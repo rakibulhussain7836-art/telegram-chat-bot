@@ -12,6 +12,8 @@ Supports: text, photos, stickers, voice, video, documents, GIFs
 """
 
 import os
+import sys
+import asyncio
 import logging
 from dotenv import load_dotenv
 
@@ -571,6 +573,19 @@ def main():
         print("❌ BOT_TOKEN not found! Create a .env file with your bot token.")
         print("   Get one from @BotFather on Telegram.")
         return
+
+    # Set up asyncio event loop for Python 3.12+ / 3.14
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     # Start health check server in background thread for Koyeb / cloud platforms
     threading.Thread(target=start_health_server, daemon=True).start()
