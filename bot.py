@@ -547,13 +547,33 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
-# ═══════════════════════════════════════════════════════════════════
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # suppress access log spam
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check server listening on port {port}")
+    server.serve_forever()
 
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not found! Create a .env file with your bot token.")
         print("   Get one from @BotFather on Telegram.")
         return
+
+    # Start health check server in background thread for Koyeb / cloud platforms
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
