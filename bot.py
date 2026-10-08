@@ -104,6 +104,10 @@ HELP_MSG = """
 • Press ❤️ **Like** to like your partner's profile
 • Press 🚩 **Report** to report your partner
 
+**Settings:**
+• Change your gender, country and partner preference
+• 📷 Set a profile photo — it's sent to your partner on match
+
 **Coins:**
 • Chatting with anyone is **free**
 • Searching for a 👩 **Girl** costs **{cost} 🪙 per search**
@@ -190,6 +194,16 @@ async def notify_partner_found(context, user_id, partner_id):
             parse_mode="Markdown",
             reply_markup=chat_keyboard(),
         )
+        # Send the partner's profile photo (they never see their own)
+        if p.photo_file_id:
+            try:
+                await context.bot.send_photo(
+                    chat_id=u.user_id,
+                    photo=p.photo_file_id,
+                    caption="📷 Partner's profile photo",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
 
 
 async def safe_edit(query, text, parse_mode=None, reply_markup=None):
@@ -792,6 +806,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=preference_keyboard(),
         )
 
+    elif data == "set_photo":
+        context.user_data["awaiting_photo"] = True
+        await safe_edit(
+            query,
+            "📷 **Send your profile photo**\n\n"
+            "Send a photo now — it will be sent to your partner when you get "
+            "matched. Send any other message to cancel.",
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(),
+        )
+
     # ── Chat controls ───────────────────────────────────────
     elif data == "end_chat":
         partner_id = db.end_chat(user_id)
@@ -850,6 +875,24 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user.banned:
         await update.message.reply_text("🚫 Your account is restricted.")
+        return
+
+    # Handle profile photo upload (before chat / country logic)
+    if context.user_data.get("awaiting_photo"):
+        context.user_data["awaiting_photo"] = False
+        if update.message.photo:
+            db.set_photo(user_id, update.message.photo[-1].file_id)
+            await update.message.reply_text(
+                "✅ **Profile photo saved!**\n\n"
+                "It will be sent to your partner when you get matched.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ That wasn't a photo — photo setting cancelled.",
+                reply_markup=settings_keyboard(),
+            )
         return
 
     # Handle country text input

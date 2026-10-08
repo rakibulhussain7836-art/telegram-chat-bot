@@ -1,6 +1,7 @@
 """Tests for bot.py: helpers, search/coin logic, payments, referrals and reports."""
 
 import asyncio
+from types import SimpleNamespace
 
 import bot
 from database import (
@@ -25,32 +26,40 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self):
+    def __init__(self, text=None, photo=None, caption=None):
         self.replies = []
+        self.text = text
+        self.photo = photo
+        self.caption = caption
 
     async def reply_text(self, text, **kwargs):
         self.replies.append({"text": text, **kwargs})
 
 
 class FakeUpdate:
-    def __init__(self, user_id, username=None, args=None):
+    def __init__(self, user_id, username=None, message=None):
         self.effective_user = FakeUser(user_id, username)
-        self.message = FakeMessage()
-        self.args = args or []
+        self.message = message or FakeMessage()
+        self.args = []
 
 
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.photos = []
 
     async def send_message(self, chat_id=None, text=None, **kwargs):
         self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+
+    async def send_photo(self, chat_id=None, photo=None, caption=None, **kwargs):
+        self.photos.append({"chat_id": chat_id, "photo": photo, "caption": caption})
 
 
 class FakeContext:
     def __init__(self):
         self.bot = FakeBot()
         self.args = []
+        self.user_data = {}
 
 
 class FakeInvoiceQuery:
@@ -297,3 +306,75 @@ def test_report_without_chat_is_rejected(fresh_db):
     message, was_in_chat = asyncio.run(bot.process_report(FakeContext(), 1))
     assert was_in_chat is False
     assert "no active chat" in message
+
+
+# ── Profile photo ───────────────────────────────────────────────
+
+def test_photo_upload_is_saved(fresh_db):
+    register(fresh_db, 1)
+    ctx = FakeContext()
+    ctx.user_data["awaiting_photo"] = True
+    update = FakeUpdate(1, message=FakeMessage(photo=[SimpleNamespace(file_id="photo_1")]))
+
+    asyncio.run(bot.relay_message(update, ctx))
+
+    assert fresh_db.get_user(1).photo_file_id == "photo_1"
+    assert ctx.user_data["awaiting_photo"] is False
+    assert "saved" in update.message.replies[0]["text"]
+
+
+def test_non_photo_cancels_photo_setting(fresh_db):
+    register(fresh_db, 1)
+    ctx = FakeContext()
+    ctx.user_data["awaiting_photo"] = True
+    update = FakeUpdate(1, message=FakeMessage(text="hello"))
+
+    asyncio.run(bot.relay_message(update, ctx))
+
+    assert fresh_db.get_user(1).photo_file_id is None
+    assert ctx.user_data["awaiting_photo"] is False
+    assert "cancelled" in update.message.replies[0]["text"]
+
+
+def test_photo_is_not_relayed_to_partner_while_setting(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+
+    ctx = FakeContext()
+    ctx.user_data["awaiting_photo"] = True
+    update = FakeUpdate(1, message=FakeMessage(photo=[SimpleNamespace(file_id="photo_1")]))
+
+    asyncio.run(bot.relay_message(update, ctx))
+
+    assert ctx.bot.photos == []          # not sent to the partner
+    assert fresh_db.get_user(1).photo_file_id == "photo_1"
+
+
+def test_partner_receives_my_photo_on_match(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.set_photo(1, "photo_of_1")
+    fresh_db.add_to_queue(1)
+
+    ctx = FakeContext()
+    text, _, _ = asyncio.run(bot.begin_search(ctx, 2, Gender.ANY))
+
+    assert "Partner found" in text
+    assert any(
+        p["chat_id"] == 2 and p["photo"] == "photo_of_1" for p in ctx.bot.photos
+    )
+    assert not any(p["chat_id"] == 1 for p in ctx.bot.photos)  # no own photo back
+
+
+def test_match_without_photos_sends_none(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(1)
+
+    ctx = FakeContext()
+    asyncio.run(bot.begin_search(ctx, 2, Gender.ANY))
+
+    assert ctx.bot.photos == []

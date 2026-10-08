@@ -153,6 +153,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Change Gender", callback_data="change_gender")],
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
         [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
+        [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
     ])
 

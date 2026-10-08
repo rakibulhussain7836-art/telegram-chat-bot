@@ -71,6 +71,8 @@ class UserProfile:
     banned: bool = False
     # ── Active search filter (chosen per search) ──
     search_pref: Optional[Gender] = None
+    # ── Profile photo (Telegram file_id, sent to partner on match) ──
+    photo_file_id: Optional[str] = None
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -96,6 +98,7 @@ def _user_to_json(user: UserProfile) -> str:
             "blocked": sorted(user.blocked),
             "banned": user.banned,
             "search_pref": user.search_pref.value if user.search_pref else None,
+            "photo_file_id": user.photo_file_id,
         }
     )
 
@@ -122,6 +125,7 @@ def _user_from_json(data: str) -> UserProfile:
         blocked=set(d["blocked"]),
         banned=d["banned"],
         search_pref=Gender(d["search_pref"]) if d["search_pref"] else None,
+        photo_file_id=d.get("photo_file_id"),
     )
 
 
@@ -237,6 +241,15 @@ class Database:
         if user_id in self.users:
             self.users[user_id].preferred_gender = preferred
             self._save()
+
+    def set_photo(self, user_id: int, file_id: str) -> bool:
+        """Store the user's profile photo (Telegram file_id)."""
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.photo_file_id = file_id
+        self._save()
+        return True
 
     # ── Coins ─────────────────────────────────────────────────────
 

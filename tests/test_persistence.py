@@ -168,6 +168,49 @@ def test_queue_entry_for_deleted_user_is_dropped(tmp_path):
     db2.close()
 
 
+def test_profile_photo_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    assert db.set_photo(1, "photo_abc") is True
+    assert db.set_photo(404, "photo_x") is False
+    db.close()
+
+    db2 = Database(path=path)
+    assert db2.get_user(1).photo_file_id == "photo_abc"
+    db2.close()
+
+
+def test_users_created_before_photos_keep_working(tmp_path):
+    """Old rows without the photo key must still load."""
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.close()
+
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    (data,) = conn.execute(
+        "SELECT data FROM users WHERE user_id = 1"
+    ).fetchone()
+    row = json.loads(data)
+    row.pop("photo_file_id", None)
+    conn.execute(
+        "UPDATE users SET data = ? WHERE user_id = 1", (json.dumps(row),)
+    )
+    conn.commit()
+    conn.close()
+
+    db2 = Database(path=path)
+    assert db2.get_user(1) is not None
+    assert db2.get_user(1).photo_file_id is None
+    db2.close()
+
+
 def test_memory_mode_creates_no_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     db = Database(path="")
