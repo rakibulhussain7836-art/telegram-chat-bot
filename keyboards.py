@@ -6,6 +6,8 @@ All inline keyboard builders live here for clean separation.
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from database import GIRL_SEARCH_COST
+
 
 # ── Gender selection ─────────────────────────────────────────────
 
@@ -74,7 +76,73 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👤 My Profile", callback_data="my_profile"),
             InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
         ],
-        [InlineKeyboardButton("📊 Stats", callback_data="stats")],
+        [
+            InlineKeyboardButton("💎 Credits", callback_data="credit_menu"),
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+        ],
+    ])
+
+
+# ── Per-search partner choice (Random / Guy / Girl) ─────────────
+
+def search_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 Random (Free)", callback_data="search_random")],
+        [
+            InlineKeyboardButton("🕺 Chat With Guy (Free)", callback_data="search_guy"),
+            InlineKeyboardButton(f"💃 Chat With Girl ({GIRL_SEARCH_COST} 🪙)", callback_data="search_girl"),
+        ],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+    ])
+
+
+# ── Profile ──────────────────────────────────────────────────────
+
+def profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❤️ View Likers", callback_data="view_likers")],
+        [
+            InlineKeyboardButton("🔍 Find a Partner", callback_data="find_partner"),
+            InlineKeyboardButton("💎 Credits", callback_data="credit_menu"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+        ],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_menu")],
+    ])
+
+
+def back_to_profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Profile", callback_data="my_profile")]
+    ])
+
+
+# ── Credits / coin shop ──────────────────────────────────────────
+
+# (coins, stars, is_vip)
+COIN_PLANS = [
+    (280, 100, False),
+    (500, 151, False),
+    (1300, 222, False),
+    (2500, 318, False),
+    (6200, 740, True),
+]
+
+
+def credit_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🎁 Refer Friends (Free Coin)", callback_data="show_refer")]]
+    for coins, stars, vip in COIN_PLANS:
+        label = f"👑 {coins} Coins VIP → ⭐{stars}" if vip else f"🪙 {coins} Coins → ⭐{stars}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"buy_{stars}_{coins}")])
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def back_to_credit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Credits", callback_data="credit_menu")]
     ])
 
 
@@ -96,7 +164,11 @@ def chat_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⏭️ Next Partner", callback_data="next_partner"),
             InlineKeyboardButton("🛑 End Chat", callback_data="end_chat"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("❤️ Like Partner", callback_data="like_partner"),
+            InlineKeyboardButton("🚩 Report Partner", callback_data="report_partner"),
+        ],
     ])
 
 
