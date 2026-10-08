@@ -403,10 +403,10 @@ def test_match_without_photos_sends_none(fresh_db):
 
 # ── Helper: press an inline button ──────────────────────────────
 
-def press(user_id, data):
+def press(user_id, data, context=None):
     query = FakeQuery(user_id, data)
     update = FakeUpdate(user_id, callback_query=query)
-    context = FakeContext()
+    context = context or FakeContext()
     asyncio.run(bot.button_handler(update, context))
     return query, context
 
@@ -535,6 +535,15 @@ def test_like_toggle_from_profile_card(fresh_db):
     assert query.answers[-1]["text"] == "💔 Like removed"
 
 
+def test_cannot_like_your_own_profile(fresh_db):
+    register(fresh_db, 1)
+
+    query, _ = press(1, f"like_toggle_{1}")
+
+    assert fresh_db.get_user(1).likes == 0
+    assert query.answers[-1]["text"] == "You can't like this profile."
+
+
 # ── Chat requests ───────────────────────────────────────────────
 
 def test_chat_request_charges_coins_and_delivers(fresh_db):
@@ -600,6 +609,50 @@ def test_declining_request_notifies_requester(fresh_db):
         m["chat_id"] == 1 and "declined" in m["text"].lower()
         for m in context.bot.sent
     )
+
+
+def test_accept_fails_when_target_busy_and_keeps_request(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    register(fresh_db, 3, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(2)
+    fresh_db.add_to_queue(3)
+    fresh_db.pair_users(2, 3)          # acceptor is already chatting
+    fresh_db.create_request(1, 2)
+
+    query, _ = press(2, "req_yes_1")
+
+    assert "already in a chat" in query.answers[-1]["text"]
+    assert fresh_db.request_status(1, 2) == "pending"   # not burned
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+
+
+def test_accept_is_refused_for_banned_accounts(fresh_db):
+    requester = register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+    requester.banned = True
+
+    query, _ = press(2, "req_yes_1")
+
+    assert "restricted" in query.answers[-1]["text"].lower()
+    assert fresh_db.request_status(1, 2) == "pending"
+    assert fresh_db.get_user(2).state == ChatState.IDLE
+
+
+def test_back_list_returns_to_previous_list(fresh_db):
+    register(fresh_db, 1)
+    other = register(fresh_db, 2)
+    fresh_db.add_contact(1, 2)
+
+    context = FakeContext()
+    press(1, "contacts", context)
+    press(1, f"view_{2}", context)
+    query, _ = press(1, "back_list", context)
+
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
+    ]
 
 
 # ── Contacts ────────────────────────────────────────────────────

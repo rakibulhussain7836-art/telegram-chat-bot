@@ -1140,18 +1140,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("That account no longer exists.", show_alert=True)
             return
         if user_id in target.liked_by:
-            _, total = db.unlike(user_id, target.user_id)
+            db.unlike(user_id, target.user_id)
             await query.answer("💔 Like removed")
         else:
-            _, total = db.add_like(user_id, target.user_id)
-            await query.answer("❤️ Liked!")
-            try:
-                await context.bot.send_message(
-                    chat_id=target.user_id,
-                    text=f"❤️ Someone liked your profile! Total likes: {total}",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to notify like to {target.user_id}: {e}")
+            is_new, total = db.add_like(user_id, target.user_id)
+            if is_new:
+                await query.answer("❤️ Liked!")
+                try:
+                    await context.bot.send_message(
+                        chat_id=target.user_id,
+                        text=(
+                            f"❤️ Someone liked your profile! Total likes: {total}"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to notify like to {target.user_id}: {e}"
+                    )
+            else:
+                await query.answer("You can't like this profile.")
         liked = user_id in target.liked_by
         await safe_edit(
             query,
@@ -1210,18 +1217,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("req_yes_"):
         requester_id = int(data[len("req_yes_"):])
+        requester = db.get_user(requester_id)
+        me = user
+
+        # Validate everything BEFORE consuming the request, otherwise a
+        # failed accept would burn the requester's coins for nothing.
+        if db.request_status(requester_id, user_id) != "pending":
+            await query.answer("This request is no longer valid.", show_alert=True)
+            return
+        if not requester:
+            db.cancel_request(requester_id, user_id)
+            await query.answer("That user no longer exists.", show_alert=True)
+            return
+        if me.banned or requester.banned:
+            await query.answer(
+                "🚫 Restricted accounts can't start a chat.", show_alert=True
+            )
+            return
+        if me.state == ChatState.CHATTING or requester.state == ChatState.CHATTING:
+            await query.answer(
+                "Someone is already in a chat — try again later.", show_alert=True
+            )
+            return
         if not db.resolve_request(requester_id, user_id, accepted=True):
             await query.answer("This request is no longer valid.", show_alert=True)
             return
 
-        requester = db.get_user(requester_id)
-        me = user
-        if not requester:
-            await query.answer("That user no longer exists.", show_alert=True)
-            return
-        if me.state == ChatState.CHATTING or requester.state == ChatState.CHATTING:
-            await query.answer("Someone is already in a chat.", show_alert=True)
-            return
         if me.state == ChatState.SEARCHING:
             db.remove_from_queue(user_id)
         if requester.state == ChatState.SEARCHING:
