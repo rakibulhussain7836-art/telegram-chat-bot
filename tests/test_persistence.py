@@ -183,7 +183,7 @@ def test_profile_photo_survives_restart(tmp_path):
 
 
 def test_users_created_before_photos_keep_working(tmp_path):
-    """Old rows without the photo key must still load."""
+    """Rows written before the newer columns existed must still load."""
     path = str(tmp_path / "bot.db")
 
     db = Database(path=path)
@@ -198,7 +198,16 @@ def test_users_created_before_photos_keep_working(tmp_path):
         "SELECT data FROM users WHERE user_id = 1"
     ).fetchone()
     row = json.loads(data)
-    row.pop("photo_file_id", None)
+    for old_key in (
+        "photo_file_id",
+        "public_id",
+        "lat",
+        "lon",
+        "contacts",
+        "verified",
+        "verified_gender",
+    ):
+        row.pop(old_key, None)
     conn.execute(
         "UPDATE users SET data = ? WHERE user_id = 1", (json.dumps(row),)
     )
@@ -206,8 +215,54 @@ def test_users_created_before_photos_keep_working(tmp_path):
     conn.close()
 
     db2 = Database(path=path)
-    assert db2.get_user(1) is not None
-    assert db2.get_user(1).photo_file_id is None
+    user = db2.get_user(1)
+    assert user is not None
+    assert user.photo_file_id is None
+    assert user.lat is None and user.contacts == set()
+    assert user.verified is False
+    assert 100000 <= user.public_id <= 999999   # assigned on load
+    db2.close()
+
+
+def test_discovery_state_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    register(db, 2, gender=Gender.FEMALE)
+    db.set_location(1, 12.97, 77.59)
+    db.add_contact(1, 2)
+    db.queue_verification(1, Gender.MALE, "ev_1")
+    db.create_request(2, 1)
+    db.add_like(2, 1)
+    public_id = db.get_user(1).public_id
+    db.close()
+
+    db2 = Database(path=path)
+    assert db2.get_user(1).public_id == public_id
+    assert db2.has_location(1)
+    assert db2.find_by_public_id(public_id).user_id == 1
+    assert [u.user_id for u in db2.contacts_of(1)] == [2]
+    assert 1 in db2.pending_verifications
+    assert db2.request_status(2, 1) == "pending"
+    assert db2.get_user(1).likes == 1
+    db2.close()
+
+
+def test_verified_badge_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.queue_verification(1, Gender.MALE, "ev_1")
+    db.approve_verification(1)
+    db.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user.verified is True
+    assert user.verified_gender == Gender.MALE
+    assert db2.pending_verifications == {}
     db2.close()
 
 

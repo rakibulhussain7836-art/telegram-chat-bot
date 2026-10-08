@@ -13,7 +13,9 @@ from typing import Optional
 from enum import Enum
 import atexit
 import json
+import math
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -44,6 +46,9 @@ REFERRAL_REWARD = 15       # coins earned by the referrer per friend
 REFERRED_BONUS = 5         # extra coins for the newly referred friend
 GIRL_SEARCH_COST = 1       # coins per "Chat With Girl" search
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
+CHAT_REQUEST_COST = 1      # coins to send a chat request from Nearby / by ID
+NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
+EARTH_RADIUS_KM = 6371.0
 
 
 @dataclass
@@ -73,6 +78,14 @@ class UserProfile:
     search_pref: Optional[Gender] = None
     # ── Profile photo (Telegram file_id, sent to partner on match) ──
     photo_file_id: Optional[str] = None
+    # ── Discovery: short shareable ID, location, contacts ──
+    public_id: int = 0
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    contacts: set[int] = field(default_factory=set)
+    # ── Verification (admin reviews a photo evidence) ──
+    verified: bool = False
+    verified_gender: Optional[Gender] = None
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -99,6 +112,14 @@ def _user_to_json(user: UserProfile) -> str:
             "banned": user.banned,
             "search_pref": user.search_pref.value if user.search_pref else None,
             "photo_file_id": user.photo_file_id,
+            "public_id": user.public_id,
+            "lat": user.lat,
+            "lon": user.lon,
+            "contacts": sorted(user.contacts),
+            "verified": user.verified,
+            "verified_gender": (
+                user.verified_gender.value if user.verified_gender else None
+            ),
         }
     )
 
@@ -126,6 +147,14 @@ def _user_from_json(data: str) -> UserProfile:
         banned=d["banned"],
         search_pref=Gender(d["search_pref"]) if d["search_pref"] else None,
         photo_file_id=d.get("photo_file_id"),
+        public_id=d.get("public_id", 0),
+        lat=d.get("lat"),
+        lon=d.get("lon"),
+        contacts=set(d.get("contacts", [])),
+        verified=d.get("verified", False),
+        verified_gender=(
+            Gender(d["verified_gender"]) if d.get("verified_gender") else None
+        ),
     )
 
 
@@ -136,6 +165,10 @@ class Database:
         self.users: dict[int, UserProfile] = {}
         self.queue: list[int] = []  # user_ids waiting for a partner
         self.processed_charges: set[str] = set()  # Telegram payment charge ids
+        # Chat requests: "from_id:to_id" -> {"status": pending/accepted/declined}
+        self.requests: dict[str, dict] = {}
+        # Photo evidence waiting for admin review: user_id -> {gender, file_id}
+        self.pending_verifications: dict[int, dict] = {}
 
         # SQLite persistence ("" or None disables it — memory only)
         self.path = os.getenv("DB_PATH", "bot.db") if path is None else path
@@ -160,6 +193,10 @@ class Database:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS charges (charge_id TEXT PRIMARY KEY)"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS state "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         conn.commit()
         self._conn = conn
 
@@ -181,6 +218,29 @@ class Database:
             self.processed_charges = {
                 cid for (cid,) in self._conn.execute("SELECT charge_id FROM charges")
             }
+            state = {
+                key: value
+                for key, value in self._conn.execute("SELECT key, value FROM state")
+            }
+        try:
+            self.requests = json.loads(state.get("requests", "{}"))
+        except ValueError:
+            self.requests = {}
+        try:
+            self.pending_verifications = {
+                int(k): v
+                for k, v in json.loads(state.get("verifications", "{}")).items()
+            }
+        except ValueError:
+            self.pending_verifications = {}
+        # Older accounts (created before public IDs existed) get one now.
+        assigned = False
+        for user in self.users.values():
+            if not user.public_id:
+                user.public_id = self._next_public_id()
+                assigned = True
+        if assigned:
+            self._save()
 
     def _save(self):
         """Write the full state atomically. Every mutation path calls this."""
@@ -202,6 +262,15 @@ class Database:
                 "INSERT INTO charges(charge_id) VALUES (?)",
                 [(cid,) for cid in self.processed_charges],
             )
+            for key, value in (
+                ("requests", json.dumps(self.requests)),
+                ("verifications", json.dumps(self.pending_verifications)),
+            ):
+                self._conn.execute(
+                    "INSERT INTO state(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
 
     def close(self):
         """Flush and close the SQLite store."""
@@ -220,12 +289,36 @@ class Database:
 
     def register_user(self, user_id: int, username: Optional[str] = None) -> UserProfile:
         if user_id not in self.users:
-            self.users[user_id] = UserProfile(user_id=user_id, username=username)
+            user = UserProfile(user_id=user_id, username=username)
+            user.public_id = self._next_public_id()
+            self.users[user_id] = user
             self._save()
         elif username and self.users[user_id].username != username:
             self.users[user_id].username = username
             self._save()
         return self.users[user_id]
+
+    def _next_public_id(self) -> int:
+        """Short 6-digit ID other people can use to find this account."""
+        taken = {u.public_id for u in self.users.values() if u.public_id}
+        while True:
+            candidate = random.randint(100000, 999999)
+            if candidate not in taken:
+                return candidate
+
+    def find_by_public_id(self, public_id: int) -> Optional["UserProfile"]:
+        for user in self.users.values():
+            if user.public_id == public_id:
+                return user
+        return None
+
+    def resolve_id(self, value) -> Optional["UserProfile"]:
+        """Accept either a public ID or a Telegram user ID."""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return self.users.get(number) or self.find_by_public_id(number)
 
     def update_gender(self, user_id: int, gender: Gender):
         if user_id in self.users:
@@ -248,6 +341,182 @@ class Database:
         if not user:
             return False
         user.photo_file_id = file_id
+        self._save()
+        return True
+
+    # ── Location / Nearby ────────────────────────────────────────
+
+    def set_location(self, user_id: int, lat: float, lon: float) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.lat, user.lon = lat, lon
+        self._save()
+        return True
+
+    def has_location(self, user_id: int) -> bool:
+        user = self.users.get(user_id)
+        return bool(user and user.lat is not None and user.lon is not None)
+
+    @staticmethod
+    def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Great-circle distance between two coordinates, in kilometres."""
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dphi / 2) ** 2
+            + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+        )
+        return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+    def distance_km(self, a_id: int, b_id: int) -> Optional[float]:
+        a, b = self.users.get(a_id), self.users.get(b_id)
+        if not a or not b or a.lat is None or b.lat is None:
+            return None
+        return self._haversine(a.lat, a.lon, b.lat, b.lon)
+
+    def nearby_users(
+        self,
+        user_id: int,
+        radius_km: float = NEARBY_RADIUS_KM,
+        limit: int = 20,
+    ) -> list[tuple["UserProfile", float]]:
+        """Users with a shared location inside the radius, nearest first."""
+        me = self.users.get(user_id)
+        if not me or me.lat is None:
+            return []
+        found = []
+        for user in self.users.values():
+            if user.user_id == user_id or user.banned or user.lat is None:
+                continue
+            dist = self._haversine(me.lat, me.lon, user.lat, user.lon)
+            if dist <= radius_km:
+                found.append((user, dist))
+        found.sort(key=lambda pair: pair[1])
+        return found[:limit]
+
+    # ── Contacts (added manually while chatting) ─────────────────
+
+    def add_contact(self, user_id: int, contact_id: int) -> bool:
+        """Add someone to my contact list (only from an active chat)."""
+        me = self.users.get(user_id)
+        target = self.users.get(contact_id)
+        if not me or not target or user_id == contact_id:
+            return False
+        if contact_id in me.contacts:
+            return False
+        me.contacts.add(contact_id)
+        self._save()
+        return True
+
+    def remove_contact(self, user_id: int, contact_id: int) -> bool:
+        me = self.users.get(user_id)
+        if not me or contact_id not in me.contacts:
+            return False
+        me.contacts.remove(contact_id)
+        self._save()
+        return True
+
+    def contacts_of(self, user_id: int) -> list["UserProfile"]:
+        user = self.users.get(user_id)
+        if not user:
+            return []
+        return [
+            self.users[uid] for uid in sorted(user.contacts) if uid in self.users
+        ]
+
+    # ── Chat requests (cost CHAT_REQUEST_COST coins) ─────────────
+
+    @staticmethod
+    def _request_key(from_id: int, to_id: int) -> str:
+        return f"{from_id}:{to_id}"
+
+    def request_status(self, from_id: int, to_id: int) -> Optional[str]:
+        req = self.requests.get(self._request_key(from_id, to_id))
+        return req["status"] if req else None
+
+    def create_request(self, from_id: int, to_id: int) -> tuple[bool, str]:
+        """
+        Send a chat request (charges CHAT_REQUEST_COST coins).
+        Returns (ok, reason) — reason is used directly in bot replies.
+        """
+        sender = self.users.get(from_id)
+        target = self.users.get(to_id)
+        if not sender or not target:
+            return False, "That user no longer exists."
+        if from_id == to_id:
+            return False, "You can't send a request to yourself."
+        if sender.banned or target.banned:
+            return False, "🚫 Your account is restricted."
+        if self.request_status(from_id, to_id) == "pending":
+            return False, "You already have a pending request for this person."
+        if self.request_status(to_id, from_id) == "pending":
+            return False, "They already sent you a request — accept it instead."
+        if not self.spend_coins(from_id, CHAT_REQUEST_COST):
+            return False, (
+                f"Not enough Coins! A chat request costs "
+                f"{CHAT_REQUEST_COST} 🪙."
+            )
+        self.requests[self._request_key(from_id, to_id)] = {
+            "status": "pending",
+            "created_at": time.time(),
+        }
+        self._save()
+        return True, "ok"
+
+    def resolve_request(self, from_id: int, to_id: int, accepted: bool) -> bool:
+        """Mark a pending request accepted/declined. Returns False if missing."""
+        key = self._request_key(from_id, to_id)
+        req = self.requests.get(key)
+        if not req or req.get("status") != "pending":
+            return False
+        req["status"] = "accepted" if accepted else "declined"
+        self._save()
+        return True
+
+    def cancel_request(self, from_id: int, to_id: int) -> bool:
+        """Drop a still-pending request (e.g. it could not be delivered)."""
+        key = self._request_key(from_id, to_id)
+        req = self.requests.get(key)
+        if not req or req.get("status") != "pending":
+            return False
+        del self.requests[key]
+        self._save()
+        return True
+
+    # ── Verification (photo evidence reviewed by the admin) ──────
+
+    def queue_verification(self, user_id: int, gender: Gender, file_id: str) -> bool:
+        user = self.users.get(user_id)
+        if not user or user.verified:
+            return False
+        self.pending_verifications[user_id] = {
+            "gender": gender.value,
+            "file_id": file_id,
+            "created_at": time.time(),
+        }
+        self._save()
+        return True
+
+    def pending_verifications_list(self) -> list[tuple[int, dict]]:
+        return sorted(self.pending_verifications.items())
+
+    def approve_verification(self, user_id: int) -> Optional["UserProfile"]:
+        """Approve the pending request. Returns the user, or None if nothing pending."""
+        pending = self.pending_verifications.pop(user_id, None)
+        user = self.users.get(user_id)
+        if not pending or not user:
+            return None
+        user.verified = True
+        user.verified_gender = Gender(pending["gender"])
+        self._save()
+        return user
+
+    def reject_verification(self, user_id: int) -> bool:
+        if user_id not in self.pending_verifications:
+            return False
+        del self.pending_verifications[user_id]
         self._save()
         return True
 
@@ -306,6 +575,16 @@ class Database:
             return False, target.likes
         target.liked_by.add(from_id)
         target.likes += 1
+        self._save()
+        return True, target.likes
+
+    def unlike(self, from_id: int, to_id: int) -> tuple[bool, int]:
+        """Remove my like from a profile. Returns (was_removed, new_total)."""
+        target = self.users.get(to_id)
+        if not target or from_id not in target.liked_by:
+            return False, target.likes if target else 0
+        target.liked_by.discard(from_id)
+        target.likes = max(0, target.likes - 1)
         self._save()
         return True, target.likes
 

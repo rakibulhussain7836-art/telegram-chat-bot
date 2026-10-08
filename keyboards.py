@@ -6,7 +6,7 @@ All inline keyboard builders live here for clean separation.
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from database import GIRL_SEARCH_COST
+from database import CHAT_REQUEST_COST, GIRL_SEARCH_COST
 
 
 # ── Gender selection ─────────────────────────────────────────────
@@ -73,6 +73,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Find a Partner", callback_data="find_partner")],
         [
+            InlineKeyboardButton("📍 Nearby", callback_data="nearby"),
+            InlineKeyboardButton("🔎 Find by ID", callback_data="find_id"),
+        ],
+        [
             InlineKeyboardButton("👤 My Profile", callback_data="my_profile"),
             InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
         ],
@@ -101,6 +105,7 @@ def search_choice_keyboard() -> InlineKeyboardMarkup:
 def profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ View Likers", callback_data="view_likers")],
+        [InlineKeyboardButton("📇 My Contacts", callback_data="contacts")],
         [
             InlineKeyboardButton("🔍 Find a Partner", callback_data="find_partner"),
             InlineKeyboardButton("💎 Credits", callback_data="credit_menu"),
@@ -154,6 +159,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
         [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
         [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
+        [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
     ])
 
@@ -170,6 +176,7 @@ def chat_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("❤️ Like Partner", callback_data="like_partner"),
             InlineKeyboardButton("🚩 Report Partner", callback_data="report_partner"),
         ],
+        [InlineKeyboardButton("➕ Add to Contacts", callback_data="add_contact")],
     ])
 
 
@@ -178,4 +185,67 @@ def chat_keyboard() -> InlineKeyboardMarkup:
 def searching_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel Search", callback_data="cancel_search")]
+    ])
+
+
+# ── Nearby / contacts / ID lookup lists ─────────────────────────
+
+def user_list_keyboard(users, empty_callback="back_menu") -> InlineKeyboardMarkup:
+    """
+    Buttons for a list of users. Each item must expose .user_id.
+    Used by Nearby, Contacts and the ID search results.
+    """
+    if not users:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back to Menu", callback_data=empty_callback)]]
+        )
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"view_{user.user_id}")]
+        for label, user in users
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def share_location_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📍 Share My Location", callback_data="share_location")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+    ])
+
+
+# ── Someone else's profile (viewed by ID / Nearby / Contacts) ──
+
+def profile_view_keyboard(target_id: int, liked: bool) -> InlineKeyboardMarkup:
+    like_label = "💔 Unlike" if liked else "❤️ Like"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(like_label, callback_data=f"like_toggle_{target_id}")],
+        [InlineKeyboardButton(
+            f"📨 Request Chat ({CHAT_REQUEST_COST} 🪙)",
+            callback_data=f"req_chat_{target_id}",
+        )],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_list")],
+    ])
+
+
+# ── Incoming chat request ───────────────────────────────────────
+
+def request_keyboard(from_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=f"req_yes_{from_id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"req_no_{from_id}"),
+        ]
+    ])
+
+
+# ── Verification ────────────────────────────────────────────────
+
+def verify_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👦 Verify as Boy", callback_data="verify_boy"),
+            InlineKeyboardButton("👧 Verify as Girl", callback_data="verify_girl"),
+        ],
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings")],
     ])

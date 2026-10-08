@@ -6,6 +6,8 @@ from database import (
     Database,
     Gender,
     GIRL_SEARCH_COST,
+    CHAT_REQUEST_COST,
+    NEARBY_RADIUS_KM,
     REFERRED_BONUS,
     REFERRAL_REWARD,
     STARTING_COINS,
@@ -323,3 +325,214 @@ def test_counters():
 
 def test_girl_search_is_not_free():
     assert GIRL_SEARCH_COST >= 1
+
+
+# ── Public IDs ──────────────────────────────────────────────────
+
+def test_every_user_gets_a_six_digit_public_id():
+    db = Database()
+    ids = {make_user(db, i).public_id for i in range(1, 30)}
+    assert all(100000 <= pid <= 999999 for pid in ids)
+    assert len(ids) == 29  # unique
+
+
+def test_find_by_public_id_and_resolve_id():
+    db = Database()
+    user = make_user(db, 1)
+    assert db.find_by_public_id(user.public_id) is user
+    assert db.resolve_id(str(user.public_id)) is user
+    assert db.resolve_id(1) is user          # Telegram user ID also works
+    assert db.resolve_id(424242) is None
+    assert db.resolve_id("abc") is None
+
+
+# ── Nearby / location ───────────────────────────────────────────
+
+def test_distance_is_computed_in_km():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.set_location(1, 0.0, 0.0)
+    db.set_location(2, 0.0, 1.0)   # ~111 km at the equator
+    distance = db.distance_km(1, 2)
+    assert distance is not None
+    assert 100 < distance < 125
+
+
+def test_nearby_sorts_by_distance_and_respects_radius():
+    db = Database()
+    make_user(db, 1)
+    db.set_location(1, 0.0, 0.0)
+    for uid, lon in ((2, 0.10), (3, 0.02), (4, 5.0)):   # ~11km, ~2km, ~550km
+        make_user(db, uid)
+        db.set_location(uid, 0.0, lon)
+
+    results = db.nearby_users(1)
+    assert [u.user_id for u, _ in results] == [3, 2]      # nearest first
+    assert all(dist <= NEARBY_RADIUS_KM for _, dist in results)
+
+
+def test_nearby_skips_users_without_location_and_self():
+    db = Database()
+    make_user(db, 1)
+    db.set_location(1, 0.0, 0.0)
+    make_user(db, 2)                       # never shared a location
+    make_user(db, 3)
+    db.set_location(3, 0.0, 0.1)
+
+    assert [u.user_id for u, _ in db.nearby_users(1)] == [3]
+
+
+def test_nearby_without_own_location_is_empty():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.set_location(2, 0.0, 0.0)
+    assert db.nearby_users(1) == []
+    assert db.has_location(1) is False
+
+
+# ── Contacts ────────────────────────────────────────────────────
+
+def test_add_and_remove_contact():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    assert db.add_contact(1, 2) is True
+    assert db.add_contact(1, 2) is False        # already there
+    assert [u.user_id for u in db.contacts_of(1)] == [2]
+    assert db.remove_contact(1, 2) is True
+    assert db.remove_contact(1, 2) is False
+    assert db.contacts_of(1) == []
+
+
+def test_cannot_add_self_or_unknown_as_contact():
+    db = Database()
+    make_user(db, 1)
+    assert db.add_contact(1, 1) is False
+    assert db.add_contact(1, 999) is False
+
+
+# ── Like / unlike ───────────────────────────────────────────────
+
+def test_unlike_removes_the_like():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.add_like(1, 2)
+    assert db.unlike(1, 2) == (True, 0)
+    assert db.get_user(2).likes == 0
+    assert db.unlike(1, 2) == (False, 0)
+    assert db.likers_of(2) == []
+
+
+def test_repeated_like_after_unlike_counts_once():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.add_like(1, 2)
+    db.unlike(1, 2)
+    db.add_like(1, 2)
+    assert db.get_user(2).likes == 1
+    assert len(db.likers_of(2)) == 1
+
+
+# ── Chat requests ───────────────────────────────────────────────
+
+def test_request_charges_one_coin():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    before = db.get_user(1).coins
+    assert db.create_request(1, 2) == (True, "ok")
+    assert db.get_user(1).coins == before - CHAT_REQUEST_COST
+    assert db.request_status(1, 2) == "pending"
+
+
+def test_request_fails_without_coins():
+    db = Database()
+    user = make_user(db, 1)
+    make_user(db, 2)
+    user.coins = 0
+    ok, reason = db.create_request(1, 2)
+    assert ok is False
+    assert "Not enough Coins" in reason
+    assert db.request_status(1, 2) is None
+    assert user.coins == 0
+
+
+def test_duplicate_and_reversed_requests_are_blocked():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    assert db.create_request(1, 2)[0] is True
+    balance = db.get_user(1).coins
+
+    assert db.create_request(1, 2)[0] is False       # duplicate
+    assert db.get_user(1).coins == balance            # not charged twice
+    assert db.create_request(2, 1)[0] is False        # they already got one
+    assert db.request_status(2, 1) is None
+
+
+def test_self_and_banned_requests_are_blocked():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    assert db.create_request(1, 1)[0] is False
+    db.get_user(1).banned = True
+    assert db.create_request(1, 2)[0] is False
+
+
+def test_resolving_requests():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.create_request(1, 2)
+    assert db.resolve_request(1, 2, accepted=True) is True
+    assert db.request_status(1, 2) == "accepted"
+    assert db.resolve_request(1, 2, accepted=True) is False   # already resolved
+    assert db.cancel_request(1, 2) is False                   # still stored
+    assert db.cancel_request(9, 9) is False
+
+
+def test_cancel_pending_request():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.create_request(1, 2)
+    assert db.cancel_request(1, 2) is True
+    assert db.request_status(1, 2) is None
+
+
+# ── Verification ────────────────────────────────────────────────
+
+def test_verification_queue_and_approval():
+    db = Database()
+    user = make_user(db, 1)
+    assert db.queue_verification(1, Gender.FEMALE, "ev_1") is True
+    assert db.pending_verifications_list() == [(1, db.pending_verifications[1])]
+
+    approved = db.approve_verification(1)
+    assert approved is user
+    assert user.verified is True
+    assert user.verified_gender == Gender.FEMALE
+    assert db.pending_verifications_list() == []
+    assert db.approve_verification(1) is None            # nothing pending
+
+
+def test_verification_reject_allows_retry():
+    db = Database()
+    user = make_user(db, 1)
+    db.queue_verification(1, Gender.MALE, "ev_1")
+    assert db.reject_verification(1) is True
+    assert db.reject_verification(1) is False
+    assert user.verified is False
+    assert db.queue_verification(1, Gender.MALE, "ev_2") is True
+
+
+def test_verified_user_cannot_queue_again():
+    db = Database()
+    make_user(db, 1)
+    db.queue_verification(1, Gender.MALE, "ev_1")
+    db.approve_verification(1)
+    assert db.queue_verification(1, Gender.MALE, "ev_2") is False

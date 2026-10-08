@@ -23,6 +23,8 @@ def fresh_db():
         bot.db.users.clear()
         bot.db.queue.clear()
         bot.db.processed_charges.clear()
+        bot.db.requests.clear()
+        bot.db.pending_verifications.clear()
 
     clear()
     yield bot.db

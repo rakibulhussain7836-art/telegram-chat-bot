@@ -9,6 +9,7 @@ from database import (
     ChatState,
     Gender,
     GIRL_SEARCH_COST,
+    CHAT_REQUEST_COST,
     STARTING_COINS,
 )
 
@@ -26,21 +27,39 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self, text=None, photo=None, caption=None):
+    def __init__(self, text=None, photo=None, caption=None, location=None):
         self.replies = []
         self.text = text
         self.photo = photo
         self.caption = caption
+        self.location = location
 
     async def reply_text(self, text, **kwargs):
         self.replies.append({"text": text, **kwargs})
 
 
 class FakeUpdate:
-    def __init__(self, user_id, username=None, message=None):
+    def __init__(self, user_id, username=None, message=None, callback_query=None):
         self.effective_user = FakeUser(user_id, username)
         self.message = message or FakeMessage()
+        self.callback_query = callback_query
         self.args = []
+
+
+class FakeQuery:
+    def __init__(self, user_id, data):
+        self.data = data
+        self.from_user = FakeUser(user_id)
+        self.edits = []
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append({"text": text, "show_alert": show_alert})
+
+    async def edit_message_text(self, text, parse_mode=None, reply_markup=None):
+        self.edits.append(
+            {"text": text, "parse_mode": parse_mode, "reply_markup": reply_markup}
+        )
 
 
 class FakeBot:
@@ -95,9 +114,11 @@ def test_format_gender_and_state():
 
 
 def test_help_text_has_search_cost_filled_in():
-    text = bot.HELP_MSG.format(cost=GIRL_SEARCH_COST)
+    text = bot.HELP_MSG.format(cost=GIRL_SEARCH_COST, request_cost=CHAT_REQUEST_COST)
     assert str(GIRL_SEARCH_COST) in text
+    assert str(CHAT_REQUEST_COST) in text
     assert "{cost}" not in text
+    assert "{request_cost}" not in text
 
 
 def test_credit_text_shows_balance_and_earn_options(fresh_db):
@@ -378,3 +399,319 @@ def test_match_without_photos_sends_none(fresh_db):
     asyncio.run(bot.begin_search(ctx, 2, Gender.ANY))
 
     assert ctx.bot.photos == []
+
+
+# ── Helper: press an inline button ──────────────────────────────
+
+def press(user_id, data):
+    query = FakeQuery(user_id, data)
+    update = FakeUpdate(user_id, callback_query=query)
+    context = FakeContext()
+    asyncio.run(bot.button_handler(update, context))
+    return query, context
+
+
+def _buttons(markup):
+    return [b for row in markup.inline_keyboard for b in row]
+
+
+# ── Public ID / profile card ────────────────────────────────────
+
+def test_profile_shows_public_id_contacts_and_verification(fresh_db):
+    user = register(fresh_db, 1)
+    text = bot.build_profile_text(user)
+    assert f"`{user.public_id}`" in text
+    assert "📇" in text and "❌ Not verified" in text
+
+
+def test_find_id_prompts_for_input(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "find_id")
+    assert context.user_data["awaiting_id"] is True
+    assert "Find by ID" in query.edits[-1]["text"]
+
+
+def test_id_search_shows_profile_card(fresh_db):
+    register(fresh_db, 1)
+    target = register(fresh_db, 2, gender=Gender.FEMALE)
+    context = FakeContext()
+    context.user_data["awaiting_id"] = True
+    update = FakeUpdate(1, message=FakeMessage(text=str(target.public_id)))
+
+    asyncio.run(bot.relay_message(update, context))
+
+    reply = update.message.replies[0]
+    assert f"`{target.public_id}`" in reply["text"]
+    labels = [b.text for b in _buttons(reply["reply_markup"])]
+    assert any("Like" in label for label in labels)
+    assert any(f"{CHAT_REQUEST_COST}" in label for label in labels)
+
+
+def test_id_search_with_unknown_id(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    context.user_data["awaiting_id"] = True
+    update = FakeUpdate(1, message=FakeMessage(text="999999"))
+
+    asyncio.run(bot.relay_message(update, context))
+
+    assert "No account found" in update.message.replies[0]["text"]
+
+
+def test_own_public_id_is_six_digits(fresh_db):
+    user = register(fresh_db, 1)
+    assert 100000 <= user.public_id <= 999999
+
+
+# ── Nearby ──────────────────────────────────────────────────────
+
+def test_nearby_prompts_for_location_when_missing(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "nearby")
+    assert "location" in query.edits[-1]["text"].lower()
+    assert context.user_data["awaiting_location"] is True
+
+
+def test_location_share_saves_and_lists_nearby(fresh_db):
+    register(fresh_db, 1)
+    near = register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.set_location(2, 10.0, 20.0)
+
+    context = FakeContext()
+    context.user_data["awaiting_location"] = True
+    message = FakeMessage(location=SimpleNamespace(latitude=10.0, longitude=20.05))
+    update = FakeUpdate(1, message=message)
+
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.has_location(1)
+    reply = update.message.replies[0]
+    assert "Location saved" in reply["text"]
+    callback_datas = [b.callback_data for b in _buttons(reply["reply_markup"])]
+    assert f"view_{near.user_id}" in callback_datas
+
+
+def test_nearby_list_shows_distance(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_location(1, 10.0, 20.0)
+    other = register(fresh_db, 2)
+    fresh_db.set_location(2, 10.0, 20.1)
+
+    query, _ = press(1, "nearby")
+
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
+    ]
+    assert "People near you" in query.edits[-1]["text"]
+
+
+def test_non_location_message_cancels_location_flow(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    context.user_data["awaiting_location"] = True
+    update = FakeUpdate(1, message=FakeMessage(text="hello"))
+
+    asyncio.run(bot.relay_message(update, context))
+
+    assert not fresh_db.has_location(1)
+    assert "wasn't a location" in update.message.replies[0]["text"]
+
+
+# ── Like / unlike ───────────────────────────────────────────────
+
+def test_like_toggle_from_profile_card(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+
+    query, _ = press(1, f"like_toggle_{2}")
+    assert fresh_db.get_user(2).likes == 1
+    assert query.answers[-1]["text"] == "❤️ Liked!"
+    assert "Unlike" in [
+        b.text for b in _buttons(query.edits[-1]["reply_markup"])
+    ][0]
+
+    query, _ = press(1, f"like_toggle_{2}")
+    assert fresh_db.get_user(2).likes == 0
+    assert query.answers[-1]["text"] == "💔 Like removed"
+
+
+# ── Chat requests ───────────────────────────────────────────────
+
+def test_chat_request_charges_coins_and_delivers(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    before = fresh_db.get_user(1).coins
+
+    query, context = press(1, f"req_chat_{2}")
+
+    assert fresh_db.get_user(1).coins == before - CHAT_REQUEST_COST
+    assert fresh_db.request_status(1, 2) == "pending"
+    assert query.answers[-1]["text"] == "📨 Request sent!"
+    delivered = [m for m in context.bot.sent if m["chat_id"] == 2]
+    assert delivered and delivered[0]["reply_markup"] is not None
+
+
+def test_chat_request_without_coins_is_refused(fresh_db):
+    sender = register(fresh_db, 1)
+    register(fresh_db, 2)
+    sender.coins = 0
+
+    query, _ = press(1, f"req_chat_{2}")
+
+    assert fresh_db.request_status(1, 2) is None
+    assert query.answers[-1]["show_alert"] is True
+
+
+def test_duplicate_chat_request_is_refused(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+    balance = fresh_db.get_user(1).coins
+
+    query, _ = press(1, f"req_chat_{2}")
+
+    assert fresh_db.request_status(1, 2) == "pending"
+    assert fresh_db.get_user(1).coins == balance  # charged only once
+
+
+def test_accepting_request_pairs_both_users(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+
+    query, _ = press(2, "req_yes_1")
+
+    assert fresh_db.get_user(1).state == ChatState.CHATTING
+    assert fresh_db.get_user(2).state == ChatState.CHATTING
+    assert fresh_db.get_user(1).partner_id == 2
+    assert "accepted" in query.edits[-1]["text"].lower()
+
+
+def test_declining_request_notifies_requester(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+
+    query, context = press(2, "req_no_1")
+
+    assert fresh_db.request_status(1, 2) == "declined"
+    assert "declined" in query.edits[-1]["text"].lower()
+    assert any(
+        m["chat_id"] == 1 and "declined" in m["text"].lower()
+        for m in context.bot.sent
+    )
+
+
+# ── Contacts ────────────────────────────────────────────────────
+
+def test_add_contact_requires_active_chat(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "add_contact")
+    assert query.answers[-1]["show_alert"] is True
+    assert fresh_db.contacts_of(1) == []
+
+
+def test_add_contact_while_chatting(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+
+    query, _ = press(1, "add_contact")
+
+    assert [u.user_id for u in fresh_db.contacts_of(1)] == [2]
+    assert "Added" in query.answers[-1]["text"]
+
+    query, _ = press(1, "add_contact")   # second tap
+    assert query.answers[-1]["text"] == "Already in your contacts."
+
+
+def test_contacts_list_button(fresh_db):
+    register(fresh_db, 1)
+    other = register(fresh_db, 2)
+    fresh_db.add_contact(1, 2)
+
+    query, _ = press(1, "contacts")
+
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
+    ]
+
+
+def test_empty_contacts_shows_hint(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "contacts")
+    assert "No contacts yet" in query.edits[-1]["text"]
+
+
+# ── Verification ────────────────────────────────────────────────
+
+def test_verification_flow_queues_photo_evidence(fresh_db):
+    register(fresh_db, 1)
+
+    query, context = press(1, "verify_boy")
+    assert context.user_data["awaiting_verify"] is True
+    assert context.user_data["verify_gender"] == Gender.MALE
+
+    update = FakeUpdate(
+        1, message=FakeMessage(photo=[SimpleNamespace(file_id="evidence_1")])
+    )
+    asyncio.run(bot.relay_message(update, context))
+
+    assert 1 in fresh_db.pending_verifications
+    assert fresh_db.pending_verifications[1]["file_id"] == "evidence_1"
+    assert "submitted" in update.message.replies[0]["text"]
+
+
+def test_admin_can_approve_verification(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_verification(1, Gender.MALE, "evidence_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = [str(fresh_db.get_user(1).public_id)]
+    asyncio.run(bot.verifyok_command(update, context))
+
+    user = fresh_db.get_user(1)
+    assert user.verified is True
+    assert user.verified_gender == Gender.MALE
+    assert "✅ Verified" in update.message.replies[0]["text"]
+    assert any(m["chat_id"] == 1 for m in context.bot.sent)
+
+
+def test_non_admin_cannot_verify(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_verification(1, Gender.MALE, "evidence_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(1)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.verifyok_command(update, context))
+
+    assert fresh_db.get_user(1).verified is False
+    assert 1 in fresh_db.pending_verifications
+    assert update.message.replies == []
+
+
+def test_verify_without_admin_id_is_disabled(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_verification(1, Gender.MALE, "evidence_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", None)
+
+    update = FakeUpdate(1)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.verifyok_command(update, context))
+
+    assert fresh_db.get_user(1).verified is False
+    assert update.message.replies == []
+
+
+def test_verified_label_shows_gender(fresh_db):
+    user = register(fresh_db, 1)
+    user.verified = True
+    user.verified_gender = Gender.FEMALE
+    assert bot.verified_label(user) == "✅ Verified Girl"
