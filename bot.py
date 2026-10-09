@@ -2,14 +2,17 @@
 Telegram Random Chat Bot — Main Bot Logic
 
 Commands:
-  /start    — Register & show main menu (supports referral codes)
-  /find     — Choose who to search for (Random / Guy / Girl)
-  /stop     — End current chat
-  /profile  — View your profile
-  /credit   — Coin balance, referral link & coin shop
-  /link     — Your personal invite link
-  /report   — Report your current chat partner
-  /help     — Show help
+  /start      — Register & show main menu (supports referral codes)
+  /newchat    — Start a random anonymous chat
+  /search     — Choose who to search for (Random / Guy / Girl)
+  /stop       — End current chat
+  /profile    — View your profile
+  /credit     — Coin balance, referral link & coin shop
+  /vip        — Upgrade to VIP
+  /link       — Your personal invite link
+  /link_anon  — Your anonymous chat link
+  /report     — Report your current chat partner
+  /help       — Show help
 
 Coins: chatting with anyone is free, searching for a Girl costs coins.
 Supports: text, photos, stickers, voice, video, documents, GIFs
@@ -21,7 +24,7 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
-from telegram import Update, LabeledPrice
+from telegram import Update, LabeledPrice, BotCommand
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -42,13 +45,16 @@ from database import (
     REFERRED_BONUS,
     GIRL_SEARCH_COST,
     CHAT_REQUEST_COST,
+    CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
+    BROWSE_PAGE_SIZE,
 )
 from keyboards import (
     gender_keyboard,
     preference_keyboard,
     country_keyboard,
     main_menu_keyboard,
+    main_reply_keyboard,
     settings_keyboard,
     chat_keyboard,
     searching_keyboard,
@@ -61,7 +67,15 @@ from keyboards import (
     share_location_keyboard,
     profile_view_keyboard,
     request_keyboard,
+    view_request_keyboard,
+    viewed_by_keyboard,
+    browse_keyboard,
+    swipe_keyboard,
+    vip_keyboard,
     verify_keyboard,
+    NEW_CHAT_LABEL,
+    BROWSE_LABEL,
+    NEARBY_LABEL,
 )
 
 load_dotenv()
@@ -76,35 +90,48 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 _admin = os.getenv("ADMIN_ID", "")
 ADMIN_ID = int(_admin) if _admin.strip().isdigit() else None
 
+# Shows up in Telegram's ☰ Menu, like the reference bot.
+BOT_COMMANDS = [
+    BotCommand("start", "🏠 Open main menu"),
+    BotCommand("profile", "👤 View your profile"),
+    BotCommand("newchat", "💬 Start new chat"),
+    BotCommand("search", "🔍 Choose who to search for"),
+    BotCommand("browse", "🎉 Browse people"),
+    BotCommand("stop", "🛑 End the current chat"),
+    BotCommand("help", "❓ How it works"),
+    BotCommand("link", "🔗 Invite & earn coins"),
+    BotCommand("credit", "💰 Check your coins or buy more"),
+    BotCommand("link_anon", "👀 Get your anonymous Chat link"),
+    BotCommand("vip", "🔥 Upgrade to VIP"),
+]
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  MESSAGES / TEMPLATES
 # ═══════════════════════════════════════════════════════════════════
 
 WELCOME_MSG = """
-🌍 **Welcome to Random Chat Bot!**
+❤️ **Welcome to Random Chat Bot!**
 
-Connect with strangers from around the world anonymously.
-
-🔹 Set your **gender** and **country**
-🔹 Choose who you want to talk to
-🔹 Get matched with a random partner
-🔹 Chat freely — your identity stays hidden!
+Tap «🎲 Random Search» and start chatting now.
+🎁 You'll also receive **{free} 🪙** free Coins!
 
 Let's get you set up. First, select your **gender**:
 """
 
 HELP_MSG = """
-📖 **How to use this bot:**
+❓ **How it works**
 
-/start — Register or reset your profile
-/find — Choose who to search for
-/stop — End the current conversation
-/profile — View your profile
-/credit — Coin balance, shop & how to earn Coins
-/link — Get your personal invite link
-/report — Report your current chat partner
-/help — Show this help message
+/start — 🏠 Open main menu
+/profile — 👤 View your profile
+/newchat — 💬 Start new chat
+/search — 🔍 Choose who to search for
+/help — ❓ How it works
+/link — 🔗 Invite & earn coins
+/credit — 💰 Check your coins or buy more
+/link_anon — 👀 Get your anonymous Chat link
+/vip — 🔥 Upgrade to VIP
+/stop — 🛑 End the current conversation
 
 **During a chat:**
 • Send any message — it's forwarded anonymously
@@ -114,39 +141,41 @@ HELP_MSG = """
 • Press ❤️ **Like** to like your partner's profile
 • Press 🚩 **Report** to report your partner
 
-**Settings:**
-• Change your gender, country and partner preference
-• 📷 Set a profile photo — it's sent to your partner on match
-• 🪩 Get Verified — send a photo, an admin reviews it
-
 **Discover people:**
-• 📍 Nearby — share your location and see people around you
-• 🔎 Find by ID — search anyone with their 6-digit ID (see yours in /profile)
-• 📨 Send a chat request ({request_cost} 🪙) — they accept or decline
+• 🎉 **Browse People** — see who is around right now
+• 🧭 **Nearby People** — share your location and see people around you
+• 🔎 **Find by ID** — search anyone with their 6-digit ID (see yours in /profile)
+• 📨 **Chat Request** ({request_cost} 🪙) — they accept within two minutes
 • ❤️ Like / 💔 Unlike profiles from the profile view
 • ➕ Add to Contacts while chatting — see them in 📇 My Contacts
+
+**Profile:**
+• Set your **name, age, city** and 📷 a profile photo
+• 🪩 Get Verified — send a photo, an admin reviews it
 
 **Coins:**
 • Chatting with anyone is **free**
 • Searching for a 👩 **Girl** costs **{cost} 🪙 per search**
+• 👑 **VIP** members search for Girls for free
 • Earn Coins by inviting friends with /link
 • Buy Coins with Telegram Stars via /credit
 """
 
 PROFILE_TEMPLATE = """
-👤 **Your Profile**
+{badge} **{name}**
+Age: {age} • City: {city}
 
-🆔 **ID:** `{public_id}`
-🔹 **Gender:** {gender}
-🔹 **Country:** {country}
-🔹 **Looking for:** {preference}
-🔹 **Total chats:** {total_chats}
-🔹 **Likes:** ❤️ {likes}
-🔹 **Coins:** 🪙 {coins}
-🔹 **Referrals:** {referrals}
-🔹 **Contacts:** 📇 {contacts}
-🔹 **Verified:** {verified}
-🔹 **Status:** {status}
+👁 {online}
+ID: `{public_id}`
+
+❤️ {likes} likes
+🪙 {coins} Coins
+🌍 Country: {country}
+🔹 Looking for: {preference}
+🔹 Total chats: {total_chats}
+📇 Contacts: {contacts}
+👥 Referrals: {referrals}
+🪩 {verified}
 """
 
 SEARCH_CHOICE_TEXT = """
@@ -157,6 +186,24 @@ SEARCH_CHOICE_TEXT = """
 💃 **Chat With Girl ({cost} 🪙 per search)**
 
 💡 Talking to everyone is free — only searching for Girls costs Coins.
+"""
+
+AGE_ASK_TEXT = """
+🎂 **How old are you?**
+
+Send your age as a number (10–99).
+"""
+
+CITY_ASK_TEXT = """
+🏙 **Which city are you in?**
+
+Send your city name below.
+"""
+
+ALL_SET_TEXT = """
+🎉 **You're all set!**
+
+Use the buttons below to find a partner, browse people or open the menu.
 """
 
 
@@ -176,6 +223,24 @@ def credit_text(user) -> str:
     )
 
 
+VIP_PLAN = (6200, 740)  # (coins, stars) — the VIP pack sold via /vip
+
+
+def vip_text(user) -> str:
+    status = "👑 You're a VIP already — thank you!" if user.vip else \
+        "🔥 **Upgrade to VIP**"
+    return (
+        f"{status}\n\n"
+        f"👑 **VIP benefits**\n"
+        f"• 👩 Girl searches are **free** (everyone else pays "
+        f"{GIRL_SEARCH_COST} 🪙 each)\n"
+        f"• 👑 VIP badge on your profile card and in every match\n"
+        f"• 🔥 VIP label next to your name in lists\n\n"
+        f"👑 **{VIP_PLAN[0]} Coins** for **⭐{VIP_PLAN[1]}**\n"
+        f"💡 Buy it from the button below — paid securely with Telegram Stars."
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
@@ -188,12 +253,37 @@ def format_gender(g):
     return "Not set"
 
 
+def gender_emoji(g) -> str:
+    if g == Gender.MALE:
+        return "👦"
+    if g == Gender.FEMALE:
+        return "👧"
+    return "🧑"
+
+
 def format_state(s):
     return {
         ChatState.IDLE: "🟢 Online",
         ChatState.SEARCHING: "🔍 Searching...",
         ChatState.CHATTING: "💬 In Chat",
     }.get(s, "Unknown")
+
+
+def format_online(user) -> str:
+    """👁 Online status line shown on profile cards."""
+    if user.state == ChatState.CHATTING:
+        return "👁 Online (Chatting🗣)"
+    if user.state == ChatState.SEARCHING:
+        return "👁 Online (Searching🔍)"
+    return "👁 Online"
+
+
+def display_name(user) -> str:
+    if user.name:
+        return user.name
+    if user.username:
+        return f"@{user.username}"
+    return "Stranger"
 
 
 async def notify_partner_found(context, user_id, partner_id):
@@ -204,8 +294,10 @@ async def notify_partner_found(context, user_id, partner_id):
     for u, p in [(user, partner), (partner, user)]:
         partner_info = (
             f"🎉 **Partner found!**\n\n"
-            f"🌍 Country: **{p.country or 'Unknown'}**\n"
-            f"👤 Gender: **{format_gender(p.gender)}**\n"
+            f"{gender_emoji(p.gender)} **{display_name(p)}**"
+            f"{f', {p.age}' if p.age else ''}\n"
+            f"🌍 {p.city or p.country or 'Unknown'}\n"
+            f"👁 {format_online(p)}\n"
             f"🪩 {verified_label(p)}\n"
             f"🆔 ID: `{p.public_id}`\n\n"
             f"Say hi! Type your message below.\n"
@@ -230,11 +322,18 @@ async def notify_partner_found(context, user_id, partner_id):
 
 
 async def safe_edit(query, text, parse_mode=None, reply_markup=None):
-    """Edit a message, ignoring 'message is not modified' errors."""
+    """Edit a message (or its caption when it carries a photo)."""
+    message = getattr(query, "message", None)
+    has_photo = bool(message is not None and getattr(message, "photo", None))
     try:
-        await query.edit_message_text(
-            text, parse_mode=parse_mode, reply_markup=reply_markup
-        )
+        if has_photo:
+            await query.edit_message_caption(
+                caption=text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text(
+                text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             raise
@@ -247,19 +346,22 @@ async def get_referral_link(context, user_id: int) -> str:
 
 def build_profile_text(user) -> str:
     return PROFILE_TEMPLATE.format(
+        badge="👑" if user.vip else gender_emoji(user.gender),
+        name=display_name(user),
+        age=user.age if user.age else "—",
+        city=user.city or (user.country or "—"),
+        online=format_online(user),
         public_id=user.public_id,
-        gender=format_gender(user.gender),
+        likes=user.likes,
+        coins=user.coins,
         country=user.country or "Not set",
         preference=format_gender(user.preferred_gender)
         if user.preferred_gender != Gender.ANY
         else "🌍 Anyone",
         total_chats=user.total_chats,
-        likes=user.likes,
-        coins=user.coins,
-        referrals=user.referral_count,
         contacts=len(user.contacts),
+        referrals=user.referral_count,
         verified=verified_label(user),
-        status=format_state(user.state),
     )
 
 
@@ -276,41 +378,104 @@ def verified_label(user) -> str:
 
 
 def build_user_card(target, viewer_id: int) -> str:
-    """Profile card for someone else's account (ID search / Nearby / Contacts)."""
+    """Profile card for someone else's account (ID search / Nearby / Browse)."""
     lines = [
-        "👤 **Profile**",
+        f"{gender_emoji(target.gender)} **{display_name(target)}**"
+        f"{f', {target.age}' if target.age else ''}",
+        f"📍 {target.city or target.country or 'Not set'}",
         "",
-        f"🆔 **ID:** `{target.public_id}`",
+        f"👁 {format_online(target)}",
+        f"🆔 ID: `{target.public_id}`",
+        "",
+        f"❤️ {target.likes} likes",
         f"🔹 **Gender:** {format_gender(target.gender)}",
-        f"🔹 **Verified:** {verified_label(target)}",
-        f"🔹 **Country:** {target.country or 'Not set'}",
-        f"🔹 **Likes:** ❤️ {target.likes}",
-        f"🔹 **Total chats:** {target.total_chats}",
-        f"🔹 **Status:** {format_state(target.state)}",
+        f"🪩 {verified_label(target)}",
     ]
+    if target.vip:
+        lines.append("👑 VIP member")
     distance = db.distance_km(viewer_id, target.user_id)
     if distance is not None:
-        lines.insert(
-            4, f"📍 **Distance:** {distance:.0f} km away"
-        )
+        lines.append(f"📍 Distance: {distance:.0f} km away")
     lines += [
         "",
-        f"📨 Chat request costs **{CHAT_REQUEST_COST} 🪙**",
+        f"📨 Chat request costs **{CHAT_REQUEST_COST} 🪙** "
+        f"(answered within {CHAT_REQUEST_TTL // 60} min)",
     ]
     return "\n".join(lines)
 
 
+def _remember_list_message(context, query) -> None:
+    """Remember which message holds a list so Back can refresh it."""
+    message = getattr(query, "message", None)
+    message_id = getattr(message, "message_id", None)
+    if message_id:
+        context.user_data["list_message_id"] = message_id
+
+
+async def show_user_card(query, context, viewer_id: int, target) -> None:
+    """
+    Open someone's profile. When they have a photo the card is sent as a
+    photo message (like the reference bot); otherwise the current message
+    is edited in place.
+    """
+    liked = viewer_id in target.liked_by
+    notify = db.get_user(viewer_id).notify_on_end
+    markup = profile_view_keyboard(target.user_id, liked, notify)
+    text = build_user_card(target, viewer_id)
+
+    if target.photo_file_id:
+        _remember_list_message(context, query)
+        try:
+            await context.bot.send_photo(
+                chat_id=viewer_id,
+                photo=target.photo_file_id,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send profile photo card: {e}")
+
+    await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def reply_profile_card(message, viewer_id: int, target) -> None:
+    """Same card, but as a reply (text input flows such as Find by ID)."""
+    markup = profile_view_keyboard(
+        target.user_id,
+        viewer_id in target.liked_by,
+        db.get_user(viewer_id).notify_on_end,
+    )
+    text = build_user_card(target, viewer_id)
+    if target.photo_file_id and hasattr(message, "reply_photo"):
+        try:
+            await message.reply_photo(
+                photo=target.photo_file_id,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to reply with profile photo: {e}")
+    await message.reply_text(
+        text, parse_mode="Markdown", reply_markup=markup
+    )
+
+
 def _plain_label(user) -> str:
-    name = f"@{user.username}" if user.username else f"ID {user.public_id}"
-    return f"{name} • {format_gender(user.gender)}"
+    return (
+        f"{gender_emoji(user.gender)} {display_name(user)}"
+        f"{f', {user.age}' if user.age else ''}"
+    )
 
 
 def _nearby_pairs(viewer_id: int) -> list:
     pairs = []
     for target, dist in db.nearby_users(viewer_id):
-        name = f"@{target.username}" if target.username else f"ID {target.public_id}"
         pairs.append((
-            f"📍 {dist:.0f} km • {name} • {format_gender(target.gender)}",
+            f"{_plain_label(target)} • 📍 {dist:.0f} km",
             target,
         ))
     return pairs
@@ -324,9 +489,8 @@ def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
             continue
         if kind == "nearby":
             dist = db.distance_km(viewer_id, uid)
-            name = f"@{user.username}" if user.username else f"ID {user.public_id}"
             prefix = f"📍 {dist:.0f} km • " if dist is not None else "📍 "
-            pairs.append((f"{prefix}{name}", user))
+            pairs.append((f"{prefix}{_plain_label(user)}", user))
         else:
             pairs.append((_plain_label(user), user))
     return pairs
@@ -338,10 +502,110 @@ def _list_text(title: str, pairs) -> str:
     return f"{title}\n\n👥 {len(pairs)} found — tap one to open their profile:"
 
 
+def _browse_entry(target) -> str:
+    """One 🎉 Browse People entry, formatted like the reference bot."""
+    place = ", ".join(p for p in (target.country, target.city) if p) or "Not set"
+    return (
+        f"{gender_emoji(target.gender)} **{display_name(target)}**"
+        f"{f', {target.age}' if target.age else ''} • `{target.public_id}`\n"
+        f"📍 {place}\n"
+        f"👀 {format_online(target)}\n"
+        f"{'〰️' * 8}"
+    )
+
+
+def _browse_text(users, total: int) -> str:
+    if not users:
+        return "🎉 **Browse People**\n\nNo one else is here yet — check back soon!"
+    header = f"🎉 **People online** ({total})"
+    body = "\n\n".join(_browse_entry(u) for u in users)
+    return f"{header}\n\n{body}\n\nShowing 1–{len(users)} of {total}."
+
+
+def _browse_state(context, user_id: int):
+    """(text, markup) for the current Browse People page."""
+    ids = context.user_data.get("browse_ids", [])
+    users = [u for u in (db.get_user(i) for i in ids) if u]
+    total = context.user_data.get("browse_total", len(users))
+    has_more = len(users) < total
+    pairs = [(_plain_label(u), u) for u in users]
+    return _browse_text(users, total), browse_keyboard(has_more, pairs)
+
+
+async def _render_swipe(query, context, viewer_id: int, index: int) -> None:
+    """✨ View Profiles by Swiping — one card at a time."""
+    ids = context.user_data.get("swipe_ids", [])
+    target = db.get_user(ids[index])
+    if not target:
+        await query.answer("That account no longer exists.", show_alert=True)
+        return
+    text = f"{_browse_entry(target)}\n\nProfile {index + 1} of {len(ids)}"
+    await safe_edit(
+        query,
+        text,
+        parse_mode="Markdown",
+        reply_markup=swipe_keyboard(
+            index, len(ids), target.user_id, viewer_id in target.liked_by
+        ),
+    )
+
+
+async def notify_profile_view(context, viewer_id: int, target) -> None:
+    """🧖 "A guy/girl just viewed your profile" toast."""
+    viewer = db.get_user(viewer_id)
+    if not viewer:
+        return
+    kind = {Gender.MALE: "Guy", Gender.FEMALE: "Girl"}.get(viewer.gender, "Someone")
+    try:
+        await context.bot.send_message(
+            chat_id=target.user_id,
+            text=f"🧖 A {kind} just viewed your profile 👀🔥",
+            reply_markup=viewed_by_keyboard(viewer_id),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send view alert to {target.user_id}: {e}")
+
+
+async def _ping_chat_end(context, user_id: int, partner_id) -> None:
+    """Honour the 🔔 "notify me when chat ends" toggle on both sides."""
+    for uid in (user_id, partner_id):
+        if not uid:
+            continue
+        target = db.get_user(uid)
+        if target and target.notify_on_end:
+            db.set_notify_end(uid, False)
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text="🔔 Your chat has ended.",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send chat-end notice to {uid}: {e}")
+
+
+async def close_chat(context, user_id: int, leaver_notice: str = "👋 You left the chat."):
+    """
+    End a chat for user_id, tell both sides and honour the
+    🔔 "notify me when chat ends" toggle.
+    """
+    partner_id = db.end_chat(user_id)
+    await context.bot.send_message(
+        chat_id=user_id, text=leaver_notice, reply_markup=main_menu_keyboard()
+    )
+    if partner_id:
+        await context.bot.send_message(
+            chat_id=partner_id,
+            text="⚠️ Your partner has left the chat.",
+            reply_markup=main_menu_keyboard(),
+        )
+    await _ping_chat_end(context, user_id, partner_id)
+
+
 async def begin_search(context, user_id: int, search_pref: Gender):
     """
     Start a search with the given per-search filter.
-    Charges coins when searching for a Girl.
+    Charges coins when searching for a Girl (VIP members search free).
     Returns (text, reply_markup, parse_mode).
     """
     user = db.get_user(user_id)
@@ -366,7 +630,7 @@ async def begin_search(context, user_id: int, search_pref: Gender):
         return "⏳ You're already searching for a partner...", searching_keyboard(), None
 
     charged = False
-    if search_pref == Gender.FEMALE:
+    if search_pref == Gender.FEMALE and not user.vip:
         if not db.spend_coins(user_id, GIRL_SEARCH_COST):
             return (
                 f"🪙 **Not enough Coins!**\n\n"
@@ -411,7 +675,7 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
 
     partner_id = user.partner_id
     banned_now = db.add_report(reporter_id, partner_id)
-    db.end_chat(reporter_id)
+    await close_chat(context, reporter_id, leaver_notice="👋 You left the chat.")
 
     if banned_now:
         db.remove_from_queue(partner_id)
@@ -424,15 +688,6 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
             )
         except Exception as e:
             logger.warning(f"Failed to notify banned user {partner_id}: {e}")
-    else:
-        try:
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text="⚠️ Your partner has left the chat.",
-                reply_markup=main_menu_keyboard(),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to notify partner {partner_id}: {e}")
 
     return (
         "✅ **Report submitted.** This user won't be matched with you again.",
@@ -447,8 +702,19 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
+    first_name = getattr(update.effective_user, "first_name", None)
     ref_code = context.args[0] if context.args else None
-    is_new = db.get_user(user_id) is None
+    existing = db.get_user(user_id)
+    is_new = existing is None
+
+    # Deep link to someone's profile: /start chat_<public_id>
+    if ref_code and ref_code.startswith("chat_"):
+        target = db.resolve_id(ref_code[len("chat_"):])
+        db.register_user(user_id, username, name=first_name)
+        if target and target.user_id != user_id:
+            db.record_view(user_id, target.user_id)
+            await reply_profile_card(update.message, user_id, target)
+            return
 
     # End any existing chat
     partner_id = db.end_chat(user_id)
@@ -460,9 +726,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     db.remove_from_queue(user_id)
-    db.register_user(user_id, username)
+    user = db.register_user(user_id, username, name=first_name)
 
-    welcome = WELCOME_MSG
+    # Returning users just get the menu (like the reference bot)
+    if not is_new and user.gender and user.country:
+        await update.message.reply_text(
+            "🏠 **Main Menu**",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        await update.message.reply_text(
+            "👇 Use the buttons below anytime.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    welcome = WELCOME_MSG.format(free=STARTING_COINS)
 
     # Referral deep link: /start <referrer_id>
     if is_new and ref_code and ref_code.isdigit():
@@ -561,17 +840,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user.state == ChatState.CHATTING:
-        partner_id = db.end_chat(user_id)
-        await update.message.reply_text(
-            "👋 You left the chat.",
-            reply_markup=main_menu_keyboard(),
-        )
-        if partner_id:
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text="⚠️ Your partner has left the chat.",
-                reply_markup=main_menu_keyboard(),
-            )
+        await close_chat(context, user_id, leaver_notice="👋 You left the chat.")
         return
 
     await update.message.reply_text(
@@ -637,6 +906,66 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, _ = await process_report(context, user_id)
     await update.message.reply_text(
         text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+    )
+
+
+async def newchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """💬 Start new chat — jumps straight into a random search."""
+    user_id = update.effective_user.id
+    if not db.get_user(user_id):
+        await update.message.reply_text("Please /start first.")
+        return
+    text, markup, mode = await begin_search(context, user_id, Gender.ANY)
+    await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+
+
+async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎉 Browse People — paginated list of everyone around."""
+    user_id = update.effective_user.id
+    if not db.get_user(user_id):
+        await update.message.reply_text("Please /start first.")
+        return
+    page, total = db.browse_users(user_id, 0, BROWSE_PAGE_SIZE)
+    context.user_data["browse_ids"] = [u.user_id for u in page]
+    context.user_data["browse_offset"] = len(page)
+    context.user_data["browse_total"] = total
+    context.user_data["list_ids"] = context.user_data["browse_ids"]
+    context.user_data["list_title"] = "🎉 People online"
+    context.user_data["list_kind"] = "browse"
+    await update.message.reply_text(
+        _browse_text(page, total),
+        parse_mode="Markdown",
+        reply_markup=browse_keyboard(
+            len(page) < total, [(_plain_label(u), u) for u in page]
+        ),
+    )
+
+
+async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    await update.message.reply_text(
+        vip_text(user), parse_mode="Markdown", reply_markup=vip_keyboard()
+    )
+
+
+async def link_anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start=chat_{user.public_id}"
+    await update.message.reply_text(
+        f"👀 **Your anonymous Chat link:**\n`{link}`\n\n"
+        f"Anyone who opens it lands straight on your profile card — they can "
+        f"like you, send a 💬 Direct Message or a 📨 Chat Request.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -817,12 +1146,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pref = pref_map.get(data, Gender.ANY)
         db.update_preferred_gender(user_id, pref)
         label = format_gender(pref) if pref != Gender.ANY else "🌍 Anyone"
+        context.user_data["setup_flow"] = True
+        context.user_data["awaiting_age"] = True
         await safe_edit(
             query,
-            f"✅ You'll be matched with: **{label}**\n\n"
-            "🎉 You're all set! Use the menu below to find a partner.",
+            f"✅ You'll be matched with: **{label}**\n\n" + AGE_ASK_TEXT.strip(),
             parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(),
         )
 
     # ── Main menu actions ───────────────────────────────────
@@ -1011,6 +1340,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=preference_keyboard(),
         )
 
+    elif data == "change_name":
+        context.user_data["awaiting_name"] = True
+        await safe_edit(
+            query,
+            "✏️ **Send your new name**\n\nThis is what other people see on "
+            "your profile card.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "change_age":
+        context.user_data["awaiting_age"] = True
+        await safe_edit(query, AGE_ASK_TEXT.strip(), parse_mode="Markdown")
+
+    elif data == "change_city":
+        context.user_data["awaiting_city"] = True
+        await safe_edit(query, CITY_ASK_TEXT.strip(), parse_mode="Markdown")
+
     elif data == "set_photo":
         context.user_data["awaiting_photo"] = True
         await safe_edit(
@@ -1068,6 +1414,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["list_ids"] = [u.user_id for _, u in pairs]
             context.user_data["list_title"] = "📍 People near you"
             context.user_data["list_kind"] = "nearby"
+            _remember_list_message(context, query)
             await safe_edit(
                 query,
                 _list_text("📍 People near you", pairs),
@@ -1115,6 +1462,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ids = context.user_data.get("list_ids", [])
         title = context.user_data.get("list_title", "Results")
         kind = context.user_data.get("list_kind", "plain")
+
+        # A photo card is its own message — drop it and refresh the list.
+        message = getattr(query, "message", None)
+        if message is not None and getattr(message, "photo", None):
+            list_message_id = context.user_data.get("list_message_id")
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.warning(f"Failed to delete profile card: {e}")
+            if kind == "browse":
+                text, markup = _browse_state(context, user_id)
+            else:
+                pairs = _pairs_from_ids(user_id, ids, kind)
+                text = _list_text(title, pairs)
+                markup = user_list_keyboard(pairs)
+            if list_message_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=list_message_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=markup,
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to refresh list message: {e}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+            return
+
+        if kind == "browse":
+            text, markup = _browse_state(context, user_id)
+            await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
+            return
+
         pairs = _pairs_from_ids(user_id, ids, kind)
         await safe_edit(
             query, _list_text(title, pairs), parse_mode="Markdown",
@@ -1126,12 +1513,124 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target:
             await query.answer("That account no longer exists.", show_alert=True)
             return
-        liked = user_id in target.liked_by
+        _remember_list_message(context, query)
+        await show_user_card(query, context, user_id, target)
+        if db.record_view(user_id, target.user_id):
+            await notify_profile_view(context, user_id, target)
+
+    # ── Profile card actions ───────────────────────────────
+    elif data.startswith("dm_"):
+        target = db.get_user(int(data[len("dm_"):]))
+        if not target:
+            await query.answer("That account no longer exists.", show_alert=True)
+            return
+        if user.banned or target.banned:
+            await query.answer(
+                "🚫 Restricted accounts can't start a chat.", show_alert=True
+            )
+            return
+        if target.state != ChatState.IDLE:
+            await query.answer(
+                "They're busy right now — send a Chat Request instead.",
+                show_alert=True,
+            )
+            return
+        if user.state == ChatState.CHATTING:
+            await query.answer(
+                "You're already in a chat! Use /stop first.", show_alert=True
+            )
+            return
+        if user.state == ChatState.SEARCHING:
+            db.remove_from_queue(user_id)
+        db.pair_users(user_id, target.user_id)
+        await safe_edit(
+            query,
+            "💬 **Direct chat started! Say hi 👋**",
+            parse_mode="Markdown",
+            reply_markup=chat_keyboard(),
+        )
+        await notify_partner_found(context, user_id, target.user_id)
+
+    elif data.startswith("block_"):
+        target = db.get_user(int(data[len("block_"):]))
+        if not target:
+            await query.answer("That account no longer exists.", show_alert=True)
+            return
+        db.block_user(user_id, target.user_id)
+        if user.state == ChatState.CHATTING and user.partner_id == target.user_id:
+            await close_chat(
+                context,
+                user_id,
+                leaver_notice="🔒 **User blocked.** Chat ended — you won't be "
+                              "matched with them again.",
+            )
+        else:
+            await query.answer("🔒 Blocked — you won't be matched again.")
+
+    elif data.startswith("rpt_"):
+        target = db.get_user(int(data[len("rpt_"):]))
+        if not target:
+            await query.answer("That account no longer exists.", show_alert=True)
+            return
+        banned_now = db.add_report(user_id, target.user_id)
+        in_chat = user.state == ChatState.CHATTING and user.partner_id == target.user_id
+        if in_chat:
+            await close_chat(
+                context,
+                user_id,
+                leaver_notice="🚩 **Report submitted.** This user won't be "
+                              "matched with you again.",
+            )
+        else:
+            await query.answer("🚩 Report submitted — thank you!")
+            await safe_edit(
+                query,
+                "🚩 **Report submitted.**\n\nThis user won't be matched with "
+                "you again.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        if banned_now:
+            db.remove_from_queue(target.user_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=target.user_id,
+                    text="🚫 Your account has been restricted because of "
+                         "multiple reports from other users.",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify banned user {target.user_id}: {e}")
+
+    elif data.startswith("addc_"):
+        target = db.get_user(int(data[len("addc_"):]))
+        if not target:
+            await query.answer("That account no longer exists.", show_alert=True)
+            return
+        if db.add_contact(user_id, target.user_id):
+            await query.answer("➕ Added to your contacts!")
+        else:
+            await query.answer("Already in your contacts.")
+
+    elif data.startswith("notify_"):
+        target = db.get_user(int(data[len("notify_"):]))
+        if not target:
+            await query.answer("That account no longer exists.", show_alert=True)
+            return
+        enabled = not user.notify_on_end
+        db.set_notify_end(user_id, enabled)
+        await query.answer(
+            "🔔 You'll get a ping when the chat ends."
+            if enabled
+            else "🔕 Chat-end alerts are off."
+        )
         await safe_edit(
             query,
             build_user_card(target, user_id),
             parse_mode="Markdown",
-            reply_markup=profile_view_keyboard(target.user_id, liked),
+            reply_markup=profile_view_keyboard(
+                target.user_id, user_id in target.liked_by, notify=enabled
+            ),
         )
 
     elif data.startswith("like_toggle_"):
@@ -1164,7 +1663,92 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query,
             build_user_card(target, user_id),
             parse_mode="Markdown",
-            reply_markup=profile_view_keyboard(target.user_id, liked),
+            reply_markup=profile_view_keyboard(
+                target.user_id, liked, notify=user.notify_on_end
+            ),
+        )
+
+    # ── Browse People ──────────────────────────────────────
+    elif data in ("browse_more", "browse_list"):
+        if data == "browse_more":
+            offset = context.user_data.get("browse_offset", 0)
+            page, total = db.browse_users(user_id, offset, BROWSE_PAGE_SIZE)
+            seen = context.user_data.get("browse_ids", [])
+            context.user_data["browse_ids"] = (seen + [u.user_id for u in page])[:20]
+            context.user_data["browse_offset"] = min(
+                20, offset + len(page)
+            )
+            context.user_data["browse_total"] = total
+        text, markup = _browse_state(context, user_id)
+        context.user_data["list_ids"] = context.user_data.get("browse_ids", [])
+        context.user_data["list_title"] = "🎉 People online"
+        context.user_data["list_kind"] = "browse"
+        _remember_list_message(context, query)
+        await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data == "browse_swipe":
+        ids = context.user_data.get("browse_ids") or context.user_data.get(
+            "list_ids", []
+        )
+        if not ids:
+            await query.answer("No profiles to swipe yet.", show_alert=True)
+            return
+        context.user_data["swipe_ids"] = ids[:20]
+        _remember_list_message(context, query)
+        await _render_swipe(query, context, user_id, 0)
+
+    elif data.startswith("swipe_"):
+        try:
+            index = int(data[len("swipe_"):])
+        except ValueError:
+            return
+        ids = context.user_data.get("swipe_ids", [])
+        if not ids or index < 0 or index >= len(ids):
+            await query.answer("No more profiles.", show_alert=True)
+            return
+        await _render_swipe(query, context, user_id, index)
+
+    elif data == "browse_msg":
+        if not context.user_data.get("browse_ids"):
+            await query.answer("Open Browse People first.", show_alert=True)
+            return
+        context.user_data["awaiting_broadcast"] = True
+        await safe_edit(
+            query,
+            "📋 **Send Message to List**\n\n"
+            "Type the message you want to send to the people in your current "
+            "list.",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("req_view_"):
+        requester_id = int(data[len("req_view_"):])
+        if db.request_status(requester_id, user_id) != "pending":
+            await safe_edit(
+                query,
+                "⌛ This chat request has expired.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        requester = db.get_user(requester_id)
+        if not requester:
+            await safe_edit(
+                query,
+                "⌛ This chat request is no longer valid.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        await safe_edit(
+            query,
+            f"🔔 **You have a chat request**\n\n"
+            f"- You have up to {CHAT_REQUEST_TTL // 60} minutes after sending "
+            f"this message to confirm the chat request.\n\n"
+            f"To view the chat request and accept or reject it, click the "
+            f"button below 👇\n\n"
+            f"{gender_emoji(requester.gender)} **{display_name(requester)}** "
+            f"• `{requester.public_id}`",
+            parse_mode="Markdown",
+            reply_markup=request_keyboard(requester_id),
         )
 
     elif data.startswith("req_chat_"):
@@ -1191,13 +1775,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=target.user_id,
                 text=(
-                    f"📨 **Chat request**\n\n"
-                    f"*{sender.username or 'Someone'}* (ID `{sender.public_id}`) "
-                    f"wants to chat with you.\n"
-                    f"Accept to start chatting right away."
+                    f"🔔 You have a chat request\n"
+                    f"- You have up to {CHAT_REQUEST_TTL // 60} minutes after "
+                    f"sending this message to confirm the chat request.\n\n"
+                    f"To view the chat request and accept or reject it, click "
+                    f"the button below 👇"
                 ),
                 parse_mode="Markdown",
-                reply_markup=request_keyboard(sender.user_id),
+                reply_markup=view_request_keyboard(sender.user_id),
             )
         except Exception as e:
             logger.warning(f"Failed to deliver request to {target.user_id}: {e}")
@@ -1212,7 +1797,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             build_user_card(target, user_id)
             + "\n\n📨 **Request sent — waiting for their answer.**",
             parse_mode="Markdown",
-            reply_markup=profile_view_keyboard(target.user_id, False),
+            reply_markup=profile_view_keyboard(
+                target.user_id, False, notify=user.notify_on_end
+            ),
         )
 
     elif data.startswith("req_yes_"):
@@ -1291,6 +1878,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ Your partner has left the chat.",
                 reply_markup=main_menu_keyboard(),
             )
+        await _ping_chat_end(context, user_id, partner_id)
 
     elif data == "report_partner":
         text, _ = await process_report(context, user_id)
@@ -1394,13 +1982,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["list_ids"] = [target.user_id]
         context.user_data["list_title"] = "🔎 Search result"
         context.user_data["list_kind"] = "plain"
-        await update.message.reply_text(
-            build_user_card(target, user_id),
-            parse_mode="Markdown",
-            reply_markup=profile_view_keyboard(
-                target.user_id, user_id in target.liked_by
-            ),
-        )
+        await reply_profile_card(update.message, user_id, target)
         return
 
     # Handle verification photo evidence
@@ -1436,6 +2018,152 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=preference_keyboard(),
         )
         return
+
+    # Handle age text input (onboarding + Settings)
+    if context.user_data.get("awaiting_age"):
+        raw = (update.message.text or "").strip()
+        if not (raw.isdigit() and 10 <= int(raw) <= 99):
+            await update.message.reply_text(
+                "⚠️ Please send your age as a number between 10 and 99.",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+        db.update_age(user_id, int(raw))
+        context.user_data["awaiting_age"] = False
+        if context.user_data.get("setup_flow"):
+            context.user_data["awaiting_city"] = True
+            await update.message.reply_text(
+                f"✅ Age set to **{raw}**\n\n" + CITY_ASK_TEXT.strip(),
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Age set to **{raw}**",
+                parse_mode="Markdown",
+                reply_markup=settings_keyboard(),
+            )
+        return
+
+    # Handle city text input (onboarding + Settings)
+    if context.user_data.get("awaiting_city"):
+        city = (update.message.text or "").strip()
+        if not city:
+            await update.message.reply_text(
+                "⚠️ Please send a city name.", reply_markup=main_reply_keyboard()
+            )
+            return
+        db.update_city(user_id, city)
+        context.user_data["awaiting_city"] = False
+        setup_flow = context.user_data.pop("setup_flow", False)
+        if setup_flow:
+            await update.message.reply_text(
+                f"✅ City set to **{city}**",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+            await update.message.reply_text(
+                ALL_SET_TEXT.strip(),
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ City set to **{city}**",
+                parse_mode="Markdown",
+                reply_markup=settings_keyboard(),
+            )
+        return
+
+    # Handle profile name text input
+    if context.user_data.get("awaiting_name"):
+        name = (update.message.text or "").strip()
+        if not name:
+            await update.message.reply_text(
+                "⚠️ Please send a name.", reply_markup=settings_keyboard()
+            )
+            return
+        db.update_name(user_id, name)
+        context.user_data["awaiting_name"] = False
+        await update.message.reply_text(
+            f"✅ Name set to **{name}**",
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(),
+        )
+        return
+
+    # Handle "📋 Send Message to List"
+    if context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        text = (update.message.text or "").strip()
+        if not text:
+            await update.message.reply_text(
+                "❌ Empty message cancelled.", reply_markup=main_reply_keyboard()
+            )
+            return
+        recipients = [
+            uid
+            for uid in context.user_data.get("browse_ids", [])[:20]
+            if uid != user_id and db.get_user(uid) and not db.get_user(uid).banned
+        ]
+        sent = 0
+        for uid in recipients:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"📩 Message from {display_name(user)}:\n\n{text}",
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Failed to deliver list message to {uid}: {e}")
+        await update.message.reply_text(
+            f"✅ Message sent to {sent} {'person' if sent == 1 else 'people'}.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    # ── Persistent bottom bar buttons ───────────────────────
+    if user.state != ChatState.CHATTING and update.message.text:
+        text = update.message.text.strip()
+        if text == NEW_CHAT_LABEL:
+            reply, markup, mode = await begin_search(context, user_id, Gender.ANY)
+            await update.message.reply_text(reply, parse_mode=mode, reply_markup=markup)
+            return
+        if text == BROWSE_LABEL:
+            page, total = db.browse_users(user_id, 0, BROWSE_PAGE_SIZE)
+            context.user_data["browse_ids"] = [u.user_id for u in page]
+            context.user_data["browse_offset"] = len(page)
+            context.user_data["browse_total"] = total
+            context.user_data["list_ids"] = context.user_data["browse_ids"]
+            context.user_data["list_title"] = "🎉 People online"
+            context.user_data["list_kind"] = "browse"
+            await update.message.reply_text(
+                _browse_text(page, total),
+                parse_mode="Markdown",
+                reply_markup=browse_keyboard(
+                    len(page) < total, [(_plain_label(u), u) for u in page]
+                ),
+            )
+            return
+        if text == NEARBY_LABEL:
+            if not db.has_location(user_id):
+                context.user_data["awaiting_location"] = True
+                await update.message.reply_text(
+                    f"📍 **Nearby People**\n\nShare your location to see people "
+                    f"within {NEARBY_RADIUS_KM} km of you.",
+                    parse_mode="Markdown",
+                    reply_markup=share_location_keyboard(),
+                )
+            else:
+                pairs = _nearby_pairs(user_id)
+                context.user_data["list_ids"] = [u.user_id for _, u in pairs]
+                context.user_data["list_title"] = "📍 People near you"
+                context.user_data["list_kind"] = "nearby"
+                await update.message.reply_text(
+                    _list_text("📍 People near you", pairs),
+                    parse_mode="Markdown",
+                    reply_markup=user_list_keyboard(pairs),
+                )
+            return
 
     # Check if user is in a chat
     if user.state != ChatState.CHATTING or not user.partner_id:
@@ -1544,10 +2272,15 @@ async def payment_success_handler(update: Update, context: ContextTypes.DEFAULT_
         user = db.get_user(buyer_id) if buyer_id else None
         if user and coins:
             balance = db.add_coins(buyer_id, coins)
+            vip_line = ""
+            if coins == VIP_PLAN[0]:
+                db.set_vip(buyer_id, True)
+                vip_line = "\n👑 You're a **VIP** now — Girl searches are free!"
             await update.message.reply_text(
                 f"✅ **Payment successful!**\n\n"
                 f"🪙 +{coins} Coins\n"
-                f"💰 Balance: **{balance} Coins**",
+                f"💰 Balance: **{balance} Coins**"
+                f"{vip_line}",
                 parse_mode="Markdown",
                 reply_markup=credit_keyboard(),
             )
@@ -1580,6 +2313,14 @@ def start_health_server():
     logger.info(f"Health check server listening on port {port}")
     server.serve_forever()
 
+async def set_bot_commands(application):
+    """Publish the ☰ Menu command list."""
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+    except Exception as e:
+        logger.warning(f"Failed to set bot commands: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not found! Create a .env file with your bot token.")
@@ -1602,16 +2343,21 @@ def main():
     # Start health check server in background thread for Koyeb / cloud platforms
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(set_bot_commands).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CommandHandler("search", find_command))
+    app.add_handler(CommandHandler("newchat", newchat_command))
+    app.add_handler(CommandHandler("browse", browse_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("credit", credit_command))
+    app.add_handler(CommandHandler("vip", vip_command))
     app.add_handler(CommandHandler("link", link_command))
+    app.add_handler(CommandHandler("link_anon", link_anon_command))
     app.add_handler(CommandHandler("report", report_command))
 
     # Admin verification review

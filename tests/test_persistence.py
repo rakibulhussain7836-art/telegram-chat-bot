@@ -273,3 +273,54 @@ def test_memory_mode_creates_no_file(tmp_path, monkeypatch):
     db.register_user(1)
     db.close()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_card_fields_survive_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.update_name(1, "Rakib")
+    db.update_age(1, 26)
+    db.update_city(1, "Dhaka")
+    db.set_vip(1, True)
+    db.set_notify_end(1, True)
+    db.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert (user.name, user.age, user.city) == ("Rakib", 26, "Dhaka")
+    assert user.vip is True and user.notify_on_end is True
+    db2.close()
+
+
+def test_rows_written_before_card_fields_still_load(tmp_path):
+    """Rows saved before name/age/city/vip existed must keep working."""
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.close()
+
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    (data,) = conn.execute(
+        "SELECT data FROM users WHERE user_id = 1"
+    ).fetchone()
+    row = json.loads(data)
+    for old_key in ("name", "age", "city", "vip", "notify_on_end", "view_alert_at"):
+        row.pop(old_key, None)
+    conn.execute(
+        "UPDATE users SET data = ? WHERE user_id = 1", (json.dumps(row),)
+    )
+    conn.commit()
+    conn.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user is not None
+    assert user.name is None and user.age is None and user.city is None
+    assert user.vip is False and user.notify_on_end is False
+    db2.close()

@@ -47,14 +47,21 @@ REFERRED_BONUS = 5         # extra coins for the newly referred friend
 GIRL_SEARCH_COST = 1       # coins per "Chat With Girl" search
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
 CHAT_REQUEST_COST = 1      # coins to send a chat request from Nearby / by ID
+CHAT_REQUEST_TTL = 120     # seconds the receiver has to answer a request
 NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
 EARTH_RADIUS_KM = 6371.0
+VIEW_ALERT_COOLDOWN = 600  # seconds between "someone viewed you" toasts
+BROWSE_PAGE_SIZE = 5       # profiles per page in the Browse People list
 
 
 @dataclass
 class UserProfile:
     user_id: int
     username: Optional[str] = None
+    # ── Public card fields (shown on profile cards) ──
+    name: Optional[str] = None
+    age: Optional[int] = None
+    city: Optional[str] = None
     gender: Optional[Gender] = None
     country: Optional[str] = None
     preferred_gender: Gender = Gender.ANY
@@ -86,6 +93,10 @@ class UserProfile:
     # ── Verification (admin reviews a photo evidence) ──
     verified: bool = False
     verified_gender: Optional[Gender] = None
+    # ── VIP & notifications ──
+    vip: bool = False
+    notify_on_end: bool = False      # 🔔 ping me when my chat ends
+    view_alert_at: float = 0.0       # last "someone viewed you" toast
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -94,6 +105,9 @@ def _user_to_json(user: UserProfile) -> str:
         {
             "user_id": user.user_id,
             "username": user.username,
+            "name": user.name,
+            "age": user.age,
+            "city": user.city,
             "gender": user.gender.value if user.gender else None,
             "country": user.country,
             "preferred_gender": user.preferred_gender.value,
@@ -120,6 +134,9 @@ def _user_to_json(user: UserProfile) -> str:
             "verified_gender": (
                 user.verified_gender.value if user.verified_gender else None
             ),
+            "vip": user.vip,
+            "notify_on_end": user.notify_on_end,
+            "view_alert_at": user.view_alert_at,
         }
     )
 
@@ -129,6 +146,9 @@ def _user_from_json(data: str) -> UserProfile:
     return UserProfile(
         user_id=d["user_id"],
         username=d["username"],
+        name=d.get("name"),
+        age=d.get("age"),
+        city=d.get("city"),
         gender=Gender(d["gender"]) if d["gender"] else None,
         country=d["country"],
         preferred_gender=Gender(d["preferred_gender"]),
@@ -155,6 +175,9 @@ def _user_from_json(data: str) -> UserProfile:
         verified_gender=(
             Gender(d["verified_gender"]) if d.get("verified_gender") else None
         ),
+        vip=d.get("vip", False),
+        notify_on_end=d.get("notify_on_end", False),
+        view_alert_at=d.get("view_alert_at", 0.0),
     )
 
 
@@ -287,15 +310,28 @@ class Database:
     def get_user(self, user_id: int) -> Optional[UserProfile]:
         return self.users.get(user_id)
 
-    def register_user(self, user_id: int, username: Optional[str] = None) -> UserProfile:
+    def register_user(
+        self,
+        user_id: int,
+        username: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> UserProfile:
         if user_id not in self.users:
-            user = UserProfile(user_id=user_id, username=username)
+            user = UserProfile(user_id=user_id, username=username, name=name)
             user.public_id = self._next_public_id()
             self.users[user_id] = user
             self._save()
-        elif username and self.users[user_id].username != username:
-            self.users[user_id].username = username
-            self._save()
+        else:
+            user = self.users[user_id]
+            changed = False
+            if username and user.username != username:
+                user.username = username
+                changed = True
+            if name and not user.name:
+                user.name = name
+                changed = True
+            if changed:
+                self._save()
         return self.users[user_id]
 
     def _next_public_id(self) -> int:
@@ -334,6 +370,91 @@ class Database:
         if user_id in self.users:
             self.users[user_id].preferred_gender = preferred
             self._save()
+
+    def update_name(self, user_id: int, name: str) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.name = name.strip()[:50] or user.name
+        self._save()
+        return True
+
+    def update_age(self, user_id: int, age: int) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.age = age
+        self._save()
+        return True
+
+    def update_city(self, user_id: int, city: str) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.city = city.strip()[:50] or user.city
+        self._save()
+        return True
+
+    # ── VIP / chat-end notifications ─────────────────────────────
+
+    def set_vip(self, user_id: int, value: bool = True) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.vip = value
+        self._save()
+        return True
+
+    def set_notify_end(self, user_id: int, value: bool) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.notify_on_end = value
+        self._save()
+        return True
+
+    # ── Profile views ────────────────────────────────────────────
+
+    def record_view(self, viewer_id: int, target_id: int) -> bool:
+        """
+        Someone opened a profile card. Returns True when the owner should
+        get a "someone viewed your profile" toast (cooldown-limited).
+        """
+        viewer = self.users.get(viewer_id)
+        target = self.users.get(target_id)
+        if not viewer or not target or viewer_id == target_id:
+            return False
+        now = time.time()
+        if now - target.view_alert_at < VIEW_ALERT_COOLDOWN:
+            return False
+        target.view_alert_at = now
+        self._save()
+        return True
+
+    def block_user(self, user_id: int, target_id: int) -> bool:
+        """Block someone: never match with them again and drop them from contacts."""
+        me = self.users.get(user_id)
+        if not me or user_id == target_id or target_id not in self.users:
+            return False
+        me.blocked.add(target_id)
+        me.contacts.discard(target_id)
+        self._save()
+        return True
+
+    def browse_users(
+        self,
+        user_id: int,
+        offset: int = 0,
+        limit: int = BROWSE_PAGE_SIZE,
+    ) -> tuple[list["UserProfile"], int]:
+        """Everyone except me, page by page — powers 🎉 Browse People."""
+        found = [
+            u
+            for u in self.users.values()
+            if u.user_id != user_id and not u.banned
+        ]
+        found.sort(key=lambda u: u.registered_at, reverse=True)
+        return found[offset : offset + limit], len(found)
 
     def set_photo(self, user_id: int, file_id: str) -> bool:
         """Store the user's profile photo (Telegram file_id)."""
@@ -432,7 +553,21 @@ class Database:
     def _request_key(from_id: int, to_id: int) -> str:
         return f"{from_id}:{to_id}"
 
+    def _expire_if_stale(self, from_id: int, to_id: int) -> bool:
+        """Refund and drop a request the receiver never answered in time."""
+        key = self._request_key(from_id, to_id)
+        req = self.requests.get(key)
+        if not req or req.get("status") != "pending":
+            return False
+        if time.time() - req.get("created_at", 0) <= CHAT_REQUEST_TTL:
+            return False
+        req["status"] = "expired"
+        self.add_coins(from_id, CHAT_REQUEST_COST)  # never burn coins silently
+        self._save()
+        return True
+
     def request_status(self, from_id: int, to_id: int) -> Optional[str]:
+        self._expire_if_stale(from_id, to_id)
         req = self.requests.get(self._request_key(from_id, to_id))
         return req["status"] if req else None
 
@@ -467,6 +602,7 @@ class Database:
 
     def resolve_request(self, from_id: int, to_id: int, accepted: bool) -> bool:
         """Mark a pending request accepted/declined. Returns False if missing."""
+        self._expire_if_stale(from_id, to_id)
         key = self._request_key(from_id, to_id)
         req = self.requests.get(key)
         if not req or req.get("status") != "pending":

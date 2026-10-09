@@ -768,3 +768,368 @@ def test_verified_label_shows_gender(fresh_db):
     user.verified = True
     user.verified_gender = Gender.FEMALE
     assert bot.verified_label(user) == "✅ Verified Girl"
+
+
+# ── MeChat-style cards, onboarding & discovery ──────────────────
+
+def test_profile_card_shows_name_age_city(fresh_db):
+    user = register(fresh_db, 1)
+    fresh_db.update_name(1, "Rakib")
+    fresh_db.update_age(1, 26)
+    fresh_db.update_city(1, "Dhaka")
+    text = bot.build_profile_text(user)
+    assert "Rakib" in text and "26" in text and "Dhaka" in text
+
+
+def test_user_card_shows_name_age_and_online_status(fresh_db):
+    register(fresh_db, 1)
+    target = register(fresh_db, 2)
+    fresh_db.update_name(2, "Shivani")
+    fresh_db.update_age(2, 19)
+    fresh_db.update_city(2, "Bangalore")
+    fresh_db.pair_users(1, 2)
+
+    text = bot.build_user_card(target, 1)
+    assert "Shivani" in text and "19" in text and "Bangalore" in text
+    assert "Online (Chatting" in text
+    assert f"`{target.public_id}`" in text
+
+
+def test_profile_card_buttons_match_reference(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+
+    query, _ = press(1, f"view_{2}")
+
+    labels = [b.text for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert labels[0] == "❤️ Like"
+    assert any("Direct Message" in label for label in labels)
+    assert any("Chat Request" in label for label in labels)
+    assert any("Block User" in label for label in labels)
+    assert any("Report User" in label for label in labels)
+    assert any("Add to Contacts" in label for label in labels)
+    assert any("Notify me when chat ends" in label for label in labels)
+
+
+def test_onboarding_collects_age_and_city(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    press(1, "pref_any", context)
+    assert context.user_data["awaiting_age"] is True
+
+    update = FakeUpdate(1, message=FakeMessage(text="25"))
+    asyncio.run(bot.relay_message(update, context))
+    assert fresh_db.get_user(1).age == 25
+    assert context.user_data["awaiting_city"] is True
+
+    update = FakeUpdate(1, message=FakeMessage(text="Dhaka"))
+    asyncio.run(bot.relay_message(update, context))
+    assert fresh_db.get_user(1).city == "Dhaka"
+    assert "all set" in update.message.replies[-1]["text"].lower()
+
+
+def test_invalid_age_is_reasked(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    context.user_data["awaiting_age"] = True
+
+    update = FakeUpdate(1, message=FakeMessage(text="abc"))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.get_user(1).age is None
+    assert context.user_data["awaiting_age"] is True
+
+
+def test_settings_change_age_does_not_force_city(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    press(1, "change_age", context)
+    update = FakeUpdate(1, message=FakeMessage(text="31"))
+    asyncio.run(bot.relay_message(update, context))
+    assert fresh_db.get_user(1).age == 31
+    assert context.user_data.get("awaiting_city") is not True
+
+
+def test_viewing_profile_notifies_owner_once(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+
+    context = FakeContext()
+    press(1, f"view_{2}", context)
+    press(1, f"view_{2}", context)
+
+    alerts = [m for m in context.bot.sent if m["chat_id"] == 2]
+    assert len(alerts) == 1                      # cooldown-limited
+    assert "viewed your profile" in alerts[0]["text"]
+
+
+def test_viewing_own_profile_never_notifies(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    press(1, "view_1", context)
+    assert context.bot.sent == []
+
+
+# ── Direct Message / Block / Report from a card ────────────────
+
+def test_direct_message_pairs_when_both_free(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+
+    query, context = press(1, f"dm_{2}")
+
+    assert fresh_db.get_user(1).state == ChatState.CHATTING
+    assert fresh_db.get_user(2).state == ChatState.CHATTING
+    assert any("Partner found" in m["text"] for m in context.bot.sent)
+    assert "Direct chat started" in query.edits[-1]["text"]
+
+
+def test_direct_message_refused_when_busy(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    register(fresh_db, 3)
+    fresh_db.add_to_queue(2)
+    fresh_db.add_to_queue(3)
+    fresh_db.pair_users(2, 3)
+
+    query, _ = press(1, f"dm_{2}")
+
+    assert query.answers[-1]["show_alert"] is True
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+
+
+def test_block_from_profile_card_stops_matching(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    assert fresh_db.find_match(1) == 2
+
+    press(1, f"block_{2}")
+
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    assert fresh_db.find_match(1) is None
+
+
+def test_report_from_profile_card_bans_at_threshold(fresh_db):
+    from database import BAN_REPORT_THRESHOLD
+    target = 300
+    register(fresh_db, target, gender=Gender.FEMALE)
+    for i in range(BAN_REPORT_THRESHOLD):
+        reporter = 400 + i
+        register(fresh_db, reporter)
+        press(reporter, f"rpt_{target}")
+    assert fresh_db.get_user(target).banned is True
+
+
+def test_add_contact_from_profile_card(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    query, _ = press(1, f"addc_{2}")
+    assert [u.user_id for u in fresh_db.contacts_of(1)] == [2]
+    assert "Added" in query.answers[-1]["text"]
+
+
+# ── 🔔 notify-me-when-chat-ends ────────────────────────────────
+
+def test_notify_on_end_pings_when_chat_ends(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+    fresh_db.set_notify_end(1, True)
+
+    query, context = press(1, "end_chat")
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert any(
+        m["chat_id"] == 1 and "chat has ended" in m["text"]
+        for m in context.bot.sent
+    )
+    assert fresh_db.get_user(1).notify_on_end is False
+
+
+def test_notify_toggle_switches_the_flag(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+
+    press(1, f"notify_{2}")
+    assert fresh_db.get_user(1).notify_on_end is True
+    press(1, f"notify_{2}")
+    assert fresh_db.get_user(1).notify_on_end is False
+
+
+# ── Persistent bottom bar ──────────────────────────────────────
+
+def test_reply_keyboard_starts_random_chat(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text=bot.NEW_CHAT_LABEL))
+
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.get_user(1).state == ChatState.SEARCHING
+
+
+def test_reply_keyboard_opens_browse_list(fresh_db):
+    register(fresh_db, 1)
+    other = register(fresh_db, 2, gender=Gender.FEMALE)
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text=bot.BROWSE_LABEL))
+
+    asyncio.run(bot.relay_message(update, context))
+
+    reply = update.message.replies[0]
+    assert "People online" in reply["text"]
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(reply["reply_markup"])
+    ]
+
+
+def test_reply_keyboard_text_is_relayed_while_chatting(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text=bot.NEW_CHAT_LABEL))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.get_user(1).state == ChatState.CHATTING
+    assert any(m["chat_id"] == 2 for m in context.bot.sent)
+
+
+# ── Browse / swipe ─────────────────────────────────────────────
+
+def test_browse_command_lists_profiles(fresh_db):
+    register(fresh_db, 1)
+    other = register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.update_name(2, "Shivani")
+    fresh_db.update_age(2, 19)
+    fresh_db.update_city(2, "Bangalore")
+
+    update = FakeUpdate(1)
+    asyncio.run(bot.browse_command(update, FakeContext()))
+
+    text = update.message.replies[0]["text"]
+    assert "Shivani" in text and "Bangalore" in text
+    assert str(other.public_id) in text
+
+
+def test_browse_more_extends_the_list(fresh_db):
+    register(fresh_db, 1)
+    for i in range(2, 9):
+        register(fresh_db, i)
+    context = FakeContext()
+    press(1, "browse_more", context)
+    first_page = len(context.user_data["browse_ids"])
+    press(1, "browse_more", context)
+    assert len(context.user_data["browse_ids"]) > first_page
+
+
+def test_swipe_shows_one_profile_at_a_time(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    context = FakeContext()
+    press(1, "browse_more", context)      # populates the browse list
+    press(1, "browse_swipe", context)
+    assert context.user_data["swipe_ids"] == [2]
+
+    query, _ = press(1, "swipe_0", context)
+    assert "Profile 1 of 1" in query.edits[-1]["text"]
+
+
+def test_swipe_out_of_range_is_refused(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    context = FakeContext()
+    press(1, "browse_more", context)
+    press(1, "browse_swipe", context)
+
+    query, _ = press(1, "swipe_9", context)
+
+    assert query.answers[-1]["text"] == "No more profiles."
+    assert query.edits == []
+
+
+# ── VIP ────────────────────────────────────────────────────────
+
+def test_vip_girl_search_is_free(fresh_db):
+    user = register(fresh_db, 1)
+    user.vip = True
+
+    text, _, _ = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.FEMALE))
+
+    assert fresh_db.get_user(1).coins == STARTING_COINS
+    assert fresh_db.get_user(1).state == ChatState.SEARCHING
+
+
+def test_vip_payment_sets_the_flag(fresh_db):
+    register(fresh_db, 1)
+    update = FakeUpdate(1)
+    update.message.successful_payment = FakePayment("coin_pack:1:6200")
+
+    asyncio.run(bot.payment_success_handler(update, FakeContext()))
+
+    assert fresh_db.get_user(1).vip is True
+
+
+def test_vip_text_mentions_free_girl_search(fresh_db):
+    user = register(fresh_db, 1)
+    assert "Girl searches" in bot.vip_text(user)
+
+
+# ── Chat request TTL ───────────────────────────────────────────
+
+def test_request_expires_and_refunds_the_sender(fresh_db):
+    import time as _time
+    from database import CHAT_REQUEST_TTL
+
+    sender = register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+    fresh_db.requests["1:2"]["created_at"] = _time.time() - CHAT_REQUEST_TTL - 5
+
+    assert fresh_db.request_status(1, 2) == "expired"
+    assert sender.coins == STARTING_COINS        # refunded
+    assert fresh_db.resolve_request(1, 2, accepted=True) is False
+
+
+def test_expired_request_can_be_sent_again(fresh_db):
+    import time as _time
+    from database import CHAT_REQUEST_TTL
+
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+    fresh_db.requests["1:2"]["created_at"] = _time.time() - CHAT_REQUEST_TTL - 5
+
+    ok, _ = fresh_db.create_request(1, 2)
+    assert ok is True
+    assert fresh_db.request_status(1, 2) == "pending"
+
+
+def test_request_notification_uses_view_button(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+
+    query, context = press(1, f"req_chat_{2}")
+
+    delivered = [m for m in context.bot.sent if m["chat_id"] == 2]
+    labels = [b.text for b in _buttons(delivered[0]["reply_markup"])]
+    assert any("View Chat Request" in label for label in labels)
+
+
+def test_view_request_shows_accept_buttons(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.create_request(1, 2)
+
+    query, _ = press(2, "req_view_1")
+
+    labels = [b.text for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "✅ Accept" in labels and "❌ Decline" in labels

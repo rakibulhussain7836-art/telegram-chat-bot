@@ -536,3 +536,74 @@ def test_verified_user_cannot_queue_again():
     db.queue_verification(1, Gender.MALE, "ev_1")
     db.approve_verification(1)
     assert db.queue_verification(1, Gender.MALE, "ev_2") is False
+
+
+# ── Profile card fields / views / blocking / browsing ──────────
+
+def test_name_age_city_updates():
+    db = Database()
+    user = make_user(db, 1)
+    assert db.update_name(1, "Rakib") is True
+    assert db.update_age(1, 26) is True
+    assert db.update_city(1, "Dhaka") is True
+    assert (user.name, user.age, user.city) == ("Rakib", 26, "Dhaka")
+    assert db.update_name(999, "Ghost") is False
+
+
+def test_vip_and_notify_flags():
+    db = Database()
+    make_user(db, 1)
+    assert db.set_vip(1, True) is True
+    assert db.set_notify_end(1, True) is True
+    assert db.get_user(1).vip is True
+    assert db.get_user(1).notify_on_end is True
+    assert db.set_vip(999, True) is False
+
+
+def test_view_alert_respects_cooldown_and_self():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    assert db.record_view(1, 2) is True
+    assert db.record_view(1, 2) is False     # cooldown
+    assert db.record_view(2, 2) is False     # viewing yourself
+    assert db.record_view(1, 999) is False
+
+
+def test_block_user_stops_matching_and_drops_contact():
+    db = Database()
+    make_user(db, 1, gender=Gender.MALE, country="US")
+    make_user(db, 2, gender=Gender.FEMALE, country="FR")
+    db.add_contact(1, 2)
+
+    assert db.block_user(1, 2) is True
+    assert 2 in db.get_user(1).blocked
+    assert db.contacts_of(1) == []
+
+    db.add_to_queue(1, search_pref=None)
+    db.add_to_queue(2, search_pref=None)
+    assert db.find_match(1) is None
+
+
+def test_browse_users_paginates_and_skips_self():
+    db = Database()
+    make_user(db, 1)
+    for i in range(2, 8):
+        make_user(db, i)
+
+    page1, total = db.browse_users(1, 0, 5)
+    page2, _ = db.browse_users(1, 5, 5)
+
+    assert total == 6
+    assert len(page1) == 5 and len(page2) == 1
+    assert 1 not in {u.user_id for u in page1 + page2}
+    assert len({u.user_id for u in page1 + page2}) == 6
+
+
+def test_banned_users_are_not_browsable():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.get_user(2).banned = True
+    users, total = db.browse_users(1, 0, 10)
+    assert total == 0 and users == []
