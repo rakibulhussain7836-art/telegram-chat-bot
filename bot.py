@@ -2298,11 +2298,18 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _send_ok(self, with_body: bool = True):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"OK")
+        if with_body:
+            self.wfile.write(b"OK")
+
+    def do_GET(self):
+        self._send_ok(with_body=True)
+
+    def do_HEAD(self):
+        self._send_ok(with_body=False)
 
     def log_message(self, format, *args):
         pass  # suppress access log spam
