@@ -52,6 +52,40 @@ NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
 EARTH_RADIUS_KM = 6371.0
 VIEW_ALERT_COOLDOWN = 600  # seconds between "someone viewed you" toasts
 BROWSE_PAGE_SIZE = 5       # profiles per page in the Browse People list
+RECENT_PARTNER_LIMIT = 20  # chat partners remembered per user
+DAILY_REWARD_COINS = 1     # coins per match (MeChat-style free coin)
+DAILY_REWARD_MAX = 10      # matches rewarded per day
+DM_TTL = 7 * 86400         # unread direct messages kept for 7 days
+
+# ── Short public-ID slugs (display: /user_xxx, base36) ───────────
+_B36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _to_b36(n: int) -> str:
+    if n <= 0:
+        return "0"
+    out = []
+    while n:
+        n, rem = divmod(n, 36)
+        out.append(_B36_DIGITS[rem])
+    return "".join(reversed(out))
+
+
+def _from_b36(s: str) -> Optional[int]:
+    try:
+        return int(s, 36)
+    except (TypeError, ValueError):
+        return None
+
+
+def public_id_slug(user: "UserProfile") -> str:
+    """Shareable ID without the leading slash, safe for deep links: user_r3u2."""
+    return f"user_{_to_b36(user.public_id)}"
+
+
+def format_public_id(user: "UserProfile") -> str:
+    """Human-shareable ID, e.g. /user_r3u2 (same style as the reference bot)."""
+    return f"/{public_id_slug(user)}"
 
 
 @dataclass
@@ -97,6 +131,11 @@ class UserProfile:
     vip: bool = False
     notify_on_end: bool = False      # 🔔 ping me when my chat ends
     view_alert_at: float = 0.0       # last "someone viewed you" toast
+    # ── Chat history (most recent partners, newest first) ──
+    recent_partners: list[int] = field(default_factory=list)
+    # ── Daily match reward (1 coin per match, capped per day) ──
+    reward_date: str = ""
+    reward_count: int = 0
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -137,6 +176,9 @@ def _user_to_json(user: UserProfile) -> str:
             "vip": user.vip,
             "notify_on_end": user.notify_on_end,
             "view_alert_at": user.view_alert_at,
+            "recent_partners": list(user.recent_partners),
+            "reward_date": user.reward_date,
+            "reward_count": user.reward_count,
         }
     )
 
@@ -178,6 +220,9 @@ def _user_from_json(data: str) -> UserProfile:
         vip=d.get("vip", False),
         notify_on_end=d.get("notify_on_end", False),
         view_alert_at=d.get("view_alert_at", 0.0),
+        recent_partners=list(d.get("recent_partners", [])),
+        reward_date=d.get("reward_date", ""),
+        reward_count=d.get("reward_count", 0),
     )
 
 
@@ -192,6 +237,10 @@ class Database:
         self.requests: dict[str, dict] = {}
         # Photo evidence waiting for admin review: user_id -> {gender, file_id}
         self.pending_verifications: dict[int, dict] = {}
+        # Unread direct messages: to_id -> {from_id, text, at}
+        self.pending_dms: dict[int, dict] = {}
+        # O(1) public-ID lookup index (public_id -> user_id)
+        self._by_public_id: dict[int, int] = {}
 
         # SQLite persistence ("" or None disables it — memory only)
         self.path = os.getenv("DB_PATH", "bot.db") if path is None else path
@@ -205,6 +254,9 @@ class Database:
 
     def _connect(self):
         conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS users "
             "(user_id INTEGER PRIMARY KEY, data TEXT NOT NULL)"
@@ -256,17 +308,28 @@ class Database:
             }
         except ValueError:
             self.pending_verifications = {}
+        try:
+            self.pending_dms = {
+                int(k): v
+                for k, v in json.loads(state.get("dms", "{}")).items()
+            }
+        except ValueError:
+            self.pending_dms = {}
         # Older accounts (created before public IDs existed) get one now.
         assigned = False
+        self._by_public_id.clear()
         for user in self.users.values():
-            if not user.public_id:
+            if user.public_id:
+                self._by_public_id[user.public_id] = user.user_id
+            else:
                 user.public_id = self._next_public_id()
+                self._by_public_id[user.public_id] = user.user_id
                 assigned = True
         if assigned:
             self._save()
 
     def _save(self):
-        """Write the full state atomically. Every mutation path calls this."""
+        """Full state snapshot — only used on close. Mutations write single rows."""
         if not self._conn:
             return
         with self._lock, self._conn:
@@ -288,12 +351,79 @@ class Database:
             for key, value in (
                 ("requests", json.dumps(self.requests)),
                 ("verifications", json.dumps(self.pending_verifications)),
+                ("dms", json.dumps(self.pending_dms)),
             ):
                 self._conn.execute(
                     "INSERT INTO state(key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, value),
                 )
+
+    # ── Targeted writes (O(1) per mutation, not a full dump) ─────
+
+    def _write_user(self, user: Optional[UserProfile]):
+        if not user or not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO users(user_id, data) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET data = excluded.data",
+                (user.user_id, _user_to_json(user)),
+            )
+
+    def _write_users(self, *users: Optional[UserProfile]):
+        rows = [(u.user_id, _user_to_json(u)) for u in users if u]
+        if not rows or not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO users(user_id, data) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET data = excluded.data",
+                rows,
+            )
+
+    def _write_queue_entry(self, user_id: int, pos: int):
+        if not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO queue(user_id, pos) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET pos = excluded.pos",
+                (user_id, pos),
+            )
+
+    def _delete_queue_entry(self, user_id: int):
+        if not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM queue WHERE user_id = ?", (user_id,))
+
+    def _write_charge(self, charge_id: str):
+        if not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO charges(charge_id) VALUES (?)", (charge_id,)
+            )
+
+    def _write_state(self, key: str, value: str):
+        if not self._conn:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def _write_requests(self):
+        self._write_state("requests", json.dumps(self.requests))
+
+    def _write_verifications(self):
+        self._write_state("verifications", json.dumps(self.pending_verifications))
+
+    def _write_dms(self):
+        self._write_state("dms", json.dumps(self.pending_dms))
 
     def close(self):
         """Flush and close the SQLite store."""
@@ -320,7 +450,8 @@ class Database:
             user = UserProfile(user_id=user_id, username=username, name=name)
             user.public_id = self._next_public_id()
             self.users[user_id] = user
-            self._save()
+            self._by_public_id[user.public_id] = user_id
+            self._write_user(user)
         else:
             user = self.users[user_id]
             changed = False
@@ -331,25 +462,40 @@ class Database:
                 user.name = name
                 changed = True
             if changed:
-                self._save()
+                self._write_user(user)
         return self.users[user_id]
 
     def _next_public_id(self) -> int:
         """Short 6-digit ID other people can use to find this account."""
-        taken = {u.public_id for u in self.users.values() if u.public_id}
         while True:
             candidate = random.randint(100000, 999999)
-            if candidate not in taken:
+            if candidate not in self._by_public_id:
                 return candidate
 
     def find_by_public_id(self, public_id: int) -> Optional["UserProfile"]:
+        uid = self._by_public_id.get(public_id)
+        if uid is not None:
+            user = self.users.get(uid)
+            if user is not None and user.public_id == public_id:
+                return user
+            self._by_public_id.pop(public_id, None)  # stale index entry
         for user in self.users.values():
             if user.public_id == public_id:
+                self._by_public_id[public_id] = user.user_id
                 return user
         return None
 
     def resolve_id(self, value) -> Optional["UserProfile"]:
-        """Accept either a public ID or a Telegram user ID."""
+        """Accept a public ID (int or /user_xxx slug) or a Telegram user ID."""
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("/"):
+                value = value[1:]
+            if value.lower().startswith("user_"):
+                number = _from_b36(value[5:])
+                if number is None:
+                    return None
+                return self.find_by_public_id(number)
         try:
             number = int(value)
         except (TypeError, ValueError):
@@ -359,24 +505,24 @@ class Database:
     def update_gender(self, user_id: int, gender: Gender):
         if user_id in self.users:
             self.users[user_id].gender = gender
-            self._save()
+            self._write_user(self.users[user_id])
 
     def update_country(self, user_id: int, country: str):
         if user_id in self.users:
             self.users[user_id].country = country
-            self._save()
+            self._write_user(self.users[user_id])
 
     def update_preferred_gender(self, user_id: int, preferred: Gender):
         if user_id in self.users:
             self.users[user_id].preferred_gender = preferred
-            self._save()
+            self._write_user(self.users[user_id])
 
     def update_name(self, user_id: int, name: str) -> bool:
         user = self.users.get(user_id)
         if not user:
             return False
         user.name = name.strip()[:50] or user.name
-        self._save()
+        self._write_user(user)
         return True
 
     def update_age(self, user_id: int, age: int) -> bool:
@@ -384,7 +530,7 @@ class Database:
         if not user:
             return False
         user.age = age
-        self._save()
+        self._write_user(user)
         return True
 
     def update_city(self, user_id: int, city: str) -> bool:
@@ -392,7 +538,7 @@ class Database:
         if not user:
             return False
         user.city = city.strip()[:50] or user.city
-        self._save()
+        self._write_user(user)
         return True
 
     # ── VIP / chat-end notifications ─────────────────────────────
@@ -402,7 +548,7 @@ class Database:
         if not user:
             return False
         user.vip = value
-        self._save()
+        self._write_user(user)
         return True
 
     def set_notify_end(self, user_id: int, value: bool) -> bool:
@@ -410,7 +556,7 @@ class Database:
         if not user:
             return False
         user.notify_on_end = value
-        self._save()
+        self._write_user(user)
         return True
 
     # ── Profile views ────────────────────────────────────────────
@@ -428,7 +574,7 @@ class Database:
         if now - target.view_alert_at < VIEW_ALERT_COOLDOWN:
             return False
         target.view_alert_at = now
-        self._save()
+        self._write_user(target)
         return True
 
     def block_user(self, user_id: int, target_id: int) -> bool:
@@ -438,7 +584,16 @@ class Database:
             return False
         me.blocked.add(target_id)
         me.contacts.discard(target_id)
-        self._save()
+        self._write_user(me)
+        return True
+
+    def unblock_user(self, user_id: int, target_id: int) -> bool:
+        """Undo a block (they become matchable again)."""
+        me = self.users.get(user_id)
+        if not me or target_id not in me.blocked:
+            return False
+        me.blocked.discard(target_id)
+        self._write_user(me)
         return True
 
     def browse_users(
@@ -448,13 +603,69 @@ class Database:
         limit: int = BROWSE_PAGE_SIZE,
     ) -> tuple[list["UserProfile"], int]:
         """Everyone except me, page by page — powers 🎉 Browse People."""
+        return self.browse_filtered(user_id, "all", offset, limit)
+
+    def browse_filtered(
+        self,
+        user_id: int,
+        kind: str = "all",
+        offset: int = 0,
+        limit: int = BROWSE_PAGE_SIZE,
+    ) -> tuple[list["UserProfile"], int]:
+        """
+        Browse categories (MeChat-style "Who do you want to see?"):
+          all     — everyone except me
+          myage   — people within ±2 years of my age
+          ready   — complete profiles, not banned, not busy
+          new     — joined in the last 7 days
+          recent  — people I recently chatted with
+          popular — most liked first
+        """
+        me = self.users.get(user_id)
+        now = time.time()
+
+        if kind == "recent":
+            found = [
+                self.users[uid]
+                for uid in (me.recent_partners if me else [])
+                if uid in self.users and not self.users[uid].banned
+            ]
+            return found[offset : offset + limit], len(found)
+
         found = [
             u
             for u in self.users.values()
             if u.user_id != user_id and not u.banned
         ]
-        found.sort(key=lambda u: u.registered_at, reverse=True)
+
+        if kind == "myage" and me and me.age:
+            found = [u for u in found if u.age and abs(u.age - me.age) <= 2]
+            found.sort(key=lambda u: abs((u.age or 0) - me.age))
+        elif kind == "ready":
+            found = [
+                u
+                for u in found
+                if u.gender and u.country and u.state != ChatState.CHATTING
+            ]
+            found.sort(key=lambda u: u.state == ChatState.SEARCHING, reverse=True)
+        elif kind == "new":
+            found = [u for u in found if now - u.registered_at <= 7 * 86400]
+            found.sort(key=lambda u: u.registered_at, reverse=True)
+        elif kind == "popular":
+            found.sort(key=lambda u: u.likes, reverse=True)
+        else:  # "all"
+            found.sort(key=lambda u: u.registered_at, reverse=True)
+
         return found[offset : offset + limit], len(found)
+
+    def blocked_of(self, user_id: int) -> list["UserProfile"]:
+        """Profiles I've blocked/reported (for the 🚫 Blocked Users list)."""
+        me = self.users.get(user_id)
+        if not me:
+            return []
+        return [
+            self.users[uid] for uid in sorted(me.blocked) if uid in self.users
+        ]
 
     def set_photo(self, user_id: int, file_id: str) -> bool:
         """Store the user's profile photo (Telegram file_id)."""
@@ -462,7 +673,7 @@ class Database:
         if not user:
             return False
         user.photo_file_id = file_id
-        self._save()
+        self._write_user(user)
         return True
 
     # ── Location / Nearby ────────────────────────────────────────
@@ -472,7 +683,7 @@ class Database:
         if not user:
             return False
         user.lat, user.lon = lat, lon
-        self._save()
+        self._write_user(user)
         return True
 
     def has_location(self, user_id: int) -> bool:
@@ -528,7 +739,7 @@ class Database:
         if contact_id in me.contacts:
             return False
         me.contacts.add(contact_id)
-        self._save()
+        self._write_user(me)
         return True
 
     def remove_contact(self, user_id: int, contact_id: int) -> bool:
@@ -536,7 +747,7 @@ class Database:
         if not me or contact_id not in me.contacts:
             return False
         me.contacts.remove(contact_id)
-        self._save()
+        self._write_user(me)
         return True
 
     def contacts_of(self, user_id: int) -> list["UserProfile"]:
@@ -546,6 +757,33 @@ class Database:
         return [
             self.users[uid] for uid in sorted(user.contacts) if uid in self.users
         ]
+
+    # ── Direct messages (privacy: content hidden until opened) ───
+
+    def queue_dm(self, to_id: int, from_id: int, text: str) -> bool:
+        """Store an unread DM. The receiver sees it only via pop_dm()."""
+        if to_id not in self.users or from_id not in self.users:
+            return False
+        self.pending_dms[to_id] = {
+            "from_id": from_id,
+            "text": text[:1000],
+            "at": time.time(),
+        }
+        self._write_dms()
+        return True
+
+    def pop_dm(self, to_id: int) -> Optional[dict]:
+        """Take the oldest unread DM (expired ones are dropped silently)."""
+        dm = self.pending_dms.get(to_id)
+        if not dm:
+            return None
+        if time.time() - dm.get("at", 0) > DM_TTL:
+            del self.pending_dms[to_id]
+            self._write_dms()
+            return None
+        del self.pending_dms[to_id]
+        self._write_dms()
+        return dm
 
     # ── Chat requests (cost CHAT_REQUEST_COST coins) ─────────────
 
@@ -563,7 +801,7 @@ class Database:
             return False
         req["status"] = "expired"
         self.add_coins(from_id, CHAT_REQUEST_COST)  # never burn coins silently
-        self._save()
+        self._write_requests()
         return True
 
     def request_status(self, from_id: int, to_id: int) -> Optional[str]:
@@ -597,7 +835,7 @@ class Database:
             "status": "pending",
             "created_at": time.time(),
         }
-        self._save()
+        self._write_requests()
         return True, "ok"
 
     def resolve_request(self, from_id: int, to_id: int, accepted: bool) -> bool:
@@ -608,7 +846,7 @@ class Database:
         if not req or req.get("status") != "pending":
             return False
         req["status"] = "accepted" if accepted else "declined"
-        self._save()
+        self._write_requests()
         return True
 
     def cancel_request(self, from_id: int, to_id: int) -> bool:
@@ -618,7 +856,7 @@ class Database:
         if not req or req.get("status") != "pending":
             return False
         del self.requests[key]
-        self._save()
+        self._write_requests()
         return True
 
     # ── Verification (photo evidence reviewed by the admin) ──────
@@ -632,7 +870,7 @@ class Database:
             "file_id": file_id,
             "created_at": time.time(),
         }
-        self._save()
+        self._write_verifications()
         return True
 
     def pending_verifications_list(self) -> list[tuple[int, dict]]:
@@ -646,14 +884,15 @@ class Database:
             return None
         user.verified = True
         user.verified_gender = Gender(pending["gender"])
-        self._save()
+        self._write_users(user)
+        self._write_verifications()
         return user
 
     def reject_verification(self, user_id: int) -> bool:
         if user_id not in self.pending_verifications:
             return False
         del self.pending_verifications[user_id]
-        self._save()
+        self._write_verifications()
         return True
 
     # ── Coins ─────────────────────────────────────────────────────
@@ -664,7 +903,7 @@ class Database:
         if not user:
             return 0
         user.coins = max(0, user.coins + amount)
-        self._save()
+        self._write_user(user)
         return user.coins
 
     def spend_coins(self, user_id: int, amount: int) -> bool:
@@ -673,8 +912,35 @@ class Database:
         if not user or user.coins < amount:
             return False
         user.coins -= amount
-        self._save()
+        self._write_user(user)
         return True
+
+    def add_charge(self, charge_id: str) -> bool:
+        """Record a processed Telegram payment. Returns False if already seen."""
+        if charge_id in self.processed_charges:
+            return False
+        self.processed_charges.add(charge_id)
+        self._write_charge(charge_id)
+        return True
+
+    def award_match_reward(self, user_id: int) -> int:
+        """
+        MeChat-style free coin — girls only: +DAILY_REWARD_COINS per match,
+        up to DAILY_REWARD_MAX matches per day. Boys never get the reward.
+        """
+        user = self.users.get(user_id)
+        if not user or user.gender != Gender.FEMALE:
+            return 0
+        today = time.strftime("%Y-%m-%d")
+        if user.reward_date != today:
+            user.reward_date = today
+            user.reward_count = 0
+        if user.reward_count >= DAILY_REWARD_MAX:
+            return 0
+        user.reward_count += 1
+        user.coins = max(0, user.coins + DAILY_REWARD_COINS)
+        self._write_user(user)
+        return DAILY_REWARD_COINS
 
     # ── Referrals ─────────────────────────────────────────────────
 
@@ -695,9 +961,9 @@ class Database:
         new_user.referred_by = referrer_id
         referrer.referral_count += 1
         referrer.referral_earned += REFERRAL_REWARD
-        self.add_coins(referrer_id, REFERRAL_REWARD)
-        self.add_coins(new_user_id, REFERRED_BONUS)
-        self._save()
+        referrer.coins = max(0, referrer.coins + REFERRAL_REWARD)
+        new_user.coins = max(0, new_user.coins + REFERRED_BONUS)
+        self._write_users(referrer, new_user)
         return REFERRAL_REWARD, REFERRED_BONUS
 
     # ── Likes ─────────────────────────────────────────────────────
@@ -711,7 +977,7 @@ class Database:
             return False, target.likes
         target.liked_by.add(from_id)
         target.likes += 1
-        self._save()
+        self._write_user(target)
         return True, target.likes
 
     def unlike(self, from_id: int, to_id: int) -> tuple[bool, int]:
@@ -721,7 +987,7 @@ class Database:
             return False, target.likes if target else 0
         target.liked_by.discard(from_id)
         target.likes = max(0, target.likes - 1)
-        self._save()
+        self._write_user(target)
         return True, target.likes
 
     def likers_of(self, user_id: int) -> list["UserProfile"]:
@@ -744,18 +1010,18 @@ class Database:
             return False
 
         reporter.blocked.add(target_id)
+        self._write_user(reporter)
 
         if reporter_id in target.reports:
-            self._save()
             return False
         target.reports.add(reporter_id)
-        self._save()
 
+        banned = False
         if not target.banned and len(target.reports) >= BAN_REPORT_THRESHOLD:
             target.banned = True
-            self._save()
-            return True
-        return False
+            banned = True
+        self._write_user(target)
+        return banned
 
     # ── Queue / matchmaking ──────────────────────────────────────
 
@@ -765,16 +1031,16 @@ class Database:
             user.state = ChatState.SEARCHING
             user.search_pref = search_pref
             self.queue.append(user_id)
-            self._save()
+            self._write_user(user)
+            self._write_queue_entry(user_id, len(self.queue) - 1)
 
     def remove_from_queue(self, user_id: int):
         changed = user_id in self.queue
         if changed:
             self.queue.remove(user_id)
+            self._delete_queue_entry(user_id)
         user = self.users.get(user_id)
         if not user:
-            if changed:
-                self._save()
             return
         if user.state == ChatState.SEARCHING:
             user.state = ChatState.IDLE
@@ -783,7 +1049,7 @@ class Database:
             user.search_pref = None
             changed = True
         if changed:
-            self._save()
+            self._write_user(user)
 
     def find_match(self, user_id: int) -> Optional[int]:
         """
@@ -843,14 +1109,26 @@ class Database:
 
     def pair_users(self, user_a: int, user_b: int):
         for uid in (user_a, user_b):
-            self.remove_from_queue(uid)
+            if uid in self.queue:
+                self.queue.remove(uid)
+                self._delete_queue_entry(uid)
             user = self.users[uid]
             user.state = ChatState.CHATTING
+            user.search_pref = None
             user.total_chats += 1
 
-        self.users[user_a].partner_id = user_b
-        self.users[user_b].partner_id = user_a
-        self._save()
+        # Remember each other in chat history (newest first, capped)
+        a, b = self.users[user_a], self.users[user_b]
+        a.recent_partners = [user_b] + [
+            uid for uid in a.recent_partners if uid != user_b
+        ][: RECENT_PARTNER_LIMIT - 1]
+        b.recent_partners = [user_a] + [
+            uid for uid in b.recent_partners if uid != user_a
+        ][: RECENT_PARTNER_LIMIT - 1]
+
+        a.partner_id = user_b
+        b.partner_id = user_a
+        self._write_users(a, b)
 
     def end_chat(self, user_id: int) -> Optional[int]:
         """End the chat for user_id and return the partner's id."""
@@ -862,14 +1140,16 @@ class Database:
         user.state = ChatState.IDLE
         user.partner_id = None
         user.search_pref = None
+        changed: list[UserProfile] = [user]
 
         if partner_id and partner_id in self.users:
             partner = self.users[partner_id]
             partner.state = ChatState.IDLE
             partner.partner_id = None
             partner.search_pref = None
+            changed.append(partner)
 
-        self._save()
+        self._write_users(*changed)
         return partner_id
 
     # ── Stats ────────────────────────────────────────────────────

@@ -607,3 +607,135 @@ def test_banned_users_are_not_browsable():
     db.get_user(2).banned = True
     users, total = db.browse_users(1, 0, 10)
     assert total == 0 and users == []
+
+
+# -- MeChat-style extras: history, browse filters, DMs, rewards, slugs --
+
+
+def test_recent_partners_are_recorded():
+    from database import Database, Gender
+
+    db = Database()
+    make_user(db, 1, gender=Gender.MALE, country="US")
+    make_user(db, 2, gender=Gender.FEMALE, country="FR")
+    db.pair_users(1, 2)
+
+    assert db.get_user(1).recent_partners == [2]
+    assert db.get_user(2).recent_partners == [1]
+
+    # Rematching someone moves them to the front, no duplicates
+    db.end_chat(1)
+    db.pair_users(1, 2)
+    assert db.get_user(1).recent_partners.count(2) == 1
+    assert db.get_user(1).recent_partners[0] == 2
+
+
+def test_browse_recent_shows_past_partners():
+    db = Database()
+    make_user(db, 1, gender=Gender.MALE, country="US")
+    make_user(db, 2, gender=Gender.FEMALE, country="FR")
+    make_user(db, 3, gender=Gender.FEMALE, country="IN")
+    db.pair_users(1, 2)
+    db.end_chat(1)
+
+    page, total = db.browse_filtered(1, "recent", 0, 10)
+    assert total == 1 and page[0].user_id == 2
+
+
+def test_browse_myage_filters_by_age():
+    db = Database()
+    me = make_user(db, 1, gender=Gender.MALE, country="US")
+    db.update_age(1, 25)
+    near = make_user(db, 2, gender=Gender.FEMALE, country="FR")
+    db.update_age(2, 26)
+    far = make_user(db, 3, gender=Gender.FEMALE, country="IN")
+    db.update_age(3, 40)
+
+    page, total = db.browse_filtered(1, "myage", 0, 10)
+    assert total == 1 and page[0].user_id == near.user_id
+
+
+def test_browse_popular_sorts_by_likes():
+    db = Database()
+    make_user(db, 1)
+    a = make_user(db, 2)
+    b = make_user(db, 3)
+    db.add_like(1, 2)
+    db.add_like(1, 3)
+    db.add_like(2, 3)
+
+    page, _ = db.browse_filtered(1, "popular", 0, 10)
+    assert [u.user_id for u in page][:2] == [b.user_id, a.user_id]
+
+
+def test_browse_ready_requires_complete_profile():
+    db = Database()
+    make_user(db, 1)
+    ready = make_user(db, 2, gender=Gender.FEMALE, country="FR")
+    make_user(db, 3)  # no gender/country
+
+    page, total = db.browse_filtered(1, "ready", 0, 10)
+    assert total == 1 and page[0].user_id == ready.user_id
+
+
+def test_pending_dms_are_queued_and_popped():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+
+    assert db.queue_dm(2, 1, "hi there") is True
+    dm = db.pop_dm(2)
+    assert dm["from_id"] == 1 and dm["text"] == "hi there"
+    assert db.pop_dm(2) is None  # consumed
+
+
+def test_award_match_reward_is_capped_per_day():
+    from database import DAILY_REWARD_COINS, DAILY_REWARD_MAX, Database
+
+    db = Database()
+    make_user(db, 1, gender=Gender.FEMALE)
+    start = db.get_user(1).coins
+
+    awarded = [db.award_match_reward(1) for _ in range(DAILY_REWARD_MAX + 3)]
+    assert awarded[:DAILY_REWARD_MAX] == [DAILY_REWARD_COINS] * DAILY_REWARD_MAX
+    assert all(a == 0 for a in awarded[DAILY_REWARD_MAX:])
+    assert db.get_user(1).coins == start + DAILY_REWARD_MAX * DAILY_REWARD_COINS
+
+
+def test_award_match_reward_is_girls_only():
+    from database import Database, Gender
+
+    db = Database()
+    boy = make_user(db, 1, gender=Gender.MALE)
+    girl = make_user(db, 2, gender=Gender.FEMALE)
+    no_gender = make_user(db, 3)
+
+    assert db.award_match_reward(1) == 0
+    assert db.award_match_reward(3) == 0
+    assert db.award_match_reward(2) == 1
+
+
+def test_blocked_list_and_unblock():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.block_user(1, 2)
+
+    assert [u.user_id for u in db.blocked_of(1)] == [2]
+    assert db.unblock_user(1, 2) is True
+    assert db.blocked_of(1) == []
+    assert db.unblock_user(1, 2) is False
+
+
+def test_public_id_slug_roundtrip():
+    from database import format_public_id, public_id_slug
+
+    db = Database()
+    user = make_user(db, 1)
+    slug = public_id_slug(user)
+
+    assert slug.startswith("user_")
+    assert format_public_id(user) == f"/{slug}"
+    assert db.resolve_id(slug) is user
+    assert db.resolve_id(f"/{slug}") is user
+    assert db.resolve_id(str(user.public_id)) is user  # raw int still works

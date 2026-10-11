@@ -24,7 +24,13 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
-from telegram import Update, LabeledPrice, BotCommand
+from telegram import (
+    Update,
+    LabeledPrice,
+    BotCommand,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -48,6 +54,9 @@ from database import (
     CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
     BROWSE_PAGE_SIZE,
+    DAILY_REWARD_COINS,
+    format_public_id,
+    public_id_slug,
 )
 from keyboards import (
     gender_keyboard,
@@ -70,12 +79,24 @@ from keyboards import (
     view_request_keyboard,
     viewed_by_keyboard,
     browse_keyboard,
+    browse_menu_keyboard,
+    blocked_users_keyboard,
+    promo_keyboard,
     swipe_keyboard,
     vip_keyboard,
     verify_keyboard,
     NEW_CHAT_LABEL,
     BROWSE_LABEL,
     NEARBY_LABEL,
+)
+from animations import (
+    ANIMATIONS_ENABLED,
+    animate_edit,
+    animate_search,
+    typing_pulse,
+    celebration_pulse,
+    match_frames,
+    reveal_frames,
 )
 
 load_dotenv()
@@ -206,6 +227,32 @@ ALL_SET_TEXT = """
 Use the buttons below to find a partner, browse people or open the menu.
 """
 
+SEARCHING_TEXT = """
+🔍 **Searching for a partner…**
+
+👥 {count} people in queue
+Please wait, you'll be connected soon!
+"""
+
+PROMO_TEXT = (
+    "Want to start an anonymous chat? 😎\n\n"
+    "Tap 🎲 **Start Random Chat** and start chatting now.\n"
+    f"🎁 Girls receive **{DAILY_REWARD_COINS} free coin** per match! 👇"
+)
+
+
+async def send_promo(context, chat_id: int) -> None:
+    """MeChat-style pinned promo: nudges the user into a random chat."""
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=PROMO_TEXT,
+            parse_mode="Markdown",
+            reply_markup=promo_keyboard(None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"promo skipped for {chat_id}: {e}")
+
 
 def credit_text(user) -> str:
     return (
@@ -287,22 +334,35 @@ def display_name(user) -> str:
 
 
 async def notify_partner_found(context, user_id, partner_id):
-    """Send 'partner found' notifications to both users."""
+    """Send 'partner found' notifications to both users (with reveal animation)."""
     user = db.get_user(user_id)
     partner = db.get_user(partner_id)
 
     for u, p in [(user, partner), (partner, user)]:
+        # MeChat-style free coin for starting a chat
+        reward = db.award_match_reward(u.user_id)
+        reward_line = (
+            f"\n🎁 **+{reward} 🪙 free coin** for starting a chat!"
+            if reward
+            else ""
+        )
         partner_info = (
             f"🎉 **Partner found!**\n\n"
             f"{gender_emoji(p.gender)} **{display_name(p)}**"
             f"{f', {p.age}' if p.age else ''}\n"
-            f"🌍 {p.city or p.country or 'Unknown'}\n"
+            f"📍 {p.city or p.country or 'Unknown'}\n"
             f"👁 {format_online(p)}\n"
             f"🪩 {verified_label(p)}\n"
-            f"🆔 ID: `{p.public_id}`\n\n"
+            f"🆔 `{format_public_id(p)}`\n\n"
             f"Say hi! Type your message below.\n"
-            f"Use /stop or the buttons to end the chat."
+            f"Use ⏭ Next Partner to skip.{reward_line}"
         )
+        # Short "typing…" beat + match reveal, like the reference bot
+        if ANIMATIONS_ENABLED:
+            await typing_pulse(context.bot, u.user_id, times=2, interval=0.4)
+            await animate_edit(
+                _MsgTarget(context.bot, u.user_id), match_frames(), interval=0.45
+            )
         await context.bot.send_message(
             chat_id=u.user_id,
             text=partner_info,
@@ -315,10 +375,28 @@ async def notify_partner_found(context, user_id, partner_id):
                 await context.bot.send_photo(
                     chat_id=u.user_id,
                     photo=p.photo_file_id,
-                    caption="📷 Partner's profile photo",
+                    caption=f"📷 {display_name(p)}'s profile photo",
                 )
             except Exception as e:
                 logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
+
+
+class _MsgTarget:
+    """Minimal edit target so animate_edit can 'type into' a fresh message."""
+
+    def __init__(self, bot, chat_id):
+        self._bot = bot
+        self._chat_id = chat_id
+        self._message_id = None
+
+    async def edit_message_text(self, text, parse_mode=None):
+        if self._message_id is None:
+            msg = await self._bot.send_message(chat_id=self._chat_id, text=text)
+            self._message_id = msg.message_id
+        else:
+            await self._bot.edit_message_text(
+                chat_id=self._chat_id, message_id=self._message_id, text=text
+            )
 
 
 async def safe_edit(query, text, parse_mode=None, reply_markup=None):
@@ -351,7 +429,7 @@ def build_profile_text(user) -> str:
         age=user.age if user.age else "—",
         city=user.city or (user.country or "—"),
         online=format_online(user),
-        public_id=user.public_id,
+        public_id=format_public_id(user),
         likes=user.likes,
         coins=user.coins,
         country=user.country or "Not set",
@@ -378,21 +456,22 @@ def verified_label(user) -> str:
 
 
 def build_user_card(target, viewer_id: int) -> str:
-    """Profile card for someone else's account (ID search / Nearby / Browse)."""
+    """Profile card in the reference bot's bullet style."""
+    place_parts = [p for p in (target.country, target.city) if p]
+    place = " (".join([place_parts[0], place_parts[1] + ")"]) if len(place_parts) > 1 else (place_parts[0] if place_parts else "Not set")
     lines = [
-        f"{gender_emoji(target.gender)} **{display_name(target)}**"
-        f"{f', {target.age}' if target.age else ''}",
-        f"📍 {target.city or target.country or 'Not set'}",
+        f"{gender_emoji(target.gender)} **{display_name(target)}**",
+        f"• Age: {target.age if target.age else '—'}",
+        f"• City: {place}",
+        f"• Number of likes: {target.likes}",
         "",
-        f"👁 {format_online(target)}",
-        f"🆔 ID: `{target.public_id}`",
+        f"Currently {format_online(target)}",
+        f"ID: `{format_public_id(target)}`",
         "",
-        f"❤️ {target.likes} likes",
-        f"🔹 **Gender:** {format_gender(target.gender)}",
-        f"🪩 {verified_label(target)}",
     ]
     if target.vip:
         lines.append("👑 VIP member")
+    lines.append(f"🪩 {verified_label(target)}")
     distance = db.distance_km(viewer_id, target.user_id)
     if distance is not None:
         lines.append(f"📍 Distance: {distance:.0f} km away")
@@ -481,6 +560,39 @@ def _nearby_pairs(viewer_id: int) -> list:
     return pairs
 
 
+async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> None:
+    """
+    Reference-bot style: the nearest people arrive as photo cards with
+    name/age/city/online status before the text list.
+    """
+    if not ANIMATIONS_ENABLED:
+        return
+    for label, target in pairs[:limit]:
+        if not target.photo_file_id:
+            continue
+        dist = db.distance_km(chat_id, target.user_id)
+        caption = (
+            f"{_plain_label(target)}\n"
+            f"📍 {dist:.0f} km away • {target.city or target.country or ''}\n"
+            f"👀 {format_online(target)}\n"
+            f"ID: `{format_public_id(target)}`"
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=target.photo_file_id,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "👤 Open Profile", callback_data=f"view_{target.user_id}"
+                    )]
+                ]),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"nearby card for {target.user_id} skipped: {e}")
+
+
 def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
     pairs = []
     for uid in ids:
@@ -507,7 +619,7 @@ def _browse_entry(target) -> str:
     place = ", ".join(p for p in (target.country, target.city) if p) or "Not set"
     return (
         f"{gender_emoji(target.gender)} **{display_name(target)}**"
-        f"{f', {target.age}' if target.age else ''} • `{target.public_id}`\n"
+        f"{f', {target.age}' if target.age else ''} • `{public_id_slug(target)}`\n"
         f"📍 {place}\n"
         f"👀 {format_online(target)}\n"
         f"{'〰️' * 8}"
@@ -559,7 +671,7 @@ async def notify_profile_view(context, viewer_id: int, target) -> None:
     try:
         await context.bot.send_message(
             chat_id=target.user_id,
-            text=f"🧖 A {kind} just viewed your profile 👀🔥",
+            text=f"🏆 A {kind} just viewed your profile 👀🔥",
             reply_markup=viewed_by_keyboard(viewer_id),
         )
     except Exception as e:
@@ -602,10 +714,15 @@ async def close_chat(context, user_id: int, leaver_notice: str = "👋 You left 
     await _ping_chat_end(context, user_id, partner_id)
 
 
-async def begin_search(context, user_id: int, search_pref: Gender):
+async def begin_search(
+    context, user_id: int, search_pref: Gender, target=None
+):
     """
     Start a search with the given per-search filter.
     Charges coins when searching for a Girl (VIP members search free).
+    When `target` (a Message or CallbackQuery) is given and animations are
+    on, plays the radar animation there and returns (None, None, None)
+    so the caller doesn't send a duplicate message.
     Returns (text, reply_markup, parse_mode).
     """
     user = db.get_user(user_id)
@@ -642,7 +759,7 @@ async def begin_search(context, user_id: int, search_pref: Gender):
         charged = True
 
     db.add_to_queue(user_id, search_pref=search_pref)
-    match_id = db.find_match(user_id)
+    match_id = await asyncio.to_thread(db.find_match, user_id)
 
     if match_id:
         db.pair_users(user_id, match_id)
@@ -653,11 +770,47 @@ async def begin_search(context, user_id: int, search_pref: Gender):
             text += f"\n🪙 -{GIRL_SEARCH_COST} | Balance: {balance}"
         return text, None, None
 
-    text = (
-        "🔍 **Searching for a partner...**\n\n"
-        f"👥 {db.searching_count} people in queue\n"
-        "Please wait, you'll be connected soon!"
-    )
+    # Animated radar wait: re-check for a partner after every frame.
+    if target is not None and ANIMATIONS_ENABLED:
+        def _check():
+            found = db.find_match(user_id)
+            if found:
+                db.pair_users(user_id, found)
+            return found
+
+        found = await animate_search(
+            context,
+            user_id,
+            _check,
+            queue_size_fn=lambda: db.searching_count,
+            target=target,
+        )
+        if found:
+            await notify_partner_found(context, user_id, found)
+            text = "🎉 Partner found! Connecting..."
+            if charged:
+                balance = db.get_user(user_id).coins
+                text += f"\n🪙 -{GIRL_SEARCH_COST} | Balance: {balance}"
+            return text, None, None
+        # Still searching — the last radar frame is already on screen.
+        try:
+            if hasattr(target, "edit_message_text"):
+                await target.edit_message_text(
+                    SEARCHING_TEXT.format(count=db.searching_count),
+                    parse_mode="Markdown",
+                    reply_markup=searching_keyboard(),
+                )
+            elif hasattr(target, "edit_text"):
+                await target.edit_text(
+                    SEARCHING_TEXT.format(count=db.searching_count),
+                    parse_mode="Markdown",
+                    reply_markup=searching_keyboard(),
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"final search frame skipped: {e}")
+        return None, None, None
+
+    text = SEARCHING_TEXT.format(count=db.searching_count)
     if charged:
         balance = db.get_user(user_id).coins
         text += f"\n\n🪙 -{GIRL_SEARCH_COST} (Girl search) | Balance: {balance}"
@@ -739,6 +892,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👇 Use the buttons below anytime.",
             reply_markup=main_reply_keyboard(),
         )
+        await send_promo(context, user_id)
         return
 
     welcome = WELCOME_MSG.format(free=STARTING_COINS)
@@ -915,30 +1069,51 @@ async def newchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.get_user(user_id):
         await update.message.reply_text("Please /start first.")
         return
-    text, markup, mode = await begin_search(context, user_id, Gender.ANY)
-    await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+    text, markup, mode = await begin_search(
+        context, user_id, Gender.ANY, target=update.message
+    )
+    if text:
+        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+
+
+BROWSE_MENU_TEXT = (
+    "🌟 **Who do you want to see?**\n\n"
+    "Pick a category below 👇"
+)
+
+BROWSE_KIND_TITLES = {
+    "myage": "⭐ People My Age",
+    "ready": "💕 Ready to Chat",
+    "new": "🙋 New Members 🙋",
+    "recent": "👀 Recent Chats 👀",
+    "popular": "Popular People ❤️",
+    "all": "🌍 Everyone",
+}
 
 
 async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🎉 Browse People — paginated list of everyone around."""
+    """🎉 Browse People — MeChat-style category menu."""
     user_id = update.effective_user.id
     if not db.get_user(user_id):
         await update.message.reply_text("Please /start first.")
         return
-    page, total = db.browse_users(user_id, 0, BROWSE_PAGE_SIZE)
-    context.user_data["browse_ids"] = [u.user_id for u in page]
-    context.user_data["browse_offset"] = len(page)
-    context.user_data["browse_total"] = total
-    context.user_data["list_ids"] = context.user_data["browse_ids"]
-    context.user_data["list_title"] = "🎉 People online"
-    context.user_data["list_kind"] = "browse"
     await update.message.reply_text(
-        _browse_text(page, total),
+        BROWSE_MENU_TEXT,
         parse_mode="Markdown",
-        reply_markup=browse_keyboard(
-            len(page) < total, [(_plain_label(u), u) for u in page]
-        ),
+        reply_markup=browse_menu_keyboard(),
     )
+
+
+def _load_browse_page(context, user_id: int, kind: str, offset: int = 0):
+    """Load one browse page into user_data; returns (users, total)."""
+    page, total = db.browse_filtered(user_id, kind, offset, BROWSE_PAGE_SIZE)
+    seen = context.user_data.get("browse_ids", []) if offset else []
+    merged = (seen + [u.user_id for u in page])[:20]
+    context.user_data["browse_ids"] = merged
+    context.user_data["browse_offset"] = min(20, offset + len(page))
+    context.user_data["browse_total"] = total
+    context.user_data["browse_kind"] = kind
+    return page, total
 
 
 async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +1134,7 @@ async def link_anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please /start first.")
         return
     me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start=chat_{user.public_id}"
+    link = f"https://t.me/{me.username}?start=chat_{public_id_slug(user)}"
     await update.message.reply_text(
         f"👀 **Your anonymous Chat link:**\n`{link}`\n\n"
         f"Anyone who opens it lands straight on your profile card — they can "
@@ -989,7 +1164,7 @@ async def verifylist_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for uid, info in pending:
         target = db.get_user(uid)
         lines.append(
-            f"• `{uid}` (ID `{target.public_id if target else '?'}`) "
+            f"• `{uid}` (ID `{format_public_id(target) if target else '?'}`) "
             f"@{target.username if target and target.username else '-'} "
             f"— claims **{info['gender']}**"
         )
@@ -1196,13 +1371,68 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "search_guy": Gender.MALE,
             "search_girl": Gender.FEMALE,
         }
-        text, markup, parse_mode = await begin_search(context, user_id, pref_map[data])
-        await safe_edit(query, text, parse_mode=parse_mode, reply_markup=markup)
+        text, markup, parse_mode = await begin_search(
+            context, user_id, pref_map[data], target=query
+        )
+        if text:
+            await safe_edit(query, text, parse_mode=parse_mode, reply_markup=markup)
 
     elif data == "my_profile":
+        # MeChat-style: own profile as a photo card when a photo exists
+        if user.photo_file_id:
+            try:
+                await typing_pulse(context.bot, user_id, times=1, interval=0.3)
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=user.photo_file_id,
+                    caption=build_profile_text(user),
+                    parse_mode="Markdown",
+                    reply_markup=profile_keyboard(),
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Failed to send profile photo card: {e}")
         await safe_edit(
             query, build_profile_text(user), parse_mode="Markdown",
             reply_markup=profile_keyboard(),
+        )
+
+    elif data == "blocked_list":
+        blocked = db.blocked_of(user_id)
+        if not blocked:
+            text = (
+                "🚫 **No blocked users**\n\n"
+                "When you block or report someone, they'll show up here."
+            )
+        else:
+            lines = [
+                f"• {display_name(u)} `{format_public_id(u)}`" for u in blocked
+            ]
+            text = (
+                f"🚫 **Blocked Users** ({len(blocked)})\n\n"
+                + "\n".join(lines)
+                + "\n\nTap a name to Unblock them."
+            )
+        await safe_edit(
+            query, text, parse_mode="Markdown",
+            reply_markup=blocked_users_keyboard(blocked),
+        )
+
+    elif data.startswith("unblock_"):
+        target = db.get_user(int(data[len("unblock_"):]))
+        me = db.get_user(user_id)
+        if not target or not me or not db.unblock_user(user_id, target.user_id):
+            await query.answer("That user isn't in your blocked list.", show_alert=True)
+            return
+        await query.answer(f"✅ {display_name(target)} unblocked")
+        blocked = db.blocked_of(user_id)
+        await safe_edit(
+            query,
+            f"🚫 **Blocked Users** ({len(blocked)})\n\nTap a name to Unblock them."
+            if blocked
+            else "🚫 **No blocked users**",
+            parse_mode="Markdown",
+            reply_markup=blocked_users_keyboard(blocked),
         )
 
     elif data == "stats":
@@ -1410,7 +1640,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=share_location_keyboard(),
             )
         else:
-            pairs = _nearby_pairs(user_id)
+            pairs = await asyncio.to_thread(_nearby_pairs, user_id)
+            await send_nearby_cards(context, user_id, pairs)
             context.user_data["list_ids"] = [u.user_id for _, u in pairs]
             context.user_data["list_title"] = "📍 People near you"
             context.user_data["list_kind"] = "nearby"
@@ -1669,10 +1900,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # ── Browse People ──────────────────────────────────────
+    elif data == "browse_menu":
+        await safe_edit(
+            query,
+            BROWSE_MENU_TEXT,
+            parse_mode="Markdown",
+            reply_markup=browse_menu_keyboard(),
+        )
+
+    elif data.startswith("brw_"):
+        kind = data[len("brw_"):]
+        page, total = await asyncio.to_thread(
+            db.browse_filtered, user_id, kind, 0, BROWSE_PAGE_SIZE
+        )
+        context.user_data["browse_ids"] = [u.user_id for u in page]
+        context.user_data["browse_offset"] = len(page)
+        context.user_data["browse_total"] = total
+        context.user_data["browse_kind"] = kind
+        title = BROWSE_KIND_TITLES.get(kind, "🎉 People online")
+        context.user_data["list_ids"] = context.user_data["browse_ids"]
+        context.user_data["list_title"] = title
+        context.user_data["list_kind"] = "browse"
+        text, markup = _browse_state(context, user_id)
+        _remember_list_message(context, query)
+        await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
+
     elif data in ("browse_more", "browse_list"):
         if data == "browse_more":
             offset = context.user_data.get("browse_offset", 0)
-            page, total = db.browse_users(user_id, offset, BROWSE_PAGE_SIZE)
+            kind = context.user_data.get("browse_kind", "all")
+            page, total = await asyncio.to_thread(
+                db.browse_filtered, user_id, kind, offset, BROWSE_PAGE_SIZE
+            )
             seen = context.user_data.get("browse_ids", [])
             context.user_data["browse_ids"] = (seen + [u.user_id for u in page])[:20]
             context.user_data["browse_offset"] = min(
@@ -1707,6 +1966,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("No more profiles.", show_alert=True)
             return
         await _render_swipe(query, context, user_id, index)
+
+    elif data.startswith("view_msg_"):
+        # Reveal a stored direct message (content hidden until tapped)
+        dm = db.pop_dm(user_id)
+        if not dm:
+            await query.answer("No unread messages.", show_alert=True)
+            return
+        sender = db.get_user(dm.get("from_id"))
+        await typing_pulse(context.bot, user_id, times=1, interval=0.25)
+        await safe_edit(
+            query,
+            f"📩 **Message from {display_name(sender) if sender else 'someone'}:**\n\n"
+            f"{dm.get('text', '')}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "💬 Open their profile", callback_data=f"view_{dm.get('from_id', 0)}"
+                )],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="back_menu")],
+            ]),
+        )
 
     elif data == "browse_msg":
         if not context.user_data.get("browse_ids"):
@@ -1746,7 +2026,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"To view the chat request and accept or reject it, click the "
             f"button below 👇\n\n"
             f"{gender_emoji(requester.gender)} **{display_name(requester)}** "
-            f"• `{requester.public_id}`",
+            f"• `{format_public_id(requester)}`",
             parse_mode="Markdown",
             reply_markup=request_keyboard(requester_id),
         )
@@ -1951,7 +2231,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         location = update.message.location
         if location:
             db.set_location(user_id, location.latitude, location.longitude)
-            pairs = _nearby_pairs(user_id)
+            pairs = await asyncio.to_thread(_nearby_pairs, user_id)
+            await send_nearby_cards(context, user_id, pairs)
             context.user_data["list_ids"] = [u.user_id for _, u in pairs]
             context.user_data["list_title"] = "📍 People near you"
             context.user_data["list_kind"] = "nearby"
@@ -2066,6 +2347,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(),
             )
+            await send_promo(context, user_id)
         else:
             await update.message.reply_text(
                 f"✅ City set to **{city}**",
@@ -2107,10 +2389,20 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         sent = 0
         for uid in recipients:
+            db.queue_dm(uid, user_id, text)
             try:
+                # Privacy-first: content stays hidden until the receiver taps
                 await context.bot.send_message(
                     chat_id=uid,
-                    text=f"📩 Message from {display_name(user)}:\n\n{text}",
+                    text=(
+                        f"🔔 You have a new #direct message\n\n"
+                        f"To view the message, click the button below"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "👀 View Message", callback_data=f"view_msg_{user_id}"
+                        )]
+                    ]),
                 )
                 sent += 1
             except Exception as e:
@@ -2125,23 +2417,17 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.state != ChatState.CHATTING and update.message.text:
         text = update.message.text.strip()
         if text == NEW_CHAT_LABEL:
-            reply, markup, mode = await begin_search(context, user_id, Gender.ANY)
-            await update.message.reply_text(reply, parse_mode=mode, reply_markup=markup)
+            reply, markup, mode = await begin_search(
+                context, user_id, Gender.ANY, target=update.message
+            )
+            if reply:
+                await update.message.reply_text(reply, parse_mode=mode, reply_markup=markup)
             return
         if text == BROWSE_LABEL:
-            page, total = db.browse_users(user_id, 0, BROWSE_PAGE_SIZE)
-            context.user_data["browse_ids"] = [u.user_id for u in page]
-            context.user_data["browse_offset"] = len(page)
-            context.user_data["browse_total"] = total
-            context.user_data["list_ids"] = context.user_data["browse_ids"]
-            context.user_data["list_title"] = "🎉 People online"
-            context.user_data["list_kind"] = "browse"
             await update.message.reply_text(
-                _browse_text(page, total),
+                BROWSE_MENU_TEXT,
                 parse_mode="Markdown",
-                reply_markup=browse_keyboard(
-                    len(page) < total, [(_plain_label(u), u) for u in page]
-                ),
+                reply_markup=browse_menu_keyboard(),
             )
             return
         if text == NEARBY_LABEL:
@@ -2154,7 +2440,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=share_location_keyboard(),
                 )
             else:
-                pairs = _nearby_pairs(user_id)
+                pairs = await asyncio.to_thread(_nearby_pairs, user_id)
+                await send_nearby_cards(context, user_id, pairs)
                 context.user_data["list_ids"] = [u.user_id for _, u in pairs]
                 context.user_data["list_title"] = "📍 People near you"
                 context.user_data["list_kind"] = "nearby"
@@ -2261,7 +2548,7 @@ async def payment_success_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if charge_id in db.processed_charges:
         return
-    db.processed_charges.add(charge_id)
+    db.add_charge(charge_id)
 
     parts = (payment.invoice_payload or "").split(":")
     if len(parts) == 3 and parts[0] == "coin_pack":
@@ -2350,7 +2637,13 @@ def main():
     # Start health check server in background thread for Koyeb / cloud platforms
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(set_bot_commands).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(set_bot_commands)
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))

@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
 
 # Tests must never touch a real SQLite file (set before database.py is imported).
 os.environ["DB_PATH"] = ""
+# Keep the suite fast and deterministic — no frame-by-frame animations.
+os.environ["BOT_ANIMATIONS"] = "0"
 
 
 @pytest.fixture
@@ -25,6 +27,8 @@ def fresh_db():
         bot.db.processed_charges.clear()
         bot.db.requests.clear()
         bot.db.pending_verifications.clear()
+        bot.db.pending_dms.clear()
+        bot.db._by_public_id.clear()
 
     clear()
     yield bot.db

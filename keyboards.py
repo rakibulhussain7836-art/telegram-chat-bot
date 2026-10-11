@@ -128,17 +128,58 @@ def search_choice_keyboard() -> InlineKeyboardMarkup:
 
 def profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❤️ View Likers", callback_data="view_likers")],
-        [InlineKeyboardButton("📇 My Contacts", callback_data="contacts")],
         [
-            InlineKeyboardButton("🔍 Find a Partner", callback_data="find_partner"),
+            InlineKeyboardButton("❤️ View Likers", callback_data="view_likers"),
+            InlineKeyboardButton("📇 Contact List", callback_data="contacts"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Blocked Users", callback_data="blocked_list"),
+            InlineKeyboardButton("⚙️ Advanced Settings", callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
             InlineKeyboardButton("💎 Credits", callback_data="credit_menu"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+            InlineKeyboardButton("📝 Edit Profile Information", callback_data="settings"),
         ],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="back_menu")],
+    ])
+
+
+def blocked_users_keyboard(users) -> InlineKeyboardMarkup:
+    """🚫 Blocked Users list with per-user Unblock buttons."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🚫 {getattr(u, 'name', None) or getattr(u, 'username', None) or u.user_id}",
+                callback_data=f"unblock_{u.user_id}",
+            )
+        ]
+        for u in users[:20]
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="my_profile")])
+    return InlineKeyboardMarkup(rows)
+
+
+def browse_menu_keyboard() -> InlineKeyboardMarkup:
+    """🌟 'Who do you want to see?' — MeChat-style browse categories."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ People My Age", callback_data="brw_myage")],
+        [
+            InlineKeyboardButton("💕 Ready to Chat", callback_data="brw_ready"),
+            InlineKeyboardButton("🙋 New Members 🙋", callback_data="brw_new"),
+        ],
+        [InlineKeyboardButton("👀 Recent Chats 👀", callback_data="brw_recent")],
+        [InlineKeyboardButton("Popular People ❤️", callback_data="brw_popular")],
+        [InlineKeyboardButton("🌍 Everyone", callback_data="brw_all")],
+    ])
+
+
+def promo_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    """Pinned-style promo: start a chat and grab the free coin."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 Start Random Chat", callback_data="search_random")]
     ])
 
 
@@ -290,7 +331,7 @@ def view_request_keyboard(from_id: int) -> InlineKeyboardMarkup:
 def viewed_by_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Attached to the "someone viewed your profile" toast."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✨❤️🔥 View Profile", callback_data=f"view_{user_id}")]
+        [InlineKeyboardButton("✨🔥 View Profile", callback_data=f"view_{user_id}")]
     ])
 
 
@@ -307,6 +348,7 @@ def browse_keyboard(has_more: bool, pairs=()) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✨ View Profiles by Swiping", callback_data="browse_swipe"),
         InlineKeyboardButton("📋 Send Message to List", callback_data="browse_msg"),
     ])
+    rows.append([InlineKeyboardButton("🌟 Change Category", callback_data="browse_menu")])
     rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 

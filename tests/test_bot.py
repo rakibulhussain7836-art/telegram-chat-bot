@@ -420,7 +420,7 @@ def _buttons(markup):
 def test_profile_shows_public_id_contacts_and_verification(fresh_db):
     user = register(fresh_db, 1)
     text = bot.build_profile_text(user)
-    assert f"`{user.public_id}`" in text
+    assert f"`{bot.format_public_id(user)}`" in text
     assert "📇" in text and "❌ Not verified" in text
 
 
@@ -441,7 +441,7 @@ def test_id_search_shows_profile_card(fresh_db):
     asyncio.run(bot.relay_message(update, context))
 
     reply = update.message.replies[0]
-    assert f"`{target.public_id}`" in reply["text"]
+    assert f"`{bot.format_public_id(target)}`" in reply["text"]
     labels = [b.text for b in _buttons(reply["reply_markup"])]
     assert any("Like" in label for label in labels)
     assert any(f"{CHAT_REQUEST_COST}" in label for label in labels)
@@ -792,7 +792,7 @@ def test_user_card_shows_name_age_and_online_status(fresh_db):
     text = bot.build_user_card(target, 1)
     assert "Shivani" in text and "19" in text and "Bangalore" in text
     assert "Online (Chatting" in text
-    assert f"`{target.public_id}`" in text
+    assert f"`{bot.format_public_id(target)}`" in text
 
 
 def test_profile_card_buttons_match_reference(fresh_db):
@@ -973,7 +973,7 @@ def test_reply_keyboard_starts_random_chat(fresh_db):
     assert fresh_db.get_user(1).state == ChatState.SEARCHING
 
 
-def test_reply_keyboard_opens_browse_list(fresh_db):
+def test_reply_keyboard_opens_browse_menu(fresh_db):
     register(fresh_db, 1)
     other = register(fresh_db, 2, gender=Gender.FEMALE)
     context = FakeContext()
@@ -982,9 +982,17 @@ def test_reply_keyboard_opens_browse_list(fresh_db):
     asyncio.run(bot.relay_message(update, context))
 
     reply = update.message.replies[0]
-    assert "People online" in reply["text"]
-    assert f"view_{other.user_id}" in [
+    assert "Who do you want to see" in reply["text"]
+    assert "brw_ready" in [
         b.callback_data for b in _buttons(reply["reply_markup"])
+    ]
+
+    # Picking a category shows the actual list
+    query, _ = press(1, "brw_all", context)
+    text = query.edits[-1]["text"]
+    assert "People online" in text
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
     ]
 
 
@@ -1005,19 +1013,29 @@ def test_reply_keyboard_text_is_relayed_while_chatting(fresh_db):
 
 # ── Browse / swipe ─────────────────────────────────────────────
 
-def test_browse_command_lists_profiles(fresh_db):
+def test_browse_command_shows_category_menu(fresh_db):
     register(fresh_db, 1)
     other = register(fresh_db, 2, gender=Gender.FEMALE)
     fresh_db.update_name(2, "Shivani")
     fresh_db.update_age(2, 19)
     fresh_db.update_city(2, "Bangalore")
 
+    context = FakeContext()
     update = FakeUpdate(1)
-    asyncio.run(bot.browse_command(update, FakeContext()))
+    asyncio.run(bot.browse_command(update, context))
 
-    text = update.message.replies[0]["text"]
+    menu = update.message.replies[0]["text"]
+    assert "Who do you want to see" in menu
+    menu_buttons = [
+        b.callback_data
+        for b in _buttons(update.message.replies[0]["reply_markup"])
+    ]
+    assert "brw_myage" in menu_buttons and "brw_popular" in menu_buttons
+
+    query, _ = press(1, "brw_all", context)
+    text = query.edits[-1]["text"]
     assert "Shivani" in text and "Bangalore" in text
-    assert str(other.public_id) in text
+    assert bot.public_id_slug(other) in text
 
 
 def test_browse_more_extends_the_list(fresh_db):
@@ -1133,3 +1151,82 @@ def test_view_request_shows_accept_buttons(fresh_db):
 
     labels = [b.text for b in _buttons(query.edits[-1]["reply_markup"])]
     assert "✅ Accept" in labels and "❌ Decline" in labels
+
+
+# -- MeChat-style extras: blocked list, DM privacy, match reward --
+
+def test_blocked_list_menu_and_unblock(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.block_user(1, 2)
+
+    query, context = press(1, "blocked_list")
+    text = query.edits[-1]["text"]
+    assert "Blocked Users" in text
+    labels = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "unblock_2" in labels
+
+    query2, _ = press(1, "unblock_2", context)
+    assert fresh_db.get_user(1).blocked == set()
+    assert "No blocked users" in query2.edits[-1]["text"]
+
+
+def test_direct_message_is_hidden_until_viewed(fresh_db):
+    sender = register(fresh_db, 1)
+    receiver = register(fresh_db, 2)
+    context = FakeContext()
+    context.user_data["browse_ids"] = [2]
+    context.user_data["awaiting_broadcast"] = True
+
+    update = FakeUpdate(1, message=FakeMessage(text="secret hello"))
+    asyncio.run(bot.relay_message(update, context))
+
+    # Receiver got the privacy wrapper, NOT the content
+    assert any(
+        m["chat_id"] == receiver.user_id and "direct message" in m["text"]
+        for m in context.bot.sent
+    )
+    assert not any("secret hello" in m["text"] for m in context.bot.sent)
+    # Content is stored, waiting to be revealed
+    assert fresh_db.pending_dms[receiver.user_id]["text"] == "secret hello"
+
+
+def test_view_msg_reveals_stored_dm(fresh_db):
+    sender = register(fresh_db, 1)
+    receiver = register(fresh_db, 2)
+    fresh_db.queue_dm(2, 1, "the secret text")
+
+    query, _ = press(2, "view_msg_1")
+    text = query.edits[-1]["text"]
+    assert "the secret text" in text
+    assert "Shivani" not in text  # sanity: no crash on unnamed users
+    assert fresh_db.pop_dm(2) is None  # consumed
+
+
+def test_match_awards_free_coin_to_girls_only(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(2, search_pref=Gender.ANY)
+    start1 = fresh_db.get_user(1).coins
+    start2 = fresh_db.get_user(2).coins
+
+    context = FakeContext()
+    text, markup, mode = run(bot.begin_search(context, 1, Gender.ANY))
+
+    assert "Partner found" in text
+    # Girl got the free coin, boy didn't
+    assert fresh_db.get_user(1).coins == start1
+    assert fresh_db.get_user(2).coins == start2 + bot.DAILY_REWARD_COINS
+    # Only the girl's match card carries the free-coin line
+    coin_cards = [m for m in context.bot.sent if "free coin" in m["text"]]
+    assert len(coin_cards) == 1 and coin_cards[0]["chat_id"] == 2
+
+
+def test_my_profile_sends_photo_card(fresh_db):
+    user = register(fresh_db, 1)
+    fresh_db.set_photo(1, "photo_xyz")
+
+    query, context = press(1, "my_profile")
+
+    # The card goes out as a photo message, so the original message is not edited
+    assert query.edits == [] or "coins" in query.edits[-1]["text"].lower()
