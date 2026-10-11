@@ -93,10 +93,14 @@ from animations import (
     ANIMATIONS_ENABLED,
     animate_edit,
     animate_search,
+    animated_reply,
     typing_pulse,
     celebration_pulse,
     match_frames,
     reveal_frames,
+    bounce_frames,
+    coin_frames,
+    heart_frames,
 )
 
 load_dotenv()
@@ -361,7 +365,10 @@ async def notify_partner_found(context, user_id, partner_id):
         if ANIMATIONS_ENABLED:
             await typing_pulse(context.bot, u.user_id, times=2, interval=0.4)
             await animate_edit(
-                _MsgTarget(context.bot, u.user_id), match_frames(), interval=0.45
+                _MsgTarget(context.bot, u.user_id),
+                match_frames(),
+                interval=0.45,
+                parse_mode="HTML",
             )
         await context.bot.send_message(
             chat_id=u.user_id,
@@ -793,17 +800,22 @@ async def begin_search(
                 text += f"\n🪙 -{GIRL_SEARCH_COST} | Balance: {balance}"
             return text, None, None
         # Still searching — the last radar frame is already on screen.
+        final = (
+            "🔍 <b>Searching for a partner…</b>\n\n"
+            f"👥 {db.searching_count} people in queue\n"
+            "Please wait, you'll be connected soon!"
+        )
         try:
             if hasattr(target, "edit_message_text"):
                 await target.edit_message_text(
-                    SEARCHING_TEXT.format(count=db.searching_count),
-                    parse_mode="Markdown",
+                    final,
+                    parse_mode="HTML",
                     reply_markup=searching_keyboard(),
                 )
             elif hasattr(target, "edit_text"):
                 await target.edit_text(
-                    SEARCHING_TEXT.format(count=db.searching_count),
-                    parse_mode="Markdown",
+                    final,
+                    parse_mode="HTML",
                     reply_markup=searching_keyboard(),
                 )
         except Exception as e:  # noqa: BLE001
@@ -925,16 +937,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Failed to notify referrer {referrer_id}: {e}")
 
-    await update.message.reply_text(
-        welcome,
+    await animated_reply(
+        update.message,
+        bounce_frames(welcome),
         parse_mode="Markdown",
         reply_markup=gender_keyboard(),
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        HELP_MSG.format(cost=GIRL_SEARCH_COST, request_cost=CHAT_REQUEST_COST),
+    await animated_reply(
+        update.message,
+        bounce_frames(
+            HELP_MSG.format(cost=GIRL_SEARCH_COST, request_cost=CHAT_REQUEST_COST)
+        ),
         parse_mode="Markdown",
     )
 
@@ -1026,8 +1042,11 @@ async def credit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please /start first.")
         return
 
-    await update.message.reply_text(
-        credit_text(user), parse_mode="Markdown", reply_markup=credit_keyboard()
+    await animated_reply(
+        update.message,
+        coin_frames(credit_text(user)),
+        parse_mode="Markdown",
+        reply_markup=credit_keyboard(),
     )
 
 
@@ -1040,13 +1059,16 @@ async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     link = await get_referral_link(context, user_id)
-    await update.message.reply_text(
-        f"⚡ **Your personal invite link:**\n`{link}`\n\n"
-        f"🎁 You earn **{REFERRAL_REWARD} 🪙** for every friend who joins "
-        f"(they get **+{REFERRED_BONUS} 🪙** too).\n\n"
-        f"👥 Referrals: **{user.referral_count}**\n"
-        f"🪙 Earned from referrals: **{user.referral_earned}**\n"
-        f"💰 Balance: **{user.coins} 🪙**",
+    await animated_reply(
+        update.message,
+        bounce_frames(
+            f"⚡ **Your personal invite link:**\n`{link}`\n\n"
+            f"🎁 You earn **{REFERRAL_REWARD} 🪙** for every friend who joins "
+            f"(they get **+{REFERRED_BONUS} 🪙** too).\n\n"
+            f"👥 Referrals: **{user.referral_count}**\n"
+            f"🪙 Earned from referrals: **{user.referral_earned}**\n"
+            f"💰 Balance: **{user.coins} 🪙**"
+        ),
         parse_mode="Markdown",
     )
 
@@ -1287,10 +1309,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("gender_"):
         gender = Gender.MALE if data == "gender_male" else Gender.FEMALE
         db.update_gender(user_id, gender)
-        await safe_edit(
+        await animate_edit(
             query,
-            f"✅ Gender set to **{format_gender(gender)}**\n\n"
-            "Now select your **country**:",
+            [
+                "✅",
+                f"✅ Gender set to **{format_gender(gender)}**\n\n"
+                "Now select your **country**:",
+            ],
+            interval=0.35,
             parse_mode="Markdown",
             reply_markup=country_keyboard(),
         )
@@ -1307,10 +1333,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             db.update_country(user_id, country_code)
-            await safe_edit(
+            await animate_edit(
                 query,
-                f"✅ Country set to **{country_code}**\n\n"
-                "Who would you like to chat with?",
+                [
+                    "✅",
+                    f"✅ Country set to **{country_code}**\n\n"
+                    "Who would you like to chat with?",
+                ],
+                interval=0.35,
                 parse_mode="Markdown",
                 reply_markup=preference_keyboard(),
             )
@@ -1323,9 +1353,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = format_gender(pref) if pref != Gender.ANY else "🌍 Anyone"
         context.user_data["setup_flow"] = True
         context.user_data["awaiting_age"] = True
-        await safe_edit(
+        await animate_edit(
             query,
-            f"✅ You'll be matched with: **{label}**\n\n" + AGE_ASK_TEXT.strip(),
+            [
+                "✅",
+                f"✅ You'll be matched with: **{label}**\n\n" + AGE_ASK_TEXT.strip(),
+            ],
+            interval=0.35,
             parse_mode="Markdown",
         )
 
@@ -1392,6 +1426,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except Exception as e:
                 logger.warning(f"Failed to send profile photo card: {e}")
+        await typing_pulse(context.bot, user_id, times=1, interval=0.25)
         await safe_edit(
             query, build_profile_text(user), parse_mode="Markdown",
             reply_markup=profile_keyboard(),
@@ -1464,22 +1499,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Credits / coin shop ─────────────────────────────────
     elif data == "credit_menu":
-        await safe_edit(
-            query, credit_text(user), parse_mode="Markdown",
-            reply_markup=credit_keyboard(),
+        await animate_edit(
+            query, coin_frames(credit_text(user)), interval=0.3,
+            parse_mode="Markdown", reply_markup=credit_keyboard(),
         )
 
     elif data == "show_refer":
         link = await get_referral_link(context, user_id)
-        await safe_edit(
+        await animate_edit(
             query,
-            f"🎁 **Refer Friends (Free Coin)**\n\n"
-            f"⚡ Your personal invite link:\n`{link}`\n\n"
+            [
+                "🎁",
+                f"🎁 **Refer Friends (Free Coin)**\n\n"
+                f"⚡ Your personal invite link:\n`{link}`\n\n"
             f"Share it with friends — you earn **{REFERRAL_REWARD} 🪙** for each "
             f"friend who joins (they get **+{REFERRED_BONUS} 🪙** too).\n\n"
             f"👥 Referrals: **{user.referral_count}**\n"
             f"🪙 Earned: **{user.referral_earned}**\n"
             f"💰 Balance: **{user.coins} 🪙**",
+            ],
+            interval=0.3,
             parse_mode="Markdown",
             reply_markup=back_to_credit_keyboard(),
         )
@@ -1923,7 +1962,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["list_kind"] = "browse"
         text, markup = _browse_state(context, user_id)
         _remember_list_message(context, query)
-        await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
+        await animate_edit(
+            query,
+            ["✨", f"🌟 Loading {title}…", text],
+            interval=0.3,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
 
     elif data in ("browse_more", "browse_list"):
         if data == "browse_more":
@@ -2342,8 +2387,9 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=main_reply_keyboard(),
             )
-            await update.message.reply_text(
-                ALL_SET_TEXT.strip(),
+            await animated_reply(
+                update.message,
+                ["🎉", ALL_SET_TEXT.strip()],
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(),
             )
@@ -2563,11 +2609,14 @@ async def payment_success_handler(update: Update, context: ContextTypes.DEFAULT_
             if coins == VIP_PLAN[0]:
                 db.set_vip(buyer_id, True)
                 vip_line = "\n👑 You're a **VIP** now — Girl searches are free!"
-            await update.message.reply_text(
-                f"✅ **Payment successful!**\n\n"
-                f"🪙 +{coins} Coins\n"
-                f"💰 Balance: **{balance} Coins**"
-                f"{vip_line}",
+            await animated_reply(
+                update.message,
+                coin_frames(
+                    f"✅ **Payment successful!**\n\n"
+                    f"🪙 +{coins} Coins\n"
+                    f"💰 Balance: **{balance} Coins**"
+                    f"{vip_line}"
+                ),
                 parse_mode="Markdown",
                 reply_markup=credit_keyboard(),
             )

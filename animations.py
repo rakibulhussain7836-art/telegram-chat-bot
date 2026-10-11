@@ -36,7 +36,7 @@ def progress_bar(percent: int, width: int = 10) -> str:
 
 def search_frames(queue_size: int = 0, total: int = 6):
     """
-    Generator of radar-search frames with a filling progress bar.
+    Generator of radar-search frames with a filling progress bar (HTML).
     Yields `total` frames; the last one is ~95% full (match can land anytime).
     """
     for i in range(total):
@@ -49,7 +49,7 @@ def search_frames(queue_size: int = 0, total: int = 6):
             else "🌍 Scanning the world…"
         )
         yield (
-            f"{radar} **Searching for a partner…** {spin}\n\n"
+            f"{radar} <b>Searching for a partner…</b> {spin}\n\n"
             f"{progress_bar(pct)} {pct}%\n"
             f"{queue_line}\n"
             f"💡 Hang tight — the next frame might be your match!"
@@ -70,35 +70,122 @@ def reveal_frames(final_text: str, steps: int = 3):
 def match_frames() -> list:
     return [
         "💥",
-        "⚡ **It's a match!** ⚡",
+        "⚡ <b>It's a match!</b> ⚡",
         "💖🤝💖",
     ]
 
 
-async def animate_edit(target, frames, interval: float = 0.55, parse_mode=None):
+def bounce_frames(final_text: str) -> list:
+    """Short sparkle bounce-in for menus and confirmations."""
+    return ["✨", "🌟", final_text]
+
+
+def coin_frames(final_text: str) -> list:
+    """Coin shower for credits and payments."""
+    return ["🪙", "💰✨", final_text]
+
+
+def heart_frames(final_text: str) -> list:
+    """Heart burst for likes."""
+    return ["💗", "💖💘", final_text]
+
+
+async def animate_edit(
+    target, frames, interval: float = 0.55, parse_mode=None, reply_markup=None
+):
     """
     Play `frames` through a message by editing it in place.
 
     `target` may be a Message (uses .edit_text) or a CallbackQuery
-    (uses .edit_message_text). Returns the last frame that was attempted.
+    (uses .edit_message_text). `reply_markup` is applied on the final
+    frame only. With animations disabled this degrades to a single edit
+    of the last frame, so it can replace a plain safe_edit() call.
+    Returns the last frame that was attempted.
     """
-    last = None
-    if not ANIMATIONS_ENABLED:
+    frames = list(frames)
+    if not frames:
         return None
-    for frame in frames:
-        last = frame
+
+    if not ANIMATIONS_ENABLED:
         try:
             if hasattr(target, "edit_message_text"):
-                await target.edit_message_text(frame, parse_mode=parse_mode)
+                await target.edit_message_text(
+                    frames[-1], parse_mode=parse_mode, reply_markup=reply_markup
+                )
             elif hasattr(target, "edit_text"):
-                await target.edit_text(frame, parse_mode=parse_mode)
+                await target.edit_text(
+                    frames[-1], parse_mode=parse_mode, reply_markup=reply_markup
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return frames[-1]
+
+    last = None
+    for i, frame in enumerate(frames):
+        last = frame
+        is_last = i == len(frames) - 1
+        try:
+            if hasattr(target, "edit_message_text"):
+                await target.edit_message_text(
+                    frame,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if is_last else None,
+                )
+            elif hasattr(target, "edit_text"):
+                await target.edit_text(
+                    frame,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if is_last else None,
+                )
             else:
                 return last
         except Exception as e:  # noqa: BLE001 — animation must never break a flow
             logger.debug(f"animate_edit skipped: {e}")
             return last
-        await asyncio.sleep(interval)
+        if not is_last:
+            await asyncio.sleep(interval)
     return last
+
+
+async def animated_reply(
+    message, frames, interval: float = 0.35, parse_mode=None, reply_markup=None
+):
+    """
+    Reply with a short bounce-in animation: sends the first frame, edits
+    through the rest, and puts reply_markup on the final frame.
+    With animations disabled it behaves exactly like message.reply_text().
+    """
+    frames = list(frames)
+    if not frames or not hasattr(message, "reply_text"):
+        return None
+
+    if not ANIMATIONS_ENABLED:
+        return await message.reply_text(
+            frames[-1], parse_mode=parse_mode, reply_markup=reply_markup
+        )
+
+    try:
+        msg = await message.reply_text(frames[0], parse_mode=parse_mode)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"animated_reply skipped: {e}")
+        return None
+    if not hasattr(msg, "edit_text"):
+        return msg
+
+    for frame in frames[1:-1]:
+        try:
+            await msg.edit_text(frame, parse_mode=parse_mode)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"animated_reply cut short: {e}")
+            return msg
+        await asyncio.sleep(interval)
+    try:
+        await msg.edit_text(
+            frames[-1], parse_mode=parse_mode, reply_markup=reply_markup
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"animated_reply final frame skipped: {e}")
+    return msg
 
 
 async def typing_pulse(bot, chat_id: int, times: int = 3, interval: float = 0.7):
@@ -152,7 +239,9 @@ async def animate_search(
         match_id = check_match()
         if match_id:
             return match_id
-        stop = await animate_edit(target, [frame], interval=interval)
+        stop = await animate_edit(
+            target, [frame], interval=interval, parse_mode="HTML"
+        )
         if stop is None:
             return None  # target rejected the edit — stop animating
     return check_match()
