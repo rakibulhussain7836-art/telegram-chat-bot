@@ -1362,3 +1362,69 @@ def test_my_profile_sends_photo_card(fresh_db):
 
     # The card goes out as a photo message, so the original message is not edited
     assert query.edits == [] or "coins" in query.edits[-1]["text"].lower()
+
+
+# ── Dedicated backup bot (BACKUP_BOT_TOKEN) ──────────────────────
+
+def test_backup_bot_defaults_to_main_bot(fresh_db, monkeypatch):
+    """No BACKUP_BOT_TOKEN: the main bot handles backups itself."""
+    monkeypatch.setattr(bot, "BACKUP_BOT_TOKEN", "")
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot.db, "path", "bot.db")
+    main = object()
+    assert run(bot._get_backup_bot(main)) is main
+
+
+def test_backup_bot_disabled_when_no_channel(fresh_db, monkeypatch):
+    """Backups off entirely: never builds a second bot, even with a token."""
+    monkeypatch.setattr(bot, "BACKUP_BOT_TOKEN", "123456:backup-token")
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "")
+    main = object()
+    assert run(bot._get_backup_bot(main)) is main
+
+
+def test_backup_bot_uses_dedicated_token(monkeypatch):
+    """With a channel + BACKUP_BOT_TOKEN, a separate bot is created once."""
+    created = []
+
+    class FakeBot:
+        def __init__(self, token):
+            created.append(token)
+            self.token = token
+
+        async def initialize(self):
+            self.ready = True
+
+    monkeypatch.setattr(bot, "Bot", FakeBot)
+    monkeypatch.setattr(bot, "BACKUP_BOT_TOKEN", "111:backup")
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_dedicated_backup_bot", None)
+    monkeypatch.setattr(bot.db, "path", "bot.db")
+
+    main = object()
+    first = run(bot._get_backup_bot(main))
+    second = run(bot._get_backup_bot(main))
+    assert first is not main and first.token == "111:backup"
+    assert second is first          # created only once
+    assert created == ["111:backup"]
+    monkeypatch.setattr(bot, "_dedicated_backup_bot", None)
+
+
+def test_backup_bot_falls_back_on_bad_token(monkeypatch):
+    """An unusable BACKUP_BOT_TOKEN must not kill startup: falls back."""
+    class BadBot:
+        def __init__(self, token):
+            pass
+
+        async def initialize(self):
+            raise RuntimeError("Unauthorized")
+
+    monkeypatch.setattr(bot, "Bot", BadBot)
+    monkeypatch.setattr(bot, "BACKUP_BOT_TOKEN", "999:bad")
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_dedicated_backup_bot", None)
+    monkeypatch.setattr(bot.db, "path", "bot.db")
+
+    main = object()
+    assert run(bot._get_backup_bot(main)) is main
+    monkeypatch.setattr(bot, "_dedicated_backup_bot", None)

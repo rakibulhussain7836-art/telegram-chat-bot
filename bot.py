@@ -29,6 +29,7 @@ from telegram import (
     Update,
     LabeledPrice,
     BotCommand,
+    Bot,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
@@ -131,6 +132,11 @@ FORCE_CHANNEL_INVITE = os.getenv("FORCE_CHANNEL_INVITE", "").strip()
 # set BACKUP_CHANNEL=@yourchannel or the -100… channel id.
 BACKUP_CHANNEL = os.getenv("BACKUP_CHANNEL", "").strip()
 BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "600"))  # 10 minutes
+# Optional SECOND token — a dedicated "backup account" bot that handles all
+# backup traffic (upload/restore/pin/delete in BACKUP_CHANNEL). The main bot
+# keeps serving users untouched. Both bots must be ADMIN of the channel.
+# Leave empty to back up with the main bot.
+BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "").strip()
 
 # Shows up in Telegram's ☰ Menu, like the reference bot.
 BOT_COMMANDS = [
@@ -453,6 +459,37 @@ def _backup_chat():
     if BACKUP_CHANNEL.lstrip("-").isdigit():
         return int(BACKUP_CHANNEL)
     return BACKUP_CHANNEL
+
+
+# Dedicated bot instance for BACKUP_BOT_TOKEN (created once, on first use)
+_dedicated_backup_bot = None
+
+
+async def _get_backup_bot(main_bot):
+    """The bot used for backup traffic.
+
+    When BACKUP_BOT_TOKEN is set (a separate "backup account" bot), that bot
+    is created once and used for every upload/restore/pin/delete — the main
+    bot keeps serving users. Otherwise the main bot does the backups itself.
+    """
+    global _dedicated_backup_bot
+    if not _backup_enabled() or not BACKUP_BOT_TOKEN:
+        return main_bot
+    if BACKUP_BOT_TOKEN == (BOT_TOKEN or ""):
+        return main_bot
+    if _dedicated_backup_bot is None:
+        candidate = Bot(BACKUP_BOT_TOKEN)
+        try:
+            await candidate.initialize()
+        except Exception as e:  # noqa: BLE001 — bad token must not kill startup
+            logger.warning(
+                f"BACKUP_BOT_TOKEN unusable ({e}) — "
+                "falling back to the main bot for backups."
+            )
+            return main_bot
+        _dedicated_backup_bot = candidate
+        logger.info("Dedicated backup bot active (BACKUP_BOT_TOKEN).")
+    return _dedicated_backup_bot
 
 
 def _is_backup_doc(message) -> bool:
@@ -3076,14 +3113,16 @@ async def set_bot_commands(application):
 async def on_startup(application):
     """Restore the DB from the backup channel, then start the backup loop."""
     await set_bot_commands(application)
-    await restore_db_from_backup(application.bot)
+    backup_bot = await _get_backup_bot(application.bot)
+    await restore_db_from_backup(backup_bot)
     await _startup_checks(application)
     if _backup_enabled():
-        await upload_db_backup(application.bot)
-        application.create_task(_backup_loop(application.bot))
+        await upload_db_backup(backup_bot)
+        application.create_task(_backup_loop(backup_bot))
+        who = "dedicated bot" if backup_bot is not application.bot else "main bot"
         logger.info(
             f"💾 Auto-backup enabled → channel {BACKUP_CHANNEL} "
-            f"every {BACKUP_INTERVAL // 60} min (only if the DB changed)."
+            f"every {BACKUP_INTERVAL // 60} min (only if the DB changed, via {who})."
         )
 
 
@@ -3091,8 +3130,13 @@ async def on_shutdown(application):
     """Take one final snapshot so the next deploy resumes exactly here."""
     try:
         if _backup_enabled():
-            await upload_db_backup(application.bot)
+            await upload_db_backup(await _get_backup_bot(application.bot))
     finally:
+        if _dedicated_backup_bot is not None:
+            try:
+                await _dedicated_backup_bot.shutdown()
+            except Exception:  # noqa: BLE001 — closing a backup bot must not fail shutdown
+                pass
         db.close()
 
 
