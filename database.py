@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 import atexit
+import hashlib
 import json
 import math
 import os
@@ -449,6 +450,39 @@ class Database:
     def flush(self):
         """Persist the full snapshot right now (used before a backup upload)."""
         self._save()
+        self._checkpoint()
+
+    def _checkpoint(self):
+        """Merge the WAL into the main DB file so a plain file copy is complete."""
+        if not self._conn:
+            return
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass  # backup still works, worst case the next checkpoint catches up
+
+    def snapshot_hash(self) -> str:
+        """Stable hash of the logical contents — used by the backup loop to
+        upload only when the database actually changed since the last backup."""
+        with self._lock:
+            payload = json.dumps(
+                {
+                    "users": [
+                        (u.user_id, _user_to_json(u))
+                        for u in sorted(
+                            self.users.values(), key=lambda u: u.user_id
+                        )
+                    ],
+                    "queue": list(self.queue),
+                    "charges": sorted(self.processed_charges),
+                    "requests": self.requests,
+                    "verifications": self.pending_verifications,
+                    "dms": self.pending_dms,
+                },
+                sort_keys=True,
+            )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def reload(self):
         """Drop all in-memory state and re-read the SQLite file.

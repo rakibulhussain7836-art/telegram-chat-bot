@@ -130,7 +130,7 @@ FORCE_CHANNEL_INVITE = os.getenv("FORCE_CHANNEL_INVITE", "").strip()
 # Create a private channel, add the bot as ADMIN (post + pin messages), and
 # set BACKUP_CHANNEL=@yourchannel or the -100… channel id.
 BACKUP_CHANNEL = os.getenv("BACKUP_CHANNEL", "").strip()
-BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "300"))
+BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "600"))  # 10 minutes
 
 # Shows up in Telegram's ☰ Menu, like the reference bot.
 BOT_COMMANDS = [
@@ -440,7 +440,8 @@ async def enforce_channel(update, context) -> bool:
 
 # ── Free persistence: database backup via a Telegram channel ────
 
-_BACKUP_MSG = {"id": None, "mtime": 0.0}
+# id of the last message we uploaded + hash of the contents it contained
+_BACKUP_MSG = {"id": None, "hash": None}
 
 
 def _backup_enabled() -> bool:
@@ -508,15 +509,54 @@ async def restore_db_from_backup(bot) -> None:
     await file.download_to_drive(tmp_path)
     os.replace(tmp_path, db.path)
     db.reload()
+    # The local DB now matches what the channel already holds — remember it
+    # so the startup upload skips it instead of re-sending an identical copy.
+    _BACKUP_MSG["hash"] = db.snapshot_hash()
     logger.info(f"✅ Database restored from channel backup ({len(db.users)} users).")
 
 
-async def upload_db_backup(bot) -> None:
-    """Upload a fresh snapshot of the SQLite file to the backup channel."""
-    if not _backup_enabled() or not os.path.exists(db.path):
-        return
+async def _old_backup_ids(bot) -> set[int]:
+    """Ids of every backup doc already in the channel: the pinned one, the
+    recent ones and the one we sent last run. All are deleted after a new
+    upload so the channel keeps exactly one (current) backup message."""
+    ids: set[int] = set()
+    prev = _BACKUP_MSG.get("id")
+    if prev:
+        ids.add(prev)
     try:
-        db.flush()  # make sure every pending row is on disk before snapshotting
+        chat = await bot.get_chat(_backup_chat())
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned is not None and _is_backup_doc(pinned):
+            ids.add(pinned.message_id)
+    except Exception:  # noqa: BLE001 — needs admin rights; history scan still runs
+        pass
+    history = getattr(bot, "get_chat_history", None)
+    if history is not None:
+        try:
+            async for msg in history(_backup_chat(), limit=30):
+                if _is_backup_doc(msg):
+                    ids.add(msg.message_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return ids
+
+
+async def upload_db_backup(bot) -> bool:
+    """Upload a fresh snapshot of the SQLite file to the backup channel.
+
+    Uploads only when the database changed since the last backup, pins the new
+    snapshot and deletes every older one so the channel never fills up.
+    Returns True when a backup was actually sent.
+    """
+    if not _backup_enabled() or not os.path.exists(db.path):
+        return False
+    try:
+        db.flush()  # every pending row on disk, WAL merged into bot.db
+        digest = db.snapshot_hash()
+        if digest == _BACKUP_MSG["hash"]:
+            logger.debug("Backup skipped — database unchanged since last backup.")
+            return False
+        old_ids = await _old_backup_ids(bot)
         with open(db.path, "rb") as fh:
             stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
             msg = await bot.send_document(
@@ -531,26 +571,28 @@ async def upload_db_backup(bot) -> None:
             )
         except Exception as e:  # noqa: BLE001 — pin needs the right admin rights
             logger.debug(f"Could not pin the backup message: {e}")
-        prev = _BACKUP_MSG.get("id")
-        if prev and prev != msg.message_id:
+        for old_id in old_ids:
+            if old_id == msg.message_id:
+                continue
             try:
-                await bot.delete_message(_backup_chat(), prev)
-            except Exception:  # noqa: BLE001
-                pass
+                await bot.delete_message(_backup_chat(), old_id)
+            except Exception as e:  # noqa: BLE001 — already deleted is fine
+                logger.debug(f"Could not delete old backup message {old_id}: {e}")
         _BACKUP_MSG["id"] = msg.message_id
-        _BACKUP_MSG["mtime"] = os.path.getmtime(db.path)
-        logger.info("💾 Database backed up to the backup channel.")
+        _BACKUP_MSG["hash"] = digest
+        logger.info("Backup sent")
+        return True
     except Exception as e:  # noqa: BLE001 — backup must never kill the bot
-        logger.warning(f"Database backup upload failed: {e}")
+        logger.warning(f"Backup failed: {e}")
+        return False
 
 
 async def _backup_loop(bot) -> None:
-    """Periodic snapshot so a crash or redeploy loses at most a few minutes."""
+    """Every BACKUP_INTERVAL seconds — uploads only if the DB changed."""
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         try:
-            if os.path.getmtime(db.path) != _BACKUP_MSG["mtime"]:
-                await upload_db_backup(bot)
+            await upload_db_backup(bot)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -576,29 +618,33 @@ async def _startup_checks(application) -> None:
             )
 
 
-# ── AI avatar fallback (profiles without a photo) ───────────────
+# ── Default photo fallback (profiles without a photo) ───────────
 
-def ai_avatar_url(user) -> str:
+_DEFAULT_PHOTOS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_PHOTO_MALE = os.path.join(_DEFAULT_PHOTOS_DIR, "default_boy.jpg")
+_DEFAULT_PHOTO_FEMALE = os.path.join(_DEFAULT_PHOTOS_DIR, "default_girl.png")
+
+
+def default_photo_path(user) -> str:
     """
-    AI-generated face for profile cards when the user never set a photo.
-    Boys get a boy face, girls a girl face — the same seed every time,
-    so the face never changes.
+    Default profile card photo — boy photo for males, girl photo for females.
+    Used when the user never set their own photo.
     """
-    seed = public_id_slug(user)
     if user.gender == Gender.FEMALE:
-        return (
-            "https://api.dicebear.com/9.x/lorelei/png"
-            f"?seed={seed}&size=800&backgroundColor=ffd5dc,c0aede,ffdfbf"
-        )
-    return (
-        "https://api.dicebear.com/9.x/personas/png"
-        f"?seed={seed}&size=800&backgroundColor=b6e3f4,c0aede,d1d4f9"
-    )
+        return _DEFAULT_PHOTO_FEMALE
+    return _DEFAULT_PHOTO_MALE
 
 
 def profile_photo_of(user) -> str:
-    """The user's own photo — or their AI avatar when none is set."""
-    return user.photo_file_id or ai_avatar_url(user)
+    """The user's own photo — or the gender default when none is set."""
+    return user.photo_file_id or default_photo_path(user)
+
+
+def open_photo(photo_ref):
+    """Open a local photo path for send_photo; pass file_ids/URLs through."""
+    if photo_ref and os.path.isfile(photo_ref):
+        return open(photo_ref, "rb")
+    return photo_ref
 
 
 async def notify_partner_found(context, user_id, partner_id):
@@ -645,7 +691,7 @@ async def notify_partner_found(context, user_id, partner_id):
         try:
             await context.bot.send_photo(
                 chat_id=u.user_id,
-                photo=profile_photo_of(p),
+                photo=open_photo(profile_photo_of(p)),
             )
         except Exception as e:
             logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
@@ -776,7 +822,7 @@ async def show_user_card(query, context, viewer_id: int, target) -> None:
     try:
         await context.bot.send_photo(
             chat_id=viewer_id,
-            photo=profile_photo_of(target),
+            photo=open_photo(profile_photo_of(target)),
             caption=text,
             parse_mode="Markdown",
             reply_markup=markup,
@@ -799,7 +845,7 @@ async def reply_profile_card(message, viewer_id: int, target) -> None:
     if hasattr(message, "reply_photo"):
         try:
             await message.reply_photo(
-                photo=profile_photo_of(target),
+                photo=open_photo(profile_photo_of(target)),
                 caption=text,
                 parse_mode="Markdown",
                 reply_markup=markup,
@@ -855,7 +901,7 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
         try:
             await context.bot.send_photo(
                 chat_id=chat_id,
-                photo=profile_photo_of(target),
+                photo=open_photo(profile_photo_of(target)),
                 caption=caption,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
@@ -1747,7 +1793,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await typing_pulse(context.bot, user_id, times=1, interval=0.3)
             await context.bot.send_photo(
                 chat_id=user_id,
-                photo=profile_photo_of(user),
+                photo=open_photo(profile_photo_of(user)),
                 caption=build_profile_text(user),
                 parse_mode="Markdown",
                 reply_markup=profile_keyboard(),
@@ -3037,7 +3083,7 @@ async def on_startup(application):
         application.create_task(_backup_loop(application.bot))
         logger.info(
             f"💾 Auto-backup enabled → channel {BACKUP_CHANNEL} "
-            f"every {BACKUP_INTERVAL}s."
+            f"every {BACKUP_INTERVAL // 60} min (only if the DB changed)."
         )
 
 

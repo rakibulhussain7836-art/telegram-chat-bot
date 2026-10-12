@@ -404,10 +404,13 @@ def test_partner_receives_my_photo_on_match(fresh_db):
     assert any(
         p["chat_id"] == 2 and p["photo"] == "photo_of_1" for p in ctx.bot.photos
     )
-    # user 1 gets the partner's AI avatar back (never their own photo)
+    # user 1 gets the partner's default photo back (never their own photo)
     to_1 = [p for p in ctx.bot.photos if p["chat_id"] == 1]
     assert all(p["photo"] != "photo_of_1" for p in to_1)
-    assert any("lorelei" in p["photo"] for p in to_1)
+    assert any(
+        hasattr(p["photo"], "name") and "default_girl" in p["photo"].name
+        for p in to_1
+    )
 
 
 def test_match_without_photos_sends_ai_avatar(fresh_db):
@@ -418,27 +421,26 @@ def test_match_without_photos_sends_ai_avatar(fresh_db):
     ctx = FakeContext()
     asyncio.run(bot.begin_search(ctx, 2, Gender.ANY))
 
-    # No photo was set → the partner still gets an AI avatar photo card
+    # No photo was set → the partner still gets a default photo card
     avatar_photos = [
         p for p in ctx.bot.photos
-        if isinstance(p["photo"], str) and p["photo"].startswith("https://")
+        if hasattr(p["photo"], "name")
     ]
     assert len(avatar_photos) >= 1
-    # user 1 (boy) sees the girl's avatar, user 2 (girl) the boy's
+    # user 1 (boy) sees the girl's photo, user 2 (girl) the boy's
     to_2 = next(p for p in avatar_photos if p["chat_id"] == 2)
-    assert "personas" in to_2["photo"]  # boy face of partner 1, seen by girl 2
+    assert "default_boy" in to_2["photo"].name
     to_1 = next(p for p in avatar_photos if p["chat_id"] == 1)
-    assert "lorelei" in to_1["photo"]   # girl face of partner 2, seen by boy 1
+    assert "default_girl" in to_1["photo"].name
     assert not any(p["chat_id"] == 1 and p["photo"] == "photo_of_1" for p in ctx.bot.photos)
 
 
-def test_ai_avatar_is_gendered_and_stable(fresh_db):
+def test_default_photo_is_gendered(fresh_db):
     boy = register(fresh_db, 1, gender=Gender.MALE)
     girl = register(fresh_db, 2, gender=Gender.FEMALE)
-    assert "personas" in bot.ai_avatar_url(boy)
-    assert "lorelei" in bot.ai_avatar_url(girl)
-    assert bot.ai_avatar_url(boy) == bot.ai_avatar_url(boy)  # same face every time
-    # a real photo always wins over the AI avatar
+    assert bot.default_photo_path(boy).endswith("default_boy.jpg")
+    assert bot.default_photo_path(girl).endswith("default_girl.png")
+    # a real photo always wins over the default
     fresh_db.set_photo(1, "real_photo")
     assert bot.profile_photo_of(fresh_db.get_user(1)) == "real_photo"
 
@@ -843,10 +845,10 @@ def test_profile_card_buttons_match_reference(fresh_db):
 
     query, context = press(1, f"view_{2}")
 
-    # the card always arrives as a photo (AI avatar when no photo is set)
+    # the card always arrives as a photo (default photo when no photo is set)
     assert context.bot.photos, "profile card should be sent as a photo card"
     card = context.bot.photos[-1]
-    assert isinstance(card["photo"], str) and card["photo"].startswith("https://")
+    assert hasattr(card["photo"], "name")  # opened default photo file
     labels = [b.text for b in _buttons(card["reply_markup"])]
     assert labels[0] == "❤️ Like"
     assert any("Direct Message" in label for label in labels)
