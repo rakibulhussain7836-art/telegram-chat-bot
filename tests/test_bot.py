@@ -107,10 +107,15 @@ class FakePayment:
         self.telegram_payment_charge_id = charge_id
 
 
-def register(db, uid, gender=Gender.MALE, country="US"):
-    user = db.register_user(uid)
+def register(db, uid, gender=Gender.MALE, country="US", complete=True):
+    """Registered user. `complete=True` also fills the mandatory
+    name/age/city fields (what onboarding collects)."""
+    user = db.register_user(uid, name=f"User{uid}" if complete else None)
     db.update_gender(uid, gender)
     db.update_country(uid, country)
+    if complete:
+        db.update_age(uid, 25)
+        db.update_city(uid, "Springfield")
     return user
 
 
@@ -862,10 +867,15 @@ def test_profile_card_buttons_match_reference(fresh_db):
     assert any("Notify me when chat ends" in label for label in labels)
 
 
-def test_onboarding_collects_age_and_city(fresh_db):
-    register(fresh_db, 1)
+def test_onboarding_collects_name_age_and_city(fresh_db):
+    register(fresh_db, 1, complete=False)
     context = FakeContext()
     press(1, "pref_any", context)
+    assert context.user_data["awaiting_name"] is True
+
+    update = FakeUpdate(1, message=FakeMessage(text="Rakib"))
+    asyncio.run(bot.relay_message(update, context))
+    assert fresh_db.get_user(1).name == "Rakib"
     assert context.user_data["awaiting_age"] is True
 
     update = FakeUpdate(1, message=FakeMessage(text="25"))
@@ -880,7 +890,7 @@ def test_onboarding_collects_age_and_city(fresh_db):
 
 
 def test_invalid_age_is_reasked(fresh_db):
-    register(fresh_db, 1)
+    register(fresh_db, 1, complete=False)
     context = FakeContext()
     context.user_data["awaiting_age"] = True
 
@@ -891,6 +901,18 @@ def test_invalid_age_is_reasked(fresh_db):
     assert context.user_data["awaiting_age"] is True
 
 
+def test_settings_change_name_does_not_start_onboarding(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    press(1, "change_name", context)
+    update = FakeUpdate(1, message=FakeMessage(text="Rakib"))
+    asyncio.run(bot.relay_message(update, context))
+    assert fresh_db.get_user(1).name == "Rakib"
+    # Settings flow: no age/city prompts afterwards
+    assert context.user_data.get("awaiting_age") is not True
+    assert context.user_data.get("awaiting_city") is not True
+
+
 def test_settings_change_age_does_not_force_city(fresh_db):
     register(fresh_db, 1)
     context = FakeContext()
@@ -899,6 +921,62 @@ def test_settings_change_age_does_not_force_city(fresh_db):
     asyncio.run(bot.relay_message(update, context))
     assert fresh_db.get_user(1).age == 31
     assert context.user_data.get("awaiting_city") is not True
+
+
+# ── Mandatory name / age / city ─────────────────────────────────
+
+def test_search_requires_name_age_and_city(fresh_db):
+    register(fresh_db, 1, complete=False)
+    context = FakeContext()
+
+    text, markup, mode = asyncio.run(bot.begin_search(context, 1, Gender.ANY))
+
+    assert "required" in text
+    assert context.user_data["awaiting_name"] is True
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+
+    # completing the chain unlocks the search
+    for value in ("Rakib", "25", "Dhaka"):
+        update = FakeUpdate(1, message=FakeMessage(text=value))
+        asyncio.run(bot.relay_message(update, context))
+    text, _, _ = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.ANY))
+    assert "Searching" in text
+
+
+def test_find_command_requires_name_age_and_city(fresh_db):
+    register(fresh_db, 1, complete=False)
+    context = FakeContext()
+    update = FakeUpdate(1)
+
+    asyncio.run(bot.find_command(update, context))
+
+    assert "required" in update.message.replies[0]["text"]
+    assert context.user_data["awaiting_name"] is True
+
+
+def test_browse_requires_name_age_and_city(fresh_db):
+    register(fresh_db, 1, complete=False)
+    context = FakeContext()
+    update = FakeUpdate(1)
+
+    asyncio.run(bot.browse_command(update, context))
+
+    assert "required" in update.message.replies[0]["text"]
+    assert context.user_data["awaiting_name"] is True
+
+
+def test_setup_chain_skips_fields_already_set(fresh_db):
+    # only the city is missing → the chain asks for exactly that
+    register(fresh_db, 1, complete=False)
+    fresh_db.update_name(1, "Rakib")
+    fresh_db.update_age(1, 25)
+    context = FakeContext()
+
+    text, _, _ = asyncio.run(bot.begin_search(context, 1, Gender.ANY))
+    assert "**city** is required" in text
+    assert context.user_data.get("awaiting_city") is True
+    assert context.user_data.get("awaiting_name") is not True
+    assert context.user_data.get("awaiting_age") is not True
 
 
 def test_viewing_profile_notifies_owner_once(fresh_db):
@@ -1028,6 +1106,31 @@ def test_no_force_join_configured_skips_the_gate(fresh_db, monkeypatch):
     update = FakeUpdate(1, message=FakeMessage(text="hi"))
     asyncio.run(bot.relay_message(update, context))
     assert update.message.replies, "bot should answer without any channel config"
+
+
+def test_profile_setup_comes_before_force_join(fresh_db, monkeypatch):
+    _enable_force_join(monkeypatch)
+    register(fresh_db, 1, complete=False)
+    context = FakeContext()
+    context.bot.member_status = "left"   # hasn't joined the channel yet
+
+    # onboarding runs to completion — the gate waits while fields are missing
+    press(1, "pref_any", context)
+    for value in ("Rakib", "25", "Dhaka"):
+        update = FakeUpdate(1, message=FakeMessage(text=value))
+        asyncio.run(bot.relay_message(update, context))
+        # input is processed as setup — the gate never answers instead of it
+        assert update.message.replies[0]["text"].startswith("✅")
+
+    user = fresh_db.get_user(1)
+    assert (user.name, user.age, user.city) == ("Rakib", 25, "Dhaka")
+
+    # profile complete → the join popup lands right after setup
+    assert "channel" in update.message.replies[-1]["text"].lower()
+    markup = update.message.replies[-1]["reply_markup"]
+    assert any(
+        b.url == "https://t.me/testchan" for b in _buttons(markup) if b.url
+    )
 
 
 def test_block_from_profile_card_stops_matching(fresh_db):

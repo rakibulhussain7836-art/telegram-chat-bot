@@ -238,6 +238,12 @@ SEARCH_CHOICE_TEXT = """
 💡 Talking to everyone is free — only searching for Girls costs Coins.
 """
 
+NAME_ASK_TEXT = """
+✏️ **What should people call you?**
+
+Send your name — this is what others see on your profile card.
+"""
+
 AGE_ASK_TEXT = """
 🎂 **How old are you?**
 
@@ -378,6 +384,66 @@ def display_name(user, viewer=None) -> str:
     return "Stranger"
 
 
+# ── Mandatory profile fields (name → age → city) ────────────────
+
+PROFILE_FIELDS = ("name", "age", "city")
+
+_SETUP_PROMPTS = {"name": NAME_ASK_TEXT, "age": AGE_ASK_TEXT, "city": CITY_ASK_TEXT}
+
+
+def missing_profile_fields(user) -> list[str]:
+    """Mandatory profile fields the user still owes, in asking order."""
+    return [f for f in PROFILE_FIELDS if not getattr(user, f, None)]
+
+
+def profile_setup_reply(context, user):
+    """Arm the name→age→city chain for the first missing field.
+
+    Returns (text, reply_markup, parse_mode) for the caller to send/edit,
+    or None when the profile is already complete.
+    """
+    missing = missing_profile_fields(user)
+    if not missing:
+        return None
+    field = missing[0]
+    context.user_data["setup_flow"] = True
+    context.user_data[f"awaiting_{field}"] = True
+    return (
+        f"⚠️ Your profile is incomplete — **{field}** is required.\n\n"
+        + _SETUP_PROMPTS[field].strip(),
+        None,
+        "Markdown",
+    )
+
+
+async def _next_setup_step(update, context, user_id: int, done_line: str) -> None:
+    """After one onboarding field is saved: ask for the next missing one,
+    or close the flow — all-set message, promo and the force-join gate."""
+    user = db.get_user(user_id)
+    for field in PROFILE_FIELDS:
+        if not getattr(user, field, None):
+            context.user_data["setup_flow"] = True
+            context.user_data[f"awaiting_{field}"] = True
+            await update.message.reply_text(
+                f"{done_line}\n\n" + _SETUP_PROMPTS[field].strip(),
+                parse_mode="Markdown",
+            )
+            return
+    context.user_data.pop("setup_flow", None)
+    await update.message.reply_text(
+        done_line, parse_mode="Markdown", reply_markup=main_reply_keyboard()
+    )
+    await animated_reply(
+        update.message,
+        ["🎉", ALL_SET_TEXT.strip()],
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+    await send_promo(context, user_id)
+    # Profile is complete now — the force-join gate kicks in from here.
+    await enforce_channel(update, context)
+
+
 # ── Forced channel subscription gate ────────────────────────────
 
 FORCE_JOIN_TEXT = (
@@ -419,8 +485,15 @@ async def enforce_channel(update, context) -> bool:
     """
     Force-join gate for every entry point (commands, buttons, messages).
     Returns True when the user may proceed; otherwise shows the join popup.
+
+    Profile setup (name → age → city) runs FIRST: while mandatory fields
+    are missing the gate waits — the join popup lands only once the
+    profile is complete.
     """
     if await is_channel_member(context, update.effective_user.id):
+        return True
+    user = db.get_user(update.effective_user.id)
+    if user and missing_profile_fields(user):
         return True
     markup = force_join_keyboard(force_join_link())
     try:
@@ -1101,6 +1174,10 @@ async def begin_search(
             None,
         )
 
+    pending = profile_setup_reply(context, user)
+    if pending:
+        return pending
+
     if user.state == ChatState.CHATTING:
         return "You're already in a chat! Use /stop to leave first.", chat_keyboard(), None
 
@@ -1249,6 +1326,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Returning users just get the menu (like the reference bot)
     if not is_new and user.gender and user.country:
+        pending = profile_setup_reply(context, user)
+        if pending:
+            # name/age/city still missing — finish the profile first
+            text, markup, mode = pending
+            await update.message.reply_text(
+                text, parse_mode=mode, reply_markup=markup
+            )
+            return
         if not await enforce_channel(update, context):
             return
         await update.message.reply_text(
@@ -1354,6 +1439,12 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⏳ You're already searching for a partner...",
             reply_markup=searching_keyboard(),
         )
+        return
+
+    pending = profile_setup_reply(context, user)
+    if pending:
+        text, markup, mode = pending
+        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
         return
 
     await update.message.reply_text(
@@ -1499,10 +1590,16 @@ BROWSE_KIND_TITLES = {
 async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🎉 Browse People — MeChat-style category menu."""
     user_id = update.effective_user.id
-    if not db.get_user(user_id):
+    user = db.get_user(user_id)
+    if not user:
         await update.message.reply_text("Please /start first.")
         return
     if not await enforce_channel(update, context):
+        return
+    pending = profile_setup_reply(context, user)
+    if pending:
+        text, markup, mode = pending
+        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
         return
     await update.message.reply_text(
         BROWSE_MENU_TEXT,
@@ -1764,12 +1861,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_preferred_gender(user_id, pref)
         label = format_gender(pref) if pref != Gender.ANY else "🌍 Anyone"
         context.user_data["setup_flow"] = True
-        context.user_data["awaiting_age"] = True
+        context.user_data["awaiting_name"] = True
         await animate_edit(
             query,
             [
                 "✅",
-                f"✅ You'll be matched with: **{label}**\n\n" + AGE_ASK_TEXT.strip(),
+                f"✅ You'll be matched with: **{label}**\n\n" + NAME_ASK_TEXT.strip(),
             ],
             interval=0.35,
             parse_mode="Markdown",
@@ -1785,6 +1882,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(
                 query, "⚠️ Complete your profile first.\nUse /start to set up."
             )
+            return
+
+        pending = profile_setup_reply(context, user)
+        if pending:
+            text, markup, mode = pending
+            await safe_edit(query, text, parse_mode=mode, reply_markup=markup)
             return
 
         if user.state == ChatState.CHATTING:
@@ -2376,6 +2479,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Browse People ──────────────────────────────────────
     elif data == "browse_menu":
+        pending = profile_setup_reply(context, user)
+        if pending:
+            text, markup, mode = pending
+            await safe_edit(query, text, parse_mode=mode, reply_markup=markup)
+            return
         await safe_edit(
             query,
             BROWSE_MENU_TEXT,
@@ -2384,6 +2492,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("brw_"):
+        pending = profile_setup_reply(context, user)
+        if pending:
+            text, markup, mode = pending
+            await safe_edit(query, text, parse_mode=mode, reply_markup=markup)
+            return
         kind = data[len("brw_"):]
         page, total = await asyncio.to_thread(
             db.browse_filtered, user_id, kind, 0, BROWSE_PAGE_SIZE
@@ -2803,10 +2916,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_age(user_id, int(raw))
         context.user_data["awaiting_age"] = False
         if context.user_data.get("setup_flow"):
-            context.user_data["awaiting_city"] = True
-            await update.message.reply_text(
-                f"✅ Age set to **{raw}**\n\n" + CITY_ASK_TEXT.strip(),
-                parse_mode="Markdown",
+            await _next_setup_step(
+                update, context, user_id, f"✅ Age set to **{raw}**"
             )
         else:
             await update.message.reply_text(
@@ -2828,18 +2939,9 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_city"] = False
         setup_flow = context.user_data.pop("setup_flow", False)
         if setup_flow:
-            await update.message.reply_text(
-                f"✅ City set to **{city}**",
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(),
+            await _next_setup_step(
+                update, context, user_id, f"✅ City set to **{city}**"
             )
-            await animated_reply(
-                update.message,
-                ["🎉", ALL_SET_TEXT.strip()],
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard(),
-            )
-            await send_promo(context, user_id)
         else:
             await update.message.reply_text(
                 f"✅ City set to **{city}**",
@@ -2848,7 +2950,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Handle profile name text input
+    # Handle profile name text input (onboarding + Settings)
     if context.user_data.get("awaiting_name"):
         name = (update.message.text or "").strip()
         if not name:
@@ -2858,11 +2960,16 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.update_name(user_id, name)
         context.user_data["awaiting_name"] = False
-        await update.message.reply_text(
-            f"✅ Name set to **{name}**",
-            parse_mode="Markdown",
-            reply_markup=settings_keyboard(),
-        )
+        if context.user_data.get("setup_flow"):
+            await _next_setup_step(
+                update, context, user_id, f"✅ Name set to **{md_escape(name)}**"
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Name set to **{md_escape(name)}**",
+                parse_mode="Markdown",
+                reply_markup=settings_keyboard(),
+            )
         return
 
     # Handle "📋 Send Message to List"
@@ -2916,6 +3023,13 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(reply, parse_mode=mode, reply_markup=markup)
             return
         if text == BROWSE_LABEL:
+            pending = profile_setup_reply(context, user)
+            if pending:
+                p_text, p_markup, p_mode = pending
+                await update.message.reply_text(
+                    p_text, parse_mode=p_mode, reply_markup=p_markup
+                )
+                return
             await update.message.reply_text(
                 BROWSE_MENU_TEXT,
                 parse_mode="Markdown",
