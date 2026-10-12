@@ -275,6 +275,20 @@ def test_memory_mode_creates_no_file(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_missing_parent_directory_is_created(tmp_path):
+    """DB_PATH=/data/bot.db must work when /data doesn't exist yet (cloud volumes)."""
+    path = str(tmp_path / "data" / "nested" / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.close()
+
+    assert os.path.isfile(path)
+    db2 = Database(path=path)
+    assert db2.get_user(1) is not None
+    db2.close()
+
+
 def test_card_fields_survive_restart(tmp_path):
     path = str(tmp_path / "bot.db")
 

@@ -254,6 +254,9 @@ class Database:
     # ── Persistence ──────────────────────────────────────────────
 
     def _connect(self):
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(self.path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
