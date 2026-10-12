@@ -47,6 +47,7 @@ REFERRED_BONUS = 5         # extra coins for the newly referred friend
 GIRL_SEARCH_COST = 1       # coins per "Chat With Girl" search
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
 CHAT_REQUEST_COST = 1      # coins to send a chat request from Nearby / by ID
+DIRECT_MESSAGE_COST = 1    # coins to start a Direct Message from a profile card
 CHAT_REQUEST_TTL = 120     # seconds the receiver has to answer a request
 NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
 EARTH_RADIUS_KM = 6371.0

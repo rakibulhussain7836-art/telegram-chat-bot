@@ -11,7 +11,7 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 
-from database import CHAT_REQUEST_COST, GIRL_SEARCH_COST
+from database import CHAT_REQUEST_COST, DIRECT_MESSAGE_COST, GIRL_SEARCH_COST
 
 
 # ── Gender selection ─────────────────────────────────────────────
@@ -292,7 +292,10 @@ def profile_view_keyboard(
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(like_label, callback_data=f"like_toggle_{target_id}")],
         [
-            InlineKeyboardButton("📨 Direct Message", callback_data=f"dm_{target_id}"),
+            InlineKeyboardButton(
+                f"📨 Direct Message ({DIRECT_MESSAGE_COST} 🪙)",
+                callback_data=f"dm_{target_id}",
+            ),
             InlineKeyboardButton(
                 f"📨 Chat Request ({CHAT_REQUEST_COST} 🪙)",
                 callback_data=f"req_chat_{target_id}",
@@ -389,4 +392,14 @@ def verify_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👧 Verify as Girl", callback_data="verify_girl"),
         ],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings")],
+    ])
+
+
+# ── Forced channel subscription ─────────────────────────────────
+
+def force_join_keyboard(channel_link: str) -> InlineKeyboardMarkup:
+    """Join-channel gate: open the channel, then confirm you've joined."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=channel_link)],
+        [InlineKeyboardButton("✅ I've Joined", callback_data="joined_check")],
     ])

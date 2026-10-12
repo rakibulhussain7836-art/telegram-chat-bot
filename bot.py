@@ -51,6 +51,7 @@ from database import (
     REFERRED_BONUS,
     GIRL_SEARCH_COST,
     CHAT_REQUEST_COST,
+    DIRECT_MESSAGE_COST,
     CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
     BROWSE_PAGE_SIZE,
@@ -85,6 +86,7 @@ from keyboards import (
     swipe_keyboard,
     vip_keyboard,
     verify_keyboard,
+    force_join_keyboard,
     NEW_CHAT_LABEL,
     BROWSE_LABEL,
     NEARBY_LABEL,
@@ -114,6 +116,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Telegram user ID of the admin (you) — reviews verification photos.
 _admin = os.getenv("ADMIN_ID", "")
 ADMIN_ID = int(_admin) if _admin.strip().isdigit() else None
+
+# Forced channel subscription — users must join before using the bot.
+# FORCE_CHANNEL: @channelusername, channelusername or -100… channel id.
+# FORCE_CHANNEL_INVITE: invite link for private channels (https://t.me/+…).
+FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()
+FORCE_CHANNEL_INVITE = os.getenv("FORCE_CHANNEL_INVITE", "").strip()
 
 # Shows up in Telegram's ☰ Menu, like the reference bot.
 BOT_COMMANDS = [
@@ -171,11 +179,13 @@ HELP_MSG = """
 • 🧭 **Nearby People** — share your location and see people around you
 • 🔎 **Find by ID** — search anyone with their 6-digit ID (see yours in /profile)
 • 📨 **Chat Request** ({request_cost} 🪙) — they accept within two minutes
+• 📨 **Direct Message** ({dm_cost} 🪙) — start a chat instantly from a profile card
 • ❤️ Like / 💔 Unlike profiles from the profile view
 • ➕ Add to Contacts while chatting — see them in 📇 My Contacts
 
 **Profile:**
 • Set your **name, age, city** and 📷 a profile photo
+• No photo yet? An **AI avatar** shows on your profile card automatically
 • 🪩 Get Verified — send a photo, an admin reviews it
 
 **Coins:**
@@ -269,7 +279,8 @@ def credit_text(user) -> str:
         f"2️⃣ **Buy Coin**\n"
         f"Choose one of the plans below 👇\n\n"
         f"💡 *Chatting with anyone is free — searching for a 👩 Girl costs "
-        f"{GIRL_SEARCH_COST} 🪙 per search.*\n"
+        f"{GIRL_SEARCH_COST} 🪙 per search, and a 📨 Direct Message from a "
+        f"profile costs {DIRECT_MESSAGE_COST} 🪙.*\n"
         f"🎁 New accounts start with **{STARTING_COINS} free Coins**."
     )
 
@@ -337,6 +348,97 @@ def display_name(user) -> str:
     return "Stranger"
 
 
+# ── Forced channel subscription gate ────────────────────────────
+
+FORCE_JOIN_TEXT = (
+    "📢 **One quick step before you start!**\n\n"
+    "Join our channel to use the bot.\n"
+    "Tap **📢 Join Channel** below, then press **✅ I've Joined**."
+)
+
+
+def force_join_link() -> str | None:
+    """Public t.me link for the forced channel (or the invite link if set)."""
+    if FORCE_CHANNEL_INVITE:
+        return FORCE_CHANNEL_INVITE
+    if not FORCE_CHANNEL:
+        return None
+    name = FORCE_CHANNEL.lstrip("@")
+    if name.startswith("-100"):
+        return None  # private channel id — set FORCE_CHANNEL_INVITE instead
+    return f"https://t.me/{name}"
+
+
+def force_join_required() -> bool:
+    return bool(FORCE_CHANNEL) and force_join_link() is not None
+
+
+async def is_channel_member(context, user_id: int) -> bool:
+    """True when the user follows the forced channel (or no channel is set)."""
+    if not force_join_required():
+        return True
+    try:
+        member = await context.bot.get_chat_member(FORCE_CHANNEL, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:  # noqa: BLE001 — fail open, never brick the bot
+        logger.warning(f"Force-join check failed for {user_id}: {e}")
+        return True
+
+
+async def enforce_channel(update, context) -> bool:
+    """
+    Force-join gate for every entry point (commands, buttons, messages).
+    Returns True when the user may proceed; otherwise shows the join popup.
+    """
+    if await is_channel_member(context, update.effective_user.id):
+        return True
+    markup = force_join_keyboard(force_join_link())
+    try:
+        if update.message is not None:
+            await update.message.reply_text(
+                FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=markup
+            )
+        elif update.callback_query is not None:
+            await update.callback_query.answer(
+                "📢 Join our channel first, then press ✅ I've Joined.",
+                show_alert=True,
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=FORCE_JOIN_TEXT,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to send force-join prompt: {e}")
+    return False
+
+
+# ── AI avatar fallback (profiles without a photo) ───────────────
+
+def ai_avatar_url(user) -> str:
+    """
+    AI-generated face for profile cards when the user never set a photo.
+    Boys get a boy face, girls a girl face — the same seed every time,
+    so the face never changes.
+    """
+    seed = public_id_slug(user)
+    if user.gender == Gender.FEMALE:
+        return (
+            "https://api.dicebear.com/9.x/lorelei/png"
+            f"?seed={seed}&size=800&backgroundColor=ffd5dc,c0aede,ffdfbf"
+        )
+    return (
+        "https://api.dicebear.com/9.x/personas/png"
+        f"?seed={seed}&size=800&backgroundColor=b6e3f4,c0aede,d1d4f9"
+    )
+
+
+def profile_photo_of(user) -> str:
+    """The user's own photo — or their AI avatar when none is set."""
+    return user.photo_file_id or ai_avatar_url(user)
+
+
 async def notify_partner_found(context, user_id, partner_id):
     """Send 'partner found' notifications to both users (with reveal animation)."""
     user = db.get_user(user_id)
@@ -376,16 +478,14 @@ async def notify_partner_found(context, user_id, partner_id):
             parse_mode="Markdown",
             reply_markup=chat_keyboard(),
         )
-        # Send the partner's profile photo (they never see their own)
-        if p.photo_file_id:
-            try:
-                await context.bot.send_photo(
-                    chat_id=u.user_id,
-                    photo=p.photo_file_id,
-                    caption=f"📷 {display_name(p)}'s profile photo",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
+        # Partner's profile photo — AI avatar when they never set one
+        try:
+            await context.bot.send_photo(
+                chat_id=u.user_id,
+                photo=profile_photo_of(p),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
 
 
 class _MsgTarget:
@@ -500,28 +600,26 @@ def _remember_list_message(context, query) -> None:
 
 async def show_user_card(query, context, viewer_id: int, target) -> None:
     """
-    Open someone's profile. When they have a photo the card is sent as a
-    photo message (like the reference bot); otherwise the current message
-    is edited in place.
+    Open someone's profile as a photo card (like the reference bot).
+    Users without a photo get their AI avatar — everyone has a photo card.
     """
     liked = viewer_id in target.liked_by
     notify = db.get_user(viewer_id).notify_on_end
     markup = profile_view_keyboard(target.user_id, liked, notify)
     text = build_user_card(target, viewer_id)
 
-    if target.photo_file_id:
-        _remember_list_message(context, query)
-        try:
-            await context.bot.send_photo(
-                chat_id=viewer_id,
-                photo=target.photo_file_id,
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=markup,
-            )
-            return
-        except Exception as e:
-            logger.warning(f"Failed to send profile photo card: {e}")
+    _remember_list_message(context, query)
+    try:
+        await context.bot.send_photo(
+            chat_id=viewer_id,
+            photo=profile_photo_of(target),
+            caption=text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
+    except Exception as e:
+        logger.warning(f"Failed to send profile photo card: {e}")
 
     await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
 
@@ -534,10 +632,10 @@ async def reply_profile_card(message, viewer_id: int, target) -> None:
         db.get_user(viewer_id).notify_on_end,
     )
     text = build_user_card(target, viewer_id)
-    if target.photo_file_id and hasattr(message, "reply_photo"):
+    if hasattr(message, "reply_photo"):
         try:
             await message.reply_photo(
-                photo=target.photo_file_id,
+                photo=profile_photo_of(target),
                 caption=text,
                 parse_mode="Markdown",
                 reply_markup=markup,
@@ -575,8 +673,6 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
     if not ANIMATIONS_ENABLED:
         return
     for label, target in pairs[:limit]:
-        if not target.photo_file_id:
-            continue
         dist = db.distance_km(chat_id, target.user_id)
         caption = (
             f"{_plain_label(target)}\n"
@@ -587,7 +683,7 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
         try:
             await context.bot.send_photo(
                 chat_id=chat_id,
-                photo=target.photo_file_id,
+                photo=profile_photo_of(target),
                 caption=caption,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
@@ -895,6 +991,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Returning users just get the menu (like the reference bot)
     if not is_new and user.gender and user.country:
+        if not await enforce_channel(update, context):
+            return
         await update.message.reply_text(
             "🏠 **Main Menu**",
             parse_mode="Markdown",
@@ -937,6 +1035,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Failed to notify referrer {referrer_id}: {e}")
 
+    # Force-join gate — after registration/referral so nothing is lost
+    if not await enforce_channel(update, context):
+        return
+
     await animated_reply(
         update.message,
         bounce_frames(welcome),
@@ -946,10 +1048,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await enforce_channel(update, context):
+        return
     await animated_reply(
         update.message,
         bounce_frames(
-            HELP_MSG.format(cost=GIRL_SEARCH_COST, request_cost=CHAT_REQUEST_COST)
+            HELP_MSG.format(
+                cost=GIRL_SEARCH_COST,
+                request_cost=CHAT_REQUEST_COST,
+                dm_cost=DIRECT_MESSAGE_COST,
+            )
         ),
         parse_mode="Markdown",
     )
@@ -961,6 +1069,9 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not user:
         await update.message.reply_text("Please /start first to set up your profile.")
+        return
+
+    if not await enforce_channel(update, context):
         return
 
     if user.banned:
@@ -1027,6 +1138,9 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please /start first.")
         return
 
+    if not await enforce_channel(update, context):
+        return
+
     await update.message.reply_text(
         build_profile_text(user),
         parse_mode="Markdown",
@@ -1040,6 +1154,9 @@ async def credit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not user:
         await update.message.reply_text("Please /start first.")
+        return
+
+    if not await enforce_channel(update, context):
         return
 
     await animated_reply(
@@ -1056,6 +1173,9 @@ async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not user:
         await update.message.reply_text("Please /start first.")
+        return
+
+    if not await enforce_channel(update, context):
         return
 
     link = await get_referral_link(context, user_id)
@@ -1079,6 +1199,9 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please /start first.")
         return
 
+    if not await enforce_channel(update, context):
+        return
+
     text, _ = await process_report(context, user_id)
     await update.message.reply_text(
         text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
@@ -1090,6 +1213,8 @@ async def newchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not db.get_user(user_id):
         await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
         return
     text, markup, mode = await begin_search(
         context, user_id, Gender.ANY, target=update.message
@@ -1119,6 +1244,8 @@ async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.get_user(user_id):
         await update.message.reply_text("Please /start first.")
         return
+    if not await enforce_channel(update, context):
+        return
     await update.message.reply_text(
         BROWSE_MENU_TEXT,
         parse_mode="Markdown",
@@ -1144,6 +1271,8 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Please /start first.")
         return
+    if not await enforce_channel(update, context):
+        return
     await update.message.reply_text(
         vip_text(user), parse_mode="Markdown", reply_markup=vip_keyboard()
     )
@@ -1154,6 +1283,8 @@ async def link_anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     if not user:
         await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
         return
     me = await context.bot.get_me()
     link = f"https://t.me/{me.username}?start=chat_{public_id_slug(user)}"
@@ -1282,6 +1413,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         db.register_user(user_id, query.from_user.username)
         user = db.get_user(user_id)
+
+    # ── Force-join: "✅ I've Joined" re-check ───────────────
+    if data == "joined_check":
+        if await is_channel_member(context, user_id):
+            await query.answer("✅ Welcome aboard!", show_alert=True)
+            await safe_edit(
+                query,
+                "✅ **Thanks for joining!**\n\nYou can now use the bot — "
+                "tap a button below to get started.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await query.answer(
+                "⚠️ You haven't joined yet — tap \"📢 Join Channel\" first, "
+                "then press ✅ I've Joined.",
+                show_alert=True,
+            )
+        return
+
+    # ── Force-join gate on every other button ──────────────
+    if not await enforce_channel(update, context):
+        return
 
     # ── Like partner (answered with a toast instead) ─────────
     if data == "like_partner":
@@ -1412,20 +1566,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, text, parse_mode=parse_mode, reply_markup=markup)
 
     elif data == "my_profile":
-        # MeChat-style: own profile as a photo card when a photo exists
-        if user.photo_file_id:
-            try:
-                await typing_pulse(context.bot, user_id, times=1, interval=0.3)
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=user.photo_file_id,
-                    caption=build_profile_text(user),
-                    parse_mode="Markdown",
-                    reply_markup=profile_keyboard(),
-                )
-                return
-            except Exception as e:
-                logger.warning(f"Failed to send profile photo card: {e}")
+        # MeChat-style: own profile always arrives as a photo card
+        # (AI avatar is used when no photo was set)
+        try:
+            await typing_pulse(context.bot, user_id, times=1, interval=0.3)
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=profile_photo_of(user),
+                caption=build_profile_text(user),
+                parse_mode="Markdown",
+                reply_markup=profile_keyboard(),
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send profile photo card: {e}")
         await typing_pulse(context.bot, user_id, times=1, interval=0.25)
         await safe_edit(
             query, build_profile_text(user), parse_mode="Markdown",
@@ -1810,12 +1964,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "You're already in a chat! Use /stop first.", show_alert=True
             )
             return
+        if not db.spend_coins(user_id, DIRECT_MESSAGE_COST):
+            await query.answer(
+                f"🪙 Not enough Coins! A Direct Message costs "
+                f"{DIRECT_MESSAGE_COST} 🪙.",
+                show_alert=True,
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"🪙 **Not enough Coins!**\n\n"
+                    f"Starting a Direct Message costs **{DIRECT_MESSAGE_COST} 🪙**.\n"
+                    f"Invite friends (/link) or buy Coins (/credit) to earn more."
+                ),
+                parse_mode="Markdown",
+                reply_markup=credit_keyboard(),
+            )
+            return
         if user.state == ChatState.SEARCHING:
             db.remove_from_queue(user_id)
         db.pair_users(user_id, target.user_id)
+        balance = db.get_user(user_id).coins
         await safe_edit(
             query,
-            "💬 **Direct chat started! Say hi 👋**",
+            f"💬 **Direct chat started! Say hi 👋**\n"
+            f"🪙 -{DIRECT_MESSAGE_COST} | Balance: {balance}",
             parse_mode="Markdown",
             reply_markup=chat_keyboard(),
         )
@@ -2252,6 +2425,10 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Your account is restricted.")
         return
 
+    # Force-join gate — nothing goes through until the channel is joined
+    if not await enforce_channel(update, context):
+        return
+
     # Handle profile photo upload (before chat / country logic)
     if context.user_data.get("awaiting_photo"):
         context.user_data["awaiting_photo"] = False
@@ -2518,14 +2695,14 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
 
     try:
-        # Relay different message types
+        # Relay different message types — raw content only, no emoji prefixes
         if msg.text:
-            await context.bot.send_message(chat_id=partner_id, text=f"💬 {msg.text}")
+            await context.bot.send_message(chat_id=partner_id, text=msg.text)
         elif msg.photo:
             await context.bot.send_photo(
                 chat_id=partner_id,
                 photo=msg.photo[-1].file_id,
-                caption=f"📷 {msg.caption or ''}",
+                caption=msg.caption or "",
             )
         elif msg.sticker:
             await context.bot.send_sticker(chat_id=partner_id, sticker=msg.sticker.file_id)
@@ -2535,7 +2712,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_video(
                 chat_id=partner_id,
                 video=msg.video.file_id,
-                caption=f"🎥 {msg.caption or ''}",
+                caption=msg.caption or "",
             )
         elif msg.video_note:
             await context.bot.send_video_note(chat_id=partner_id, video_note=msg.video_note.file_id)
@@ -2549,7 +2726,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 chat_id=partner_id,
                 document=msg.document.file_id,
-                caption=f"📎 {msg.caption or ''}",
+                caption=msg.caption or "",
             )
         elif msg.location:
             await context.bot.send_location(

@@ -10,6 +10,7 @@ from database import (
     Gender,
     GIRL_SEARCH_COST,
     CHAT_REQUEST_COST,
+    DIRECT_MESSAGE_COST,
     STARTING_COINS,
 )
 
@@ -41,7 +42,8 @@ class FakeMessage:
 class FakeUpdate:
     def __init__(self, user_id, username=None, message=None, callback_query=None):
         self.effective_user = FakeUser(user_id, username)
-        self.message = message or FakeMessage()
+        # like real Telegram updates: a callback query arrives without a message
+        self.message = message or (FakeMessage() if callback_query is None else None)
         self.callback_query = callback_query
         self.args = []
 
@@ -66,12 +68,21 @@ class FakeBot:
     def __init__(self):
         self.sent = []
         self.photos = []
+        self.member_status = "member"   # force-join gate: "left" = not joined
+
+    async def get_chat_member(self, chat_id, user_id):
+        return SimpleNamespace(status=self.member_status)
 
     async def send_message(self, chat_id=None, text=None, **kwargs):
         self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
 
     async def send_photo(self, chat_id=None, photo=None, caption=None, **kwargs):
-        self.photos.append({"chat_id": chat_id, "photo": photo, "caption": caption})
+        self.photos.append({
+            "chat_id": chat_id,
+            "photo": photo,
+            "caption": caption,
+            "reply_markup": kwargs.get("reply_markup"),
+        })
 
 
 class FakeContext:
@@ -114,11 +125,17 @@ def test_format_gender_and_state():
 
 
 def test_help_text_has_search_cost_filled_in():
-    text = bot.HELP_MSG.format(cost=GIRL_SEARCH_COST, request_cost=CHAT_REQUEST_COST)
+    text = bot.HELP_MSG.format(
+        cost=GIRL_SEARCH_COST,
+        request_cost=CHAT_REQUEST_COST,
+        dm_cost=DIRECT_MESSAGE_COST,
+    )
     assert str(GIRL_SEARCH_COST) in text
     assert str(CHAT_REQUEST_COST) in text
+    assert str(DIRECT_MESSAGE_COST) in text
     assert "{cost}" not in text
     assert "{request_cost}" not in text
+    assert "{dm_cost}" not in text
 
 
 def test_credit_text_shows_balance_and_earn_options(fresh_db):
@@ -387,10 +404,13 @@ def test_partner_receives_my_photo_on_match(fresh_db):
     assert any(
         p["chat_id"] == 2 and p["photo"] == "photo_of_1" for p in ctx.bot.photos
     )
-    assert not any(p["chat_id"] == 1 for p in ctx.bot.photos)  # no own photo back
+    # user 1 gets the partner's AI avatar back (never their own photo)
+    to_1 = [p for p in ctx.bot.photos if p["chat_id"] == 1]
+    assert all(p["photo"] != "photo_of_1" for p in to_1)
+    assert any("lorelei" in p["photo"] for p in to_1)
 
 
-def test_match_without_photos_sends_none(fresh_db):
+def test_match_without_photos_sends_ai_avatar(fresh_db):
     register(fresh_db, 1, gender=Gender.MALE, country="US")
     register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
     fresh_db.add_to_queue(1)
@@ -398,7 +418,29 @@ def test_match_without_photos_sends_none(fresh_db):
     ctx = FakeContext()
     asyncio.run(bot.begin_search(ctx, 2, Gender.ANY))
 
-    assert ctx.bot.photos == []
+    # No photo was set → the partner still gets an AI avatar photo card
+    avatar_photos = [
+        p for p in ctx.bot.photos
+        if isinstance(p["photo"], str) and p["photo"].startswith("https://")
+    ]
+    assert len(avatar_photos) >= 1
+    # user 1 (boy) sees the girl's avatar, user 2 (girl) the boy's
+    to_2 = next(p for p in avatar_photos if p["chat_id"] == 2)
+    assert "personas" in to_2["photo"]  # boy face of partner 1, seen by girl 2
+    to_1 = next(p for p in avatar_photos if p["chat_id"] == 1)
+    assert "lorelei" in to_1["photo"]   # girl face of partner 2, seen by boy 1
+    assert not any(p["chat_id"] == 1 and p["photo"] == "photo_of_1" for p in ctx.bot.photos)
+
+
+def test_ai_avatar_is_gendered_and_stable(fresh_db):
+    boy = register(fresh_db, 1, gender=Gender.MALE)
+    girl = register(fresh_db, 2, gender=Gender.FEMALE)
+    assert "personas" in bot.ai_avatar_url(boy)
+    assert "lorelei" in bot.ai_avatar_url(girl)
+    assert bot.ai_avatar_url(boy) == bot.ai_avatar_url(boy)  # same face every time
+    # a real photo always wins over the AI avatar
+    fresh_db.set_photo(1, "real_photo")
+    assert bot.profile_photo_of(fresh_db.get_user(1)) == "real_photo"
 
 
 # ── Helper: press an inline button ──────────────────────────────
@@ -799,11 +841,18 @@ def test_profile_card_buttons_match_reference(fresh_db):
     register(fresh_db, 1)
     register(fresh_db, 2)
 
-    query, _ = press(1, f"view_{2}")
+    query, context = press(1, f"view_{2}")
 
-    labels = [b.text for b in _buttons(query.edits[-1]["reply_markup"])]
+    # the card always arrives as a photo (AI avatar when no photo is set)
+    assert context.bot.photos, "profile card should be sent as a photo card"
+    card = context.bot.photos[-1]
+    assert isinstance(card["photo"], str) and card["photo"].startswith("https://")
+    labels = [b.text for b in _buttons(card["reply_markup"])]
     assert labels[0] == "❤️ Like"
     assert any("Direct Message" in label for label in labels)
+    assert f"{DIRECT_MESSAGE_COST} 🪙" in next(
+        label for label in labels if "Direct Message" in label
+    )
     assert any("Chat Request" in label for label in labels)
     assert any("Block User" in label for label in labels)
     assert any("Report User" in label for label in labels)
@@ -872,7 +921,7 @@ def test_viewing_own_profile_never_notifies(fresh_db):
 
 # ── Direct Message / Block / Report from a card ────────────────
 
-def test_direct_message_pairs_when_both_free(fresh_db):
+def test_direct_message_charges_one_coin_and_pairs(fresh_db):
     register(fresh_db, 1)
     register(fresh_db, 2, gender=Gender.FEMALE)
 
@@ -880,8 +929,23 @@ def test_direct_message_pairs_when_both_free(fresh_db):
 
     assert fresh_db.get_user(1).state == ChatState.CHATTING
     assert fresh_db.get_user(2).state == ChatState.CHATTING
+    assert fresh_db.get_user(1).coins == STARTING_COINS - DIRECT_MESSAGE_COST
     assert any("Partner found" in m["text"] for m in context.bot.sent)
     assert "Direct chat started" in query.edits[-1]["text"]
+    assert f"-{DIRECT_MESSAGE_COST}" in query.edits[-1]["text"]
+
+
+def test_direct_message_refused_without_coins(fresh_db):
+    user = register(fresh_db, 1)
+    user.coins = 0
+    register(fresh_db, 2, gender=Gender.FEMALE)
+
+    query, context = press(1, f"dm_{2}")
+
+    assert query.answers[-1]["show_alert"] is True
+    assert "Not enough Coins" in query.answers[-1]["text"]
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert any("Not enough Coins" in m["text"] for m in context.bot.sent)
 
 
 def test_direct_message_refused_when_busy(fresh_db):
@@ -896,6 +960,72 @@ def test_direct_message_refused_when_busy(fresh_db):
 
     assert query.answers[-1]["show_alert"] is True
     assert fresh_db.get_user(1).state == ChatState.IDLE
+
+
+# ── Forced channel subscription ────────────────────────────────
+
+def _enable_force_join(monkeypatch):
+    monkeypatch.setattr(bot, "FORCE_CHANNEL", "@testchan")
+    monkeypatch.setattr(bot, "FORCE_CHANNEL_INVITE", "")
+
+
+def test_force_join_popup_blocks_messages_until_joined(fresh_db, monkeypatch):
+    _enable_force_join(monkeypatch)
+    register(fresh_db, 1)
+
+    context = FakeContext()
+    context.bot.member_status = "left"
+    update = FakeUpdate(1, message=FakeMessage(text="hello"))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert len(update.message.replies) == 1
+    assert "channel" in update.message.replies[0]["text"].lower()
+    markup = update.message.replies[0]["reply_markup"]
+    urls = [b.url for b in _buttons(markup) if b.url]
+    assert urls == ["https://t.me/testchan"]
+
+    # once they join, messages flow again
+    context.bot.member_status = "member"
+    update2 = FakeUpdate(1, message=FakeMessage(text="hello"))
+    asyncio.run(bot.relay_message(update2, context))
+    assert all("channel" not in r["text"].lower() for r in update2.message.replies)
+
+
+def test_force_join_gate_stops_buttons_and_joined_check_works(fresh_db, monkeypatch):
+    _enable_force_join(monkeypatch)
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+
+    # not joined → the search button is refused with the join popup
+    context = FakeContext()
+    context.bot.member_status = "left"
+    query, _ = press(1, "find_partner", context)
+    assert query.answers[-1]["show_alert"] is True
+    assert "join" in query.answers[-1]["text"].lower()
+    assert any("channel" in m["text"].lower() for m in context.bot.sent)
+
+    # "✅ I've Joined" while still not joined → alert, no menu
+    query, _ = press(1, "joined_check", context)
+    assert "haven't joined" in query.answers[-1]["text"]
+    assert query.edits == []
+
+    # "✅ I've Joined" after joining → menu
+    context.bot.member_status = "member"
+    query, _ = press(1, "joined_check", context)
+    assert "Welcome" in query.answers[-1]["text"]
+    assert "Thanks for joining" in query.edits[-1]["text"]
+
+
+def test_no_force_join_configured_skips_the_gate(fresh_db, monkeypatch):
+    monkeypatch.setattr(bot, "FORCE_CHANNEL", "")
+    monkeypatch.setattr(bot, "FORCE_CHANNEL_INVITE", "")
+    register(fresh_db, 1)
+
+    context = FakeContext()
+    context.bot.member_status = "left"   # never asked
+    update = FakeUpdate(1, message=FakeMessage(text="hi"))
+    asyncio.run(bot.relay_message(update, context))
+    assert update.message.replies, "bot should answer without any channel config"
 
 
 def test_block_from_profile_card_stops_matching(fresh_db):
