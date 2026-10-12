@@ -22,6 +22,7 @@ import os
 import sys
 import asyncio
 import logging
+import time
 from dotenv import load_dotenv
 
 from telegram import (
@@ -122,6 +123,14 @@ ADMIN_ID = int(_admin) if _admin.strip().isdigit() else None
 # FORCE_CHANNEL_INVITE: invite link for private channels (https://t.me/+…).
 FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()
 FORCE_CHANNEL_INVITE = os.getenv("FORCE_CHANNEL_INVITE", "").strip()
+
+# Free database persistence: the bot keeps its SQLite file backed up in a
+# private Telegram channel and restores it on startup — so users, coins and
+# chats survive redeploys even on free hosts that wipe the disk every time.
+# Create a private channel, add the bot as ADMIN (post + pin messages), and
+# set BACKUP_CHANNEL=@yourchannel or the -100… channel id.
+BACKUP_CHANNEL = os.getenv("BACKUP_CHANNEL", "").strip()
+BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "300"))
 
 # Shows up in Telegram's ☰ Menu, like the reference bot.
 BOT_COMMANDS = [
@@ -340,10 +349,25 @@ def format_online(user) -> str:
     return "👁 Online"
 
 
-def display_name(user) -> str:
+def md_escape(text: str) -> str:
+    """Escape user-supplied text for Telegram's legacy Markdown parse mode,
+    so a name containing _ * [ ` can't break the whole message."""
+    return "".join("\\" + ch if ch in "\\_*[`" else ch for ch in text)
+
+
+def display_name(user, viewer=None) -> str:
+    """Display name for lists/cards.
+
+    @username is a direct link to a personal Telegram account, so it is
+    NEVER shown to other users — not even VIP. Only the admin (verification)
+    and the account owner themselves can see it.
+    """
     if user.name:
         return user.name
-    if user.username:
+    if user.username and viewer is not None and (
+        viewer.user_id == user.user_id
+        or (ADMIN_ID is not None and viewer.user_id == ADMIN_ID)
+    ):
         return f"@{user.username}"
     return "Stranger"
 
@@ -414,6 +438,144 @@ async def enforce_channel(update, context) -> bool:
     return False
 
 
+# ── Free persistence: database backup via a Telegram channel ────
+
+_BACKUP_MSG = {"id": None, "mtime": 0.0}
+
+
+def _backup_enabled() -> bool:
+    return bool(BACKUP_CHANNEL) and bool(db.path)
+
+
+def _backup_chat():
+    """Channel id (int) or @username (str) for the backup channel."""
+    if BACKUP_CHANNEL.lstrip("-").isdigit():
+        return int(BACKUP_CHANNEL)
+    return BACKUP_CHANNEL
+
+
+def _is_backup_doc(message) -> bool:
+    doc = getattr(message, "document", None)
+    name = getattr(doc, "file_name", None) if doc else None
+    return bool(doc) and name in ("bot.db", "bot.db.backup")
+
+
+async def restore_db_from_backup(bot) -> None:
+    """Download the newest bot.db snapshot from the backup channel.
+
+    Runs on startup, before any update is handled — this is what makes a
+    redeployed bot continue where it stopped (users, coins, queue, chats).
+    """
+    if not _backup_enabled():
+        return
+    try:
+        chat = await bot.get_chat(_backup_chat())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"BACKUP_CHANNEL not usable ({e}) — "
+            "is the bot an ADMIN of that channel?"
+        )
+        return
+
+    doc_msg = None
+    pinned = getattr(chat, "pinned_message", None)
+    if pinned is not None and _is_backup_doc(pinned):
+        doc_msg = pinned
+    if doc_msg is None:
+        history = getattr(bot, "get_chat_history", None)
+        if history is None:
+            logger.warning("This python-telegram-bot version has no get_chat_history")
+            return
+        try:
+            async for msg in history(_backup_chat(), limit=20):
+                if _is_backup_doc(msg):
+                    doc_msg = msg
+                    break
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not scan backup channel history: {e}")
+            return
+    if doc_msg is None:
+        logger.info("No database backup in the channel yet — starting fresh.")
+        return
+
+    local_mtime = os.path.getmtime(db.path) if os.path.exists(db.path) else 0
+    if doc_msg.date and doc_msg.date.timestamp() <= local_mtime:
+        logger.info("Local DB is newer than the channel backup — keeping local.")
+        return
+
+    tmp_path = db.path + ".restoring"
+    file = await doc_msg.document.get_file()
+    await file.download_to_drive(tmp_path)
+    os.replace(tmp_path, db.path)
+    db.reload()
+    logger.info(f"✅ Database restored from channel backup ({len(db.users)} users).")
+
+
+async def upload_db_backup(bot) -> None:
+    """Upload a fresh snapshot of the SQLite file to the backup channel."""
+    if not _backup_enabled() or not os.path.exists(db.path):
+        return
+    try:
+        db.flush()  # make sure every pending row is on disk before snapshotting
+        with open(db.path, "rb") as fh:
+            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+            msg = await bot.send_document(
+                chat_id=_backup_chat(),
+                document=fh,
+                filename="bot.db",
+                caption=f"🔄 Database backup — {stamp}",
+            )
+        try:
+            await bot.pin_chat_message(
+                _backup_chat(), msg.message_id, disable_notification=True
+            )
+        except Exception as e:  # noqa: BLE001 — pin needs the right admin rights
+            logger.debug(f"Could not pin the backup message: {e}")
+        prev = _BACKUP_MSG.get("id")
+        if prev and prev != msg.message_id:
+            try:
+                await bot.delete_message(_backup_chat(), prev)
+            except Exception:  # noqa: BLE001
+                pass
+        _BACKUP_MSG["id"] = msg.message_id
+        _BACKUP_MSG["mtime"] = os.path.getmtime(db.path)
+        logger.info("💾 Database backed up to the backup channel.")
+    except Exception as e:  # noqa: BLE001 — backup must never kill the bot
+        logger.warning(f"Database backup upload failed: {e}")
+
+
+async def _backup_loop(bot) -> None:
+    """Periodic snapshot so a crash or redeploy loses at most a few minutes."""
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        try:
+            if os.path.getmtime(db.path) != _BACKUP_MSG["mtime"]:
+                await upload_db_backup(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Backup loop error: {e}")
+
+
+async def _startup_checks(application) -> None:
+    """Log actionable warnings for common misconfigurations."""
+    if FORCE_CHANNEL:
+        try:
+            me = await application.bot.get_me()
+            member = await application.bot.get_chat_member(FORCE_CHANNEL, me.id)
+            if member.status not in ("administrator", "creator"):
+                logger.warning(
+                    "FORCE_CHANNEL is set but the bot is NOT an admin there — "
+                    "the join check will silently let everyone in. "
+                    "Add the bot to the channel as an administrator."
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"FORCE_CHANNEL check failed ({e}) — make sure the bot is an "
+                "ADMIN of FORCE_CHANNEL, otherwise the gate does nothing."
+            )
+
+
 # ── AI avatar fallback (profiles without a photo) ───────────────
 
 def ai_avatar_url(user) -> str:
@@ -454,12 +616,13 @@ async def notify_partner_found(context, user_id, partner_id):
         )
         partner_info = (
             f"🎉 **Partner found!**\n\n"
-            f"{gender_emoji(p.gender)} **{display_name(p)}**"
+            f"{gender_emoji(p.gender)} **{md_escape(display_name(p, u))}**"
             f"{f', {p.age}' if p.age else ''}\n"
             f"📍 {p.city or p.country or 'Unknown'}\n"
             f"👁 {format_online(p)}\n"
             f"🪩 {verified_label(p)}\n"
-            f"🆔 `{format_public_id(p)}`\n\n"
+            + ("👑 VIP member\n" if p.vip else "")
+            + f"🆔 `{format_public_id(p)}`\n\n"
             f"Say hi! Type your message below.\n"
             f"Use ⏭ Next Partner to skip.{reward_line}"
         )
@@ -532,7 +695,7 @@ async def get_referral_link(context, user_id: int) -> str:
 def build_profile_text(user) -> str:
     return PROFILE_TEMPLATE.format(
         badge="👑" if user.vip else gender_emoji(user.gender),
-        name=display_name(user),
+        name=md_escape(display_name(user, user)),
         age=user.age if user.age else "—",
         city=user.city or (user.country or "—"),
         online=format_online(user),
@@ -564,10 +727,11 @@ def verified_label(user) -> str:
 
 def build_user_card(target, viewer_id: int) -> str:
     """Profile card in the reference bot's bullet style."""
+    viewer = db.get_user(viewer_id)
     place_parts = [p for p in (target.country, target.city) if p]
     place = " (".join([place_parts[0], place_parts[1] + ")"]) if len(place_parts) > 1 else (place_parts[0] if place_parts else "Not set")
     lines = [
-        f"{gender_emoji(target.gender)} **{display_name(target)}**",
+        f"{gender_emoji(target.gender)} **{md_escape(display_name(target, viewer))}**",
         f"• Age: {target.age if target.age else '—'}",
         f"• City: {place}",
         f"• Number of likes: {target.likes}",
@@ -648,18 +812,25 @@ async def reply_profile_card(message, viewer_id: int, target) -> None:
     )
 
 
-def _plain_label(user) -> str:
+def _list_badges(user) -> str:
+    """🔥 VIP + ✅ verified badges shown next to names in lists."""
+    return ("🔥" if user.vip else "") + ("✅" if user.verified else "")
+
+
+def _plain_label(user, viewer=None) -> str:
     return (
-        f"{gender_emoji(user.gender)} {display_name(user)}"
+        f"{gender_emoji(user.gender)} {_list_badges(user)}"
+        f"{md_escape(display_name(user, viewer))}"
         f"{f', {user.age}' if user.age else ''}"
     )
 
 
 def _nearby_pairs(viewer_id: int) -> list:
     pairs = []
+    viewer = db.get_user(viewer_id)
     for target, dist in db.nearby_users(viewer_id):
         pairs.append((
-            f"{_plain_label(target)} • 📍 {dist:.0f} km",
+            f"{_plain_label(target, viewer)} • 📍 {dist:.0f} km",
             target,
         ))
     return pairs
@@ -672,10 +843,11 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
     """
     if not ANIMATIONS_ENABLED:
         return
+    viewer = db.get_user(chat_id)
     for label, target in pairs[:limit]:
         dist = db.distance_km(chat_id, target.user_id)
         caption = (
-            f"{_plain_label(target)}\n"
+            f"{_plain_label(target, viewer)}\n"
             f"📍 {dist:.0f} km away • {target.city or target.country or ''}\n"
             f"👀 {format_online(target)}\n"
             f"ID: `{format_public_id(target)}`"
@@ -698,6 +870,7 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
 
 def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
     pairs = []
+    viewer = db.get_user(viewer_id)
     for uid in ids:
         user = db.get_user(uid)
         if not user:
@@ -705,9 +878,9 @@ def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
         if kind == "nearby":
             dist = db.distance_km(viewer_id, uid)
             prefix = f"📍 {dist:.0f} km • " if dist is not None else "📍 "
-            pairs.append((f"{prefix}{_plain_label(user)}", user))
+            pairs.append((f"{prefix}{_plain_label(user, viewer)}", user))
         else:
-            pairs.append((_plain_label(user), user))
+            pairs.append((_plain_label(user, viewer), user))
     return pairs
 
 
@@ -717,11 +890,12 @@ def _list_text(title: str, pairs) -> str:
     return f"{title}\n\n👥 {len(pairs)} found — tap one to open their profile:"
 
 
-def _browse_entry(target) -> str:
+def _browse_entry(target, viewer=None) -> str:
     """One 🎉 Browse People entry, formatted like the reference bot."""
     place = ", ".join(p for p in (target.country, target.city) if p) or "Not set"
     return (
-        f"{gender_emoji(target.gender)} **{display_name(target)}**"
+        f"{gender_emoji(target.gender)} {_list_badges(target)}"
+        f"**{md_escape(display_name(target, viewer))}**"
         f"{f', {target.age}' if target.age else ''} • `{public_id_slug(target)}`\n"
         f"📍 {place}\n"
         f"👀 {format_online(target)}\n"
@@ -729,11 +903,11 @@ def _browse_entry(target) -> str:
     )
 
 
-def _browse_text(users, total: int) -> str:
+def _browse_text(users, total: int, viewer=None) -> str:
     if not users:
         return "🎉 **Browse People**\n\nNo one else is here yet — check back soon!"
     header = f"🎉 **People online** ({total})"
-    body = "\n\n".join(_browse_entry(u) for u in users)
+    body = "\n\n".join(_browse_entry(u, viewer) for u in users)
     return f"{header}\n\n{body}\n\nShowing 1–{len(users)} of {total}."
 
 
@@ -743,8 +917,9 @@ def _browse_state(context, user_id: int):
     users = [u for u in (db.get_user(i) for i in ids) if u]
     total = context.user_data.get("browse_total", len(users))
     has_more = len(users) < total
-    pairs = [(_plain_label(u), u) for u in users]
-    return _browse_text(users, total), browse_keyboard(has_more, pairs)
+    viewer = db.get_user(user_id)
+    pairs = [(_plain_label(u, viewer), u) for u in users]
+    return _browse_text(users, total, viewer), browse_keyboard(has_more, pairs)
 
 
 async def _render_swipe(query, context, viewer_id: int, index: int) -> None:
@@ -754,7 +929,7 @@ async def _render_swipe(query, context, viewer_id: int, index: int) -> None:
     if not target:
         await query.answer("That account no longer exists.", show_alert=True)
         return
-    text = f"{_browse_entry(target)}\n\nProfile {index + 1} of {len(ids)}"
+    text = f"{_browse_entry(target, db.get_user(viewer_id))}\n\nProfile {index + 1} of {len(ids)}"
     await safe_edit(
         query,
         text,
@@ -1594,8 +1769,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "When you block or report someone, they'll show up here."
             )
         else:
+            me = db.get_user(user_id)
             lines = [
-                f"• {display_name(u)} `{format_public_id(u)}`" for u in blocked
+                f"• {md_escape(display_name(u, me))} `{format_public_id(u)}`"
+                for u in blocked
             ]
             text = (
                 f"🚫 **Blocked Users** ({len(blocked)})\n\n"
@@ -1613,7 +1790,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target or not me or not db.unblock_user(user_id, target.user_id):
             await query.answer("That user isn't in your blocked list.", show_alert=True)
             return
-        await query.answer(f"✅ {display_name(target)} unblocked")
+        await query.answer(f"✅ {display_name(target, me)} unblocked")
         blocked = db.blocked_of(user_id)
         await safe_edit(
             query,
@@ -1725,8 +1902,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines = []
             for liker in likers[:20]:
-                label = f"@{liker.username}" if liker.username else f"User {liker.user_id}"
-                lines.append(f"• {label}")
+                name = display_name(liker, user)
+                if name == "Stranger":
+                    name = public_id_slug(liker)
+                lines.append(f"• {md_escape(name)}")
             more = f"\n…and {len(likers) - 20} more" if len(likers) > 20 else ""
             text = (
                 f"❤️ **People who liked you** ({len(likers)})\n\n"
@@ -1868,7 +2047,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "contacts":
         users = db.contacts_of(user_id)
-        pairs = [(_plain_label(u), u) for u in users]
+        me = db.get_user(user_id)
+        pairs = [(_plain_label(u, me), u) for u in users]
         context.user_data["list_ids"] = [u.user_id for u in users]
         context.user_data["list_title"] = "📇 My Contacts"
         context.user_data["list_kind"] = "plain"
@@ -2142,6 +2322,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=markup,
         )
+        # The animation swallows edit failures (flood limits, parse errors,
+        # restarts mid-animation) and can leave the message stuck on
+        # "Loading…". Always re-send the final list to be safe.
+        await safe_edit(query, text, parse_mode="Markdown", reply_markup=markup)
 
     elif data in ("browse_more", "browse_list"):
         if data == "browse_more":
@@ -2195,7 +2379,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await typing_pulse(context.bot, user_id, times=1, interval=0.25)
         await safe_edit(
             query,
-            f"📩 **Message from {display_name(sender) if sender else 'someone'}:**\n\n"
+            f"📩 **Message from "
+            f"{md_escape(display_name(sender, db.get_user(user_id))) if sender else 'someone'}:**\n\n"
             f"{dm.get('text', '')}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -2243,7 +2428,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"this message to confirm the chat request.\n\n"
             f"To view the chat request and accept or reject it, click the "
             f"button below 👇\n\n"
-            f"{gender_emoji(requester.gender)} **{display_name(requester)}** "
+            f"{gender_emoji(requester.gender)} "
+            f"**{md_escape(display_name(requester, db.get_user(user_id)))}** "
             f"• `{format_public_id(requester)}`",
             parse_mode="Markdown",
             reply_markup=request_keyboard(requester_id),
@@ -2841,6 +3027,29 @@ async def set_bot_commands(application):
         logger.warning(f"Failed to set bot commands: {e}")
 
 
+async def on_startup(application):
+    """Restore the DB from the backup channel, then start the backup loop."""
+    await set_bot_commands(application)
+    await restore_db_from_backup(application.bot)
+    await _startup_checks(application)
+    if _backup_enabled():
+        await upload_db_backup(application.bot)
+        application.create_task(_backup_loop(application.bot))
+        logger.info(
+            f"💾 Auto-backup enabled → channel {BACKUP_CHANNEL} "
+            f"every {BACKUP_INTERVAL}s."
+        )
+
+
+async def on_shutdown(application):
+    """Take one final snapshot so the next deploy resumes exactly here."""
+    try:
+        if _backup_enabled():
+            await upload_db_backup(application.bot)
+    finally:
+        db.close()
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not found! Create a .env file with your bot token.")
@@ -2867,7 +3076,8 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
-        .post_init(set_bot_commands)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .build()
     )
 

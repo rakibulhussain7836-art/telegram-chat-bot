@@ -149,13 +149,17 @@ def profile_keyboard() -> InlineKeyboardMarkup:
 
 def blocked_users_keyboard(users) -> InlineKeyboardMarkup:
     """🚫 Blocked Users list with per-user Unblock buttons."""
+    def label(u) -> str:
+        # Never show @username (a direct account link) — name or the
+        # anonymous 6-digit profile ID only.
+        if getattr(u, "name", None):
+            return f"🚫 {u.name}"
+        if getattr(u, "public_id", 0):
+            return f"🚫 ID {u.public_id}"
+        return "🚫 Stranger"
+
     rows = [
-        [
-            InlineKeyboardButton(
-                f"🚫 {getattr(u, 'name', None) or getattr(u, 'username', None) or u.user_id}",
-                callback_data=f"unblock_{u.user_id}",
-            )
-        ]
+        [InlineKeyboardButton(label(u), callback_data=f"unblock_{u.user_id}")]
         for u in users[:20]
     ]
     rows.append([InlineKeyboardButton("⬅️ Back to Profile", callback_data="my_profile")])

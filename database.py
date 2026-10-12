@@ -184,44 +184,61 @@ def _user_to_json(user: UserProfile) -> str:
     )
 
 
+def _enum_or_none(enum_cls, value, default=None):
+    """Parse an enum value; missing/renamed values fall back to `default`."""
+    if value is None:
+        return default
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return default
+
+
 def _user_from_json(data: str) -> UserProfile:
+    """Deserialize a profile.
+
+    Every field except user_id is OPTIONAL: rows written by older bot
+    versions keep loading after an upgrade (new fields simply get their
+    defaults), so users never have to redo name/gender/age onboarding
+    when a new version is deployed.
+    """
     d = json.loads(data)
     return UserProfile(
         user_id=d["user_id"],
-        username=d["username"],
+        username=d.get("username"),
         name=d.get("name"),
         age=d.get("age"),
         city=d.get("city"),
-        gender=Gender(d["gender"]) if d["gender"] else None,
-        country=d["country"],
-        preferred_gender=Gender(d["preferred_gender"]),
-        state=ChatState(d["state"]),
-        partner_id=d["partner_id"],
-        registered_at=d["registered_at"],
-        total_chats=d["total_chats"],
-        coins=d["coins"],
-        referral_count=d["referral_count"],
-        referral_earned=d["referral_earned"],
-        referred_by=d["referred_by"],
-        likes=d["likes"],
-        liked_by=set(d["liked_by"]),
-        reports=set(d["reports"]),
-        blocked=set(d["blocked"]),
-        banned=d["banned"],
-        search_pref=Gender(d["search_pref"]) if d["search_pref"] else None,
+        gender=_enum_or_none(Gender, d.get("gender")),
+        country=d.get("country"),
+        preferred_gender=_enum_or_none(
+            Gender, d.get("preferred_gender"), Gender.ANY
+        ),
+        state=_enum_or_none(ChatState, d.get("state"), ChatState.IDLE),
+        partner_id=d.get("partner_id"),
+        registered_at=d.get("registered_at") or time.time(),
+        total_chats=d.get("total_chats", 0),
+        coins=d.get("coins", STARTING_COINS),
+        referral_count=d.get("referral_count", 0),
+        referral_earned=d.get("referral_earned", 0),
+        referred_by=d.get("referred_by"),
+        likes=d.get("likes", 0),
+        liked_by=set(d.get("liked_by") or []),
+        reports=set(d.get("reports") or []),
+        blocked=set(d.get("blocked") or []),
+        banned=bool(d.get("banned", False)),
+        search_pref=_enum_or_none(Gender, d.get("search_pref")),
         photo_file_id=d.get("photo_file_id"),
         public_id=d.get("public_id", 0),
         lat=d.get("lat"),
         lon=d.get("lon"),
-        contacts=set(d.get("contacts", [])),
-        verified=d.get("verified", False),
-        verified_gender=(
-            Gender(d["verified_gender"]) if d.get("verified_gender") else None
-        ),
-        vip=d.get("vip", False),
-        notify_on_end=d.get("notify_on_end", False),
+        contacts=set(d.get("contacts") or []),
+        verified=bool(d.get("verified", False)),
+        verified_gender=_enum_or_none(Gender, d.get("verified_gender")),
+        vip=bool(d.get("vip", False)),
+        notify_on_end=bool(d.get("notify_on_end", False)),
         view_alert_at=d.get("view_alert_at", 0.0),
-        recent_partners=list(d.get("recent_partners", [])),
+        recent_partners=list(d.get("recent_partners") or []),
         reward_date=d.get("reward_date", ""),
         reward_count=d.get("reward_count", 0),
     )
@@ -428,6 +445,32 @@ class Database:
 
     def _write_dms(self):
         self._write_state("dms", json.dumps(self.pending_dms))
+
+    def flush(self):
+        """Persist the full snapshot right now (used before a backup upload)."""
+        self._save()
+
+    def reload(self):
+        """Drop all in-memory state and re-read the SQLite file.
+
+        Used after an external restore of the DB file (e.g. downloading a
+        backup from the backup Telegram channel on a fresh deploy).
+        """
+        if not self.path:
+            return
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+        self.users.clear()
+        self.queue.clear()
+        self.processed_charges.clear()
+        self.requests.clear()
+        self.pending_verifications.clear()
+        self.pending_dms.clear()
+        self._by_public_id.clear()
+        self._connect()
+        self._load()
 
     def close(self):
         """Flush and close the SQLite store."""
