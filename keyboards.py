@@ -11,7 +11,12 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 
-from database import CHAT_REQUEST_COST, DIRECT_MESSAGE_COST, GIRL_SEARCH_COST
+from database import (
+    CHAT_REQUEST_COST,
+    DIRECT_MESSAGE_COST,
+    GIRL_SEARCH_COST,
+    GUY_SEARCH_COST,
+)
 
 
 # ── Gender selection ─────────────────────────────────────────────
@@ -115,9 +120,9 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 def search_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎲 Start Random Chat", callback_data="search_random")],
+        [InlineKeyboardButton("🎲 Start Random Chat (Free)", callback_data="search_random")],
         [
-            InlineKeyboardButton("🕺 Chat With Guy (Free)", callback_data="search_guy"),
+            InlineKeyboardButton(f"🕺 Chat With Guy ({GUY_SEARCH_COST} 🪙)", callback_data="search_guy"),
             InlineKeyboardButton(f"💃 Chat With Girl ({GIRL_SEARCH_COST} 🪙)", callback_data="search_girl"),
         ],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
@@ -222,7 +227,10 @@ def back_to_credit_keyboard() -> InlineKeyboardMarkup:
 
 # ── Settings ─────────────────────────────────────────────────────
 
-def settings_keyboard() -> InlineKeyboardMarkup:
+def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
+    reminder_label = (
+        "⏰ Daily Reminder: ON ✅" if reminder_on else "⏰ Daily Reminder: OFF"
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Change Name", callback_data="change_name")],
         [InlineKeyboardButton("🎂 Change Age", callback_data="change_age")],
@@ -231,6 +239,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
         [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
         [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
+        [InlineKeyboardButton(reminder_label, callback_data="reminder_toggle")],
         [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
     ])

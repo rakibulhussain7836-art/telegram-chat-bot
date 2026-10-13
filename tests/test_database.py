@@ -6,7 +6,9 @@ from database import (
     Database,
     Gender,
     GIRL_SEARCH_COST,
+    GUY_SEARCH_COST,
     CHAT_REQUEST_COST,
+    NOTIFY_COST,
     NEARBY_RADIUS_KM,
     REFERRED_BONUS,
     REFERRAL_REWARD,
@@ -325,6 +327,16 @@ def test_counters():
 
 def test_girl_search_is_not_free():
     assert GIRL_SEARCH_COST >= 1
+
+
+def test_price_list_matches_the_release_notes():
+    """New users get 10 tokens; guy/girl search and chat requests cost 2,
+    switching on the 🔔 notify alert costs 1."""
+    assert STARTING_COINS == 10
+    assert GIRL_SEARCH_COST == 2
+    assert GUY_SEARCH_COST == 2
+    assert CHAT_REQUEST_COST == 2
+    assert NOTIFY_COST == 1
 
 
 # ── Public IDs ──────────────────────────────────────────────────

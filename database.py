@@ -45,10 +45,14 @@ class ChatState(Enum):
 STARTING_COINS = 10        # free coins for every new user
 REFERRAL_REWARD = 15       # coins earned by the referrer per friend
 REFERRED_BONUS = 5         # extra coins for the newly referred friend
-GIRL_SEARCH_COST = 1       # coins per "Chat With Girl" search
+GIRL_SEARCH_COST = 2       # coins per "Chat With Girl" search
+GUY_SEARCH_COST = 2        # coins per "Chat With Guy" search (Random stays free)
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
-CHAT_REQUEST_COST = 1      # coins to send a chat request from Nearby / by ID
+CHAT_REQUEST_COST = 2      # coins to send a chat request from Nearby / by ID
 DIRECT_MESSAGE_COST = 1    # coins to start a Direct Message from a profile card
+NOTIFY_COST = 1            # coins to enable 🔔 "notify me" alerts (VIP: free)
+REMINDER_HOUR_START = 9    # daily reminder window (local bot time)
+REMINDER_HOUR_END = 22
 CHAT_REQUEST_TTL = 120     # seconds the receiver has to answer a request
 NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
 EARTH_RADIUS_KM = 6371.0
@@ -138,6 +142,9 @@ class UserProfile:
     # ── Daily match reward (1 coin per match, capped per day) ──
     reward_date: str = ""
     reward_count: int = 0
+    # ── Daily reminder (one nudge a day to come back and chat) ──
+    daily_reminder: bool = False
+    reminder_date: str = ""
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -181,6 +188,8 @@ def _user_to_json(user: UserProfile) -> str:
             "recent_partners": list(user.recent_partners),
             "reward_date": user.reward_date,
             "reward_count": user.reward_count,
+            "daily_reminder": user.daily_reminder,
+            "reminder_date": user.reminder_date,
         }
     )
 
@@ -242,6 +251,8 @@ def _user_from_json(data: str) -> UserProfile:
         recent_partners=list(d.get("recent_partners") or []),
         reward_date=d.get("reward_date", ""),
         reward_count=d.get("reward_count", 0),
+        daily_reminder=bool(d.get("daily_reminder", False)),
+        reminder_date=d.get("reminder_date", ""),
     )
 
 
@@ -637,6 +648,25 @@ class Database:
         if not user:
             return False
         user.notify_on_end = value
+        self._write_user(user)
+        return True
+
+    # ── Daily reminder (1 message a day: "come chat with someone") ─
+
+    def set_daily_reminder(self, user_id: int, value: bool) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.daily_reminder = value
+        self._write_user(user)
+        return True
+
+    def mark_reminder_sent(self, user_id: int, date: str) -> bool:
+        """Remember the day this user got their reminder (one per day)."""
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.reminder_date = date
         self._write_user(user)
         return True
 

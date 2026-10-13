@@ -14,7 +14,8 @@ Commands:
   /report     — Report your current chat partner
   /help       — Show help
 
-Coins: chatting with anyone is free, searching for a Girl costs coins.
+Coins: chatting with anyone is free, searching for a Guy or a Girl costs
+2 coins, a chat request costs 2 coins. Every new user starts with 10 coins.
 Supports: text, photos, stickers, voice, video, documents, GIFs
 """
 
@@ -52,12 +53,16 @@ from database import (
     REFERRAL_REWARD,
     REFERRED_BONUS,
     GIRL_SEARCH_COST,
+    GUY_SEARCH_COST,
     CHAT_REQUEST_COST,
     DIRECT_MESSAGE_COST,
+    NOTIFY_COST,
     CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
     BROWSE_PAGE_SIZE,
     DAILY_REWARD_COINS,
+    REMINDER_HOUR_START,
+    REMINDER_HOUR_END,
     format_public_id,
     public_id_slug,
 )
@@ -97,14 +102,17 @@ from animations import (
     ANIMATIONS_ENABLED,
     animate_edit,
     animate_search,
+    animate_photo_card,
+    animate_message_caption,
     animated_reply,
     typing_pulse,
     celebration_pulse,
-    match_frames,
+    match_photo_frames,
     reveal_frames,
     bounce_frames,
     coin_frames,
     heart_frames,
+    emoji_cycle_frames,
 )
 
 load_dotenv()
@@ -197,19 +205,32 @@ HELP_MSG = """
 • 📨 **Direct Message** ({dm_cost} 🪙) — start a chat instantly from a profile card
 • ❤️ Like / 💔 Unlike profiles from the profile view
 • ➕ Add to Contacts while chatting — see them in 📇 My Contacts
+• 🔔 **Notify me when chat ends** — {notify_cost} 🪙 to switch on (👑 VIP free)
 
 **Profile:**
 • Set your **name, age, city** and 📷 a profile photo
 • No photo yet? An **AI avatar** shows on your profile card automatically
 • 🪩 Get Verified — send a photo, an admin reviews it
+• ⏰ **Daily Reminder** (⚙️ Settings) — one message a day nudging you to
+  come back and talk to someone
 
 **Coins:**
+• 🎁 Every new account starts with **{free} 🪙**
 • Chatting with anyone is **free**
-• Searching for a 👩 **Girl** costs **{cost} 🪙 per search**
-• 👑 **VIP** members search for Girls for free
+• Searching for a 🕺 **Guy** or a 👩 **Girl** costs **{cost} 🪙 per search**
+  (🎲 Random search is free)
+• 👑 **VIP** members search for free
 • Earn Coins by inviting friends with /link
 • Buy Coins with Telegram Stars via /credit
 """
+
+HELP_KWARGS = dict(
+    cost=GIRL_SEARCH_COST,
+    request_cost=CHAT_REQUEST_COST,
+    dm_cost=DIRECT_MESSAGE_COST,
+    notify_cost=NOTIFY_COST,
+    free=STARTING_COINS,
+)
 
 PROFILE_TEMPLATE = """
 {badge} **{name}**
@@ -232,10 +253,11 @@ SEARCH_CHOICE_TEXT = """
 👫 **Choose who you want to chat with** 👇
 
 🎲 **Random (Free)**
-🕺 **Chat With Guy (Free)**
+🕺 **Chat With Guy ({cost} 🪙 per search)**
 💃 **Chat With Girl ({cost} 🪙 per search)**
 
-💡 Talking to everyone is free — only searching for Girls costs Coins.
+💡 Talking to anyone is free — only starting a Guy or Girl search costs
+{cost} 🪙. 👑 VIP members search for free.
 """
 
 NAME_ASK_TEXT = """
@@ -265,8 +287,9 @@ Use the buttons below to find a partner, browse people or open the menu.
 SEARCHING_TEXT = """
 🔍 **Searching for a partner…**
 
-👥 {count} people in queue
-Please wait, you'll be connected soon!
+🔎 Matching you with a partner…
+{count} 👥 people searching right now
+⏳ Hang tight — you'll be connected as soon as a match is found!
 """
 
 PROMO_TEXT = (
@@ -289,6 +312,69 @@ async def send_promo(context, chat_id: int) -> None:
         logger.debug(f"promo skipped for {chat_id}: {e}")
 
 
+# ── ⏰ Daily reminder: one message a day, reminding the user to come
+#    back and talk to someone ────────────────────────────────────────
+
+REMINDER_INTERVAL = 3600  # seconds between daily-reminder sweeps
+
+REMINDER_TEXT = (
+    "⏰ **Daily reminder**\n\n"
+    "Someone out there wants to talk 💬 — come back and find a partner "
+    "for a chat!\n\n"
+    "Tap a button below to start."
+)
+
+
+def reminder_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 Start Random Chat", callback_data="search_random")],
+        [InlineKeyboardButton("🎉 Browse People", callback_data="browse_menu")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_menu")],
+    ])
+
+
+async def send_due_reminders(bot, current_hour=None, today=None) -> int:
+    """
+    Nudge every user who switched ⏰ Daily Reminder on — at most ONE
+    message per user per day, and only inside the waking-hours window.
+    Returns how many reminders went out.
+    """
+    hour = time.localtime().tm_hour if current_hour is None else current_hour
+    if not (REMINDER_HOUR_START <= hour < REMINDER_HOUR_END):
+        return 0
+    date = today or time.strftime("%Y-%m-%d")
+    sent = 0
+    for user in list(db.users.values()):
+        if not user.daily_reminder or user.reminder_date == date or user.banned:
+            continue
+        try:
+            await bot.send_message(
+                chat_id=user.user_id,
+                text=REMINDER_TEXT,
+                parse_mode="Markdown",
+                reply_markup=reminder_keyboard(),
+            )
+            db.mark_reminder_sent(user.user_id, date)
+            sent += 1
+        except Exception as e:  # noqa: BLE001 — one dead chat stops no sweep
+            logger.debug(f"Daily reminder to {user.user_id} failed: {e}")
+    return sent
+
+
+async def _reminder_loop(bot) -> None:
+    """Hourly sweep — sends at most one reminder per user per day."""
+    while True:
+        await asyncio.sleep(REMINDER_INTERVAL)
+        try:
+            sent = await send_due_reminders(bot)
+            if sent:
+                logger.info(f"⏰ Daily reminders sent to {sent} users.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Reminder loop error: {e}")
+
+
 def credit_text(user) -> str:
     return (
         f"💰 Your current Coins: **{user.coins}**\n"
@@ -299,9 +385,9 @@ def credit_text(user) -> str:
         f"**{REFERRAL_REWARD} Coin** for each referral.\n\n"
         f"2️⃣ **Buy Coin**\n"
         f"Choose one of the plans below 👇\n\n"
-        f"💡 *Chatting with anyone is free — searching for a 👩 Girl costs "
-        f"{GIRL_SEARCH_COST} 🪙 per search, and a 📨 Direct Message from a "
-        f"profile costs {DIRECT_MESSAGE_COST} 🪙.*\n"
+        f"💡 *Chatting with anyone is free — a 🕺 Guy or 👩 Girl search costs "
+        f"{GIRL_SEARCH_COST} 🪙 each, a 📨 Chat Request {CHAT_REQUEST_COST} 🪙 "
+        f"and a 📨 Direct Message from a profile {DIRECT_MESSAGE_COST} 🪙.*\n"
         f"🎁 New accounts start with **{STARTING_COINS} free Coins**."
     )
 
@@ -315,8 +401,10 @@ def vip_text(user) -> str:
     return (
         f"{status}\n\n"
         f"👑 **VIP benefits**\n"
-        f"• 👩 Girl searches are **free** (everyone else pays "
-        f"{GIRL_SEARCH_COST} 🪙 each)\n"
+        f"• 👩 Girl searches are **free** — and so are 🕺 Guy searches "
+        f"(everyone else pays {GIRL_SEARCH_COST} 🪙 each)\n"
+        f"• 🔔 Chat-end alerts are **free** (everyone else pays "
+        f"{NOTIFY_COST} 🪙 to switch them on)\n"
         f"• 👑 VIP badge on your profile card and in every match\n"
         f"• 🔥 VIP label next to your name in lists\n\n"
         f"👑 **{VIP_PLAN[0]} Coins** for **⭐{VIP_PLAN[1]}**\n"
@@ -758,7 +846,11 @@ def open_photo(photo_ref):
 
 
 async def notify_partner_found(context, user_id, partner_id):
-    """Send 'partner found' notifications to both users (with reveal animation)."""
+    """
+    Match card for BOTH users: one photo message that carries the
+    partner's picture AND their profile info AND the chat buttons —
+    never a text message with the photo bolted on underneath.
+    """
     user = db.get_user(user_id)
     partner = db.get_user(partner_id)
 
@@ -782,29 +874,30 @@ async def notify_partner_found(context, user_id, partner_id):
             f"Say hi! Type your message below.\n"
             f"Use ⏭ Next Partner to skip.{reward_line}"
         )
-        # Short "typing…" beat + match reveal, like the reference bot
+        # Short "typing…" beat + match reveal on the photo card itself
         if ANIMATIONS_ENABLED:
             await typing_pulse(context.bot, u.user_id, times=2, interval=0.4)
-            await animate_edit(
-                _MsgTarget(context.bot, u.user_id),
-                match_frames(),
-                interval=0.45,
-                parse_mode="HTML",
-            )
-        await context.bot.send_message(
-            chat_id=u.user_id,
-            text=partner_info,
-            parse_mode="Markdown",
+        delivered = await animate_photo_card(
+            context.bot,
+            u.user_id,
+            open_photo(profile_photo_of(p)),
+            match_photo_frames(partner_info),
             reply_markup=chat_keyboard(),
+            parse_mode="Markdown",
+            interval=0.5,
         )
-        # Partner's profile photo — AI avatar when they never set one
+        if delivered:
+            continue
+        # No photo available — the match must still be delivered as text.
         try:
-            await context.bot.send_photo(
+            await context.bot.send_message(
                 chat_id=u.user_id,
-                photo=open_photo(profile_photo_of(p)),
+                text=partner_info,
+                parse_mode="Markdown",
+                reply_markup=chat_keyboard(),
             )
         except Exception as e:
-            logger.warning(f"Failed to send partner photo to {u.user_id}: {e}")
+            logger.warning(f"Failed to send match card to {u.user_id}: {e}")
 
 
 class _MsgTarget:
@@ -920,7 +1013,9 @@ def _remember_list_message(context, query) -> None:
 
 async def show_user_card(query, context, viewer_id: int, target) -> None:
     """
-    Open someone's profile as a photo card (like the reference bot).
+    Open someone's profile as ONE photo card — picture, info and buttons
+    in a single message (never a photo with the details trailing below it).
+    A continuous emoji cycle plays over the card when it arrives.
     Users without a photo get their AI avatar — everyone has a photo card.
     """
     liked = viewer_id in target.liked_by
@@ -929,6 +1024,17 @@ async def show_user_card(query, context, viewer_id: int, target) -> None:
     text = build_user_card(target, viewer_id)
 
     _remember_list_message(context, query)
+    if await animate_photo_card(
+        context.bot,
+        viewer_id,
+        open_photo(profile_photo_of(target)),
+        emoji_cycle_frames(text),
+        reply_markup=markup,
+        parse_mode="Markdown",
+        interval=0.45,
+    ):
+        return
+
     try:
         await context.bot.send_photo(
             chat_id=viewer_id,
@@ -953,7 +1059,22 @@ async def reply_profile_card(message, viewer_id: int, target) -> None:
     )
     text = build_user_card(target, viewer_id)
     if hasattr(message, "reply_photo"):
+        frames = emoji_cycle_frames(text)
         try:
+            if ANIMATIONS_ENABLED:
+                msg = await message.reply_photo(
+                    photo=open_photo(profile_photo_of(target)),
+                    caption=frames[0],
+                    parse_mode="Markdown",
+                )
+                if msg is not None:
+                    await animate_message_caption(
+                        msg,
+                        frames[1:],
+                        reply_markup=markup,
+                        parse_mode="Markdown",
+                    )
+                return
             await message.reply_photo(
                 photo=open_photo(profile_photo_of(target)),
                 caption=text,
@@ -1153,10 +1274,11 @@ async def begin_search(
 ):
     """
     Start a search with the given per-search filter.
-    Charges coins when searching for a Girl (VIP members search free).
-    When `target` (a Message or CallbackQuery) is given and animations are
-    on, plays the radar animation there and returns (None, None, None)
-    so the caller doesn't send a duplicate message.
+    Charges coins for 🕺 Guy and 👩 Girl searches (🎲 Random is free, VIP
+    members never pay). When `target` (a Message or CallbackQuery) is given
+    and animations are on, the "matching you with a partner" animation runs
+    THERE — continuously, until a match lands — and (None, None, None) is
+    returned so the caller doesn't send a duplicate message.
     Returns (text, reply_markup, parse_mode).
     """
     user = db.get_user(user_id)
@@ -1184,17 +1306,28 @@ async def begin_search(
     if user.state == ChatState.SEARCHING:
         return "⏳ You're already searching for a partner...", searching_keyboard(), None
 
-    charged = False
-    if search_pref == Gender.FEMALE and not user.vip:
-        if not db.spend_coins(user_id, GIRL_SEARCH_COST):
+    # 🕺 Guy and 👩 Girl searches cost coins — 🎲 Random stays free.
+    charged = 0
+    charge_label = ""
+    if search_pref in (Gender.MALE, Gender.FEMALE) and not user.vip:
+        cost = GUY_SEARCH_COST if search_pref == Gender.MALE else GIRL_SEARCH_COST
+        charge_label = "Guy" if search_pref == Gender.MALE else "Girl"
+        if not db.spend_coins(user_id, cost):
+            want = "🕺 a Guy" if charge_label == "Guy" else "👩 a Girl"
             return (
                 f"🪙 **Not enough Coins!**\n\n"
-                f"Searching for a 👩 Girl costs **{GIRL_SEARCH_COST} 🪙 per search**.\n"
+                f"Searching for {want} costs **{cost} 🪙 per search**.\n"
                 f"Invite friends (/link) or buy Coins (/credit) to earn more.",
                 credit_keyboard(),
                 "Markdown",
             )
-        charged = True
+        charged = cost
+
+    def _charge_line() -> str:
+        if not charged:
+            return ""
+        balance = db.get_user(user_id).coins
+        return f"\n\n🪙 -{charged} ({charge_label} search) | Balance: {balance}"
 
     db.add_to_queue(user_id, search_pref=search_pref)
     match_id = await asyncio.to_thread(db.find_match, user_id)
@@ -1202,13 +1335,9 @@ async def begin_search(
     if match_id:
         db.pair_users(user_id, match_id)
         await notify_partner_found(context, user_id, match_id)
-        text = "🎉 Partner found! Connecting..."
-        if charged:
-            balance = db.get_user(user_id).coins
-            text += f"\n🪙 -{GIRL_SEARCH_COST} | Balance: {balance}"
-        return text, None, None
+        return "🎉 Partner found! Connecting..." + _charge_line(), None, None
 
-    # Animated radar wait: re-check for a partner after every frame.
+    # Continuous matching animation — cycles until a match lands.
     if target is not None and ANIMATIONS_ENABLED:
         def _check():
             found = db.find_match(user_id)
@@ -1216,48 +1345,49 @@ async def begin_search(
                 db.pair_users(user_id, found)
             return found
 
+        def _cancelled():
+            me = db.get_user(user_id)
+            return me is None or me.state != ChatState.SEARCHING
+
         found = await animate_search(
             context,
             user_id,
             _check,
             queue_size_fn=lambda: db.searching_count,
             target=target,
+            interval=1.0,
+            stop_check=_cancelled,
+            reply_markup=searching_keyboard(),
         )
         if found:
             await notify_partner_found(context, user_id, found)
-            text = "🎉 Partner found! Connecting..."
-            if charged:
-                balance = db.get_user(user_id).coins
-                text += f"\n🪙 -{GIRL_SEARCH_COST} | Balance: {balance}"
-            return text, None, None
-        # Still searching — the last radar frame is already on screen.
-        final = (
-            "🔍 <b>Searching for a partner…</b>\n\n"
-            f"👥 {db.searching_count} people in queue\n"
-            "Please wait, you'll be connected soon!"
-        )
-        try:
-            if hasattr(target, "edit_message_text"):
-                await target.edit_message_text(
-                    final,
-                    parse_mode="HTML",
-                    reply_markup=searching_keyboard(),
-                )
-            elif hasattr(target, "edit_text"):
-                await target.edit_text(
-                    final,
-                    parse_mode="HTML",
-                    reply_markup=searching_keyboard(),
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"final search frame skipped: {e}")
+            return "🎉 Partner found! Connecting..." + _charge_line(), None, None
+        # The loop stopped without a match: the search was cancelled, or a
+        # chat request matched this user while the frames were running.
+        # Replace the frame so nothing keeps showing a search that is over —
+        # but only if nothing else (a fresh search) took the message over.
+        me = db.get_user(user_id)
+        final_text = None
+        if me is not None and me.state == ChatState.IDLE:
+            final_text = "❌ Search cancelled." + _charge_line()
+        elif me is not None and me.state == ChatState.CHATTING:
+            final_text = "🎉 Partner found! Check your latest message."
+        if final_text:
+            try:
+                if hasattr(target, "edit_message_text"):
+                    await target.edit_message_text(
+                        final_text, reply_markup=main_menu_keyboard()
+                    )
+                elif hasattr(target, "edit_text"):
+                    await target.edit_text(
+                        final_text, reply_markup=main_menu_keyboard()
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"final search frame skipped: {e}")
         return None, None, None
 
     text = SEARCHING_TEXT.format(count=db.searching_count)
-    if charged:
-        balance = db.get_user(user_id).coins
-        text += f"\n\n🪙 -{GIRL_SEARCH_COST} (Girl search) | Balance: {balance}"
-    return text, searching_keyboard(), "Markdown"
+    return text + _charge_line(), searching_keyboard(), "Markdown"
 
 
 async def process_report(context, reporter_id: int) -> tuple[str, bool]:
@@ -1395,13 +1525,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await animated_reply(
         update.message,
-        bounce_frames(
-            HELP_MSG.format(
-                cost=GIRL_SEARCH_COST,
-                request_cost=CHAT_REQUEST_COST,
-                dm_cost=DIRECT_MESSAGE_COST,
-            )
-        ),
+        bounce_frames(HELP_MSG.format(**HELP_KWARGS)),
         parse_mode="Markdown",
     )
 
@@ -1749,7 +1873,7 @@ async def verifyno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚙️ Settings → 🪩 Get Verified."
             ),
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(),
+            reply_markup=settings_keyboard(target.daily_reminder),
         )
     except Exception as e:
         logger.warning(f"Failed to notify rejected user {target.user_id}: {e}")
@@ -2003,7 +2127,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query,
             "⚙️ **Settings**\n\nWhat would you like to change?",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(),
+            reply_markup=settings_keyboard(user.daily_reminder),
+        )
+
+    elif data == "reminder_toggle":
+        enabled = not user.daily_reminder
+        db.set_daily_reminder(user_id, enabled)
+        await query.answer(
+            "⏰ Daily reminder ON — one message a day to come back and chat!"
+            if enabled
+            else "⏰ Daily reminder OFF."
+        )
+        await safe_edit(
+            query,
+            (
+                "⚙️ **Settings**\n\n"
+                "✅ **Daily reminder is ON** — you'll get **1 message a day** "
+                "nudging you to use the bot and talk to someone.\n\n"
+                "What would you like to change?"
+                if enabled
+                else "⚙️ **Settings**\n\n"
+                "❌ **Daily reminder is OFF**.\n\n"
+                "What would you like to change?"
+            ),
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(enabled),
         )
 
     elif data == "back_menu":
@@ -2153,7 +2301,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a photo now — it will be sent to your partner when you get "
             "matched. Send any other message to cancel.",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(),
+            reply_markup=settings_keyboard(user.daily_reminder),
         )
 
     # ── Verification ────────────────────────────────────────
@@ -2182,7 +2330,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a photo showing your face now. An admin will review it.\n"
             "Send any other message to cancel.",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(),
+            reply_markup=settings_keyboard(user.daily_reminder),
         )
 
     # ── Discovery: Nearby / ID search / Contacts ────────────
@@ -2426,13 +2574,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target:
             await query.answer("That account no longer exists.", show_alert=True)
             return
-        enabled = not user.notify_on_end
-        db.set_notify_end(user_id, enabled)
-        await query.answer(
-            "🔔 You'll get a ping when the chat ends."
-            if enabled
-            else "🔕 Chat-end alerts are off."
-        )
+        if user.notify_on_end:
+            db.set_notify_end(user_id, False)
+            enabled = False
+            toast = "🔕 Chat-end alerts are off."
+        elif user.vip:
+            db.set_notify_end(user_id, True)
+            enabled = True
+            toast = "🔔 You'll get a ping when the chat ends — free for VIP 👑"
+        elif db.spend_coins(user_id, NOTIFY_COST):
+            db.set_notify_end(user_id, True)
+            enabled = True
+            balance = db.get_user(user_id).coins
+            toast = (
+                f"🔔 You'll get a ping when the chat ends — "
+                f"🪙 -{NOTIFY_COST} | Balance: {balance}"
+            )
+        else:
+            await query.answer(
+                f"🪙 Not enough Coins! Switching 🔔 alerts on costs "
+                f"{NOTIFY_COST} 🪙 (free for 👑 VIP members).",
+                show_alert=True,
+            )
+            return
+        await query.answer(toast)
         await safe_edit(
             query,
             build_user_card(target, user_id),
@@ -2825,7 +2990,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❌ That wasn't a photo — photo setting cancelled.",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         return
 
@@ -2881,13 +3046,13 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "An admin will review your photo — you'll get a message when "
                 "it's approved.",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         else:
             await update.message.reply_text(
                 "❌ Verification cancelled — pick your gender first, then send "
                 "a photo.",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         return
 
@@ -2923,7 +3088,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ Age set to **{raw}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         return
 
@@ -2946,7 +3111,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ City set to **{city}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         return
 
@@ -2955,7 +3120,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = (update.message.text or "").strip()
         if not name:
             await update.message.reply_text(
-                "⚠️ Please send a name.", reply_markup=settings_keyboard()
+                "⚠️ Please send a name.", reply_markup=settings_keyboard(user.daily_reminder)
             )
             return
         db.update_name(user_id, name)
@@ -2968,7 +3133,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ Name set to **{md_escape(name)}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(),
+                reply_markup=settings_keyboard(user.daily_reminder),
             )
         return
 
@@ -3225,8 +3390,9 @@ async def set_bot_commands(application):
 
 
 async def on_startup(application):
-    """Restore the DB from the backup channel, then start the backup loop."""
+    """Start the hourly reminder sweep, then restore/backup the DB."""
     await set_bot_commands(application)
+    application.create_task(_reminder_loop(application.bot))
     backup_bot = await _get_backup_bot(application.bot)
     await restore_db_from_backup(backup_bot)
     await _startup_checks(application)

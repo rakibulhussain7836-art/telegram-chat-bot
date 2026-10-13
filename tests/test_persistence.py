@@ -308,6 +308,54 @@ def test_card_fields_survive_restart(tmp_path):
     db2.close()
 
 
+def test_daily_reminder_fields_survive_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.set_daily_reminder(1, True)
+    db.mark_reminder_sent(1, "2030-01-01")
+    db.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user.daily_reminder is True
+    assert user.reminder_date == "2030-01-01"
+    db2.close()
+
+
+def test_rows_without_reminder_fields_opt_out_by_default(tmp_path):
+    """Rows saved before daily_reminder existed must keep working."""
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.close()
+
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    (data,) = conn.execute(
+        "SELECT data FROM users WHERE user_id = 1"
+    ).fetchone()
+    row = json.loads(data)
+    for old_key in ("daily_reminder", "reminder_date"):
+        row.pop(old_key, None)
+    conn.execute(
+        "UPDATE users SET data = ? WHERE user_id = 1", (json.dumps(row),)
+    )
+    conn.commit()
+    conn.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user is not None
+    assert user.daily_reminder is False
+    assert not user.reminder_date  # blank, i.e. never sent
+    db2.close()
+
+
 def test_rows_written_before_card_fields_still_load(tmp_path):
     """Rows saved before name/age/city/vip existed must keep working."""
     path = str(tmp_path / "bot.db")

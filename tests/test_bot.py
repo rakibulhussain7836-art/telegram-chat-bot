@@ -9,8 +9,10 @@ from database import (
     ChatState,
     Gender,
     GIRL_SEARCH_COST,
+    GUY_SEARCH_COST,
     CHAT_REQUEST_COST,
     DIRECT_MESSAGE_COST,
+    NOTIFY_COST,
     STARTING_COINS,
 )
 
@@ -130,17 +132,16 @@ def test_format_gender_and_state():
 
 
 def test_help_text_has_search_cost_filled_in():
-    text = bot.HELP_MSG.format(
-        cost=GIRL_SEARCH_COST,
-        request_cost=CHAT_REQUEST_COST,
-        dm_cost=DIRECT_MESSAGE_COST,
-    )
+    text = bot.HELP_MSG.format(**bot.HELP_KWARGS)
     assert str(GIRL_SEARCH_COST) in text
     assert str(CHAT_REQUEST_COST) in text
     assert str(DIRECT_MESSAGE_COST) in text
-    assert "{cost}" not in text
-    assert "{request_cost}" not in text
-    assert "{dm_cost}" not in text
+    assert str(bot.HELP_KWARGS["notify_cost"]) in text
+    assert str(STARTING_COINS) in text
+    for placeholder in (
+        "{cost}", "{request_cost}", "{dm_cost}", "{notify_cost}", "{free}"
+    ):
+        assert placeholder not in text
 
 
 def test_credit_text_shows_balance_and_earn_options(fresh_db):
@@ -195,6 +196,31 @@ def test_cancelled_search_keeps_the_charge(fresh_db):
     assert fresh_db.get_user(1).coins == STARTING_COINS - GIRL_SEARCH_COST
 
 
+def test_guy_search_charges_coins(fresh_db):
+    register(fresh_db, 1)
+    text, _, mode = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.MALE))
+    assert fresh_db.get_user(1).coins == STARTING_COINS - GUY_SEARCH_COST
+    assert f"-{GUY_SEARCH_COST}" in text
+    assert mode == "Markdown"
+    assert fresh_db.get_user(1).search_pref == Gender.MALE
+
+
+def test_guy_search_without_coins_is_refused(fresh_db):
+    user = register(fresh_db, 1)
+    user.coins = 1  # one short of a 2-coin search
+    text, markup, mode = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.MALE))
+    assert "Not enough Coins" in text
+    assert markup is not None
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert user.coins == 1
+
+
+def test_new_users_start_with_10_tokens(fresh_db):
+    user = fresh_db.register_user(42)
+    assert user.coins == 10
+    assert STARTING_COINS == 10
+
+
 def test_search_requires_complete_profile(fresh_db):
     fresh_db.register_user(1)
     text, markup, mode = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.ANY))
@@ -232,7 +258,234 @@ def test_pairing_after_girl_search_notifies_partner(fresh_db):
 
     assert "Partner found" in text
     assert fresh_db.get_user(1).state == ChatState.CHATTING
-    assert len(ctx.bot.sent) == 2
+    # ONE card per user: the partner's photo carries the info + buttons
+    assert len(ctx.bot.photos) == 2
+    for card in ctx.bot.photos:
+        assert "Partner found" in card["caption"]
+        assert card["reply_markup"] is not None
+    assert ctx.bot.sent == []  # never a separate text message underneath
+
+
+# ── Continuous "matching" animation ──────────────────────────────
+
+def _recording_target(edits, markups):
+    class Target:
+        async def edit_message_text(self, text, parse_mode=None, reply_markup=None):
+            edits.append(text)
+            markups.append(reply_markup)
+
+    return Target()
+
+
+def test_matching_animation_runs_until_a_match_lands(fresh_db, monkeypatch):
+    """The frames must keep cycling (past one full cycle) until a match."""
+    import animations
+
+    monkeypatch.setattr(animations, "ANIMATIONS_ENABLED", True)
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    edits, markups = [], []
+    calls = {"n": 0}
+
+    def check():
+        calls["n"] += 1
+        if calls["n"] >= 8:  # longer than one 6-frame cycle
+            fresh_db.pair_users(1, 2)
+            return 2
+        return None
+
+    found = asyncio.run(
+        bot.animate_search(
+            FakeContext(), 1, check,
+            target=_recording_target(edits, markups),
+            interval=0,
+            reply_markup=bot.searching_keyboard(),
+        )
+    )
+
+    assert found == 2
+    assert len(edits) > 6  # kept animating past the first 6-frame cycle
+    assert "Matching you with a partner" in edits[0]
+    assert "Matching you with a partner" in edits[-1]
+    # the Cancel Search button stays reachable on every frame
+    assert all(
+        any(b.callback_data == "cancel_search" for b in _buttons(markup))
+        for markup in markups
+    )
+    assert fresh_db.get_user(1).state == ChatState.CHATTING
+
+
+def test_matching_animation_stops_when_the_search_is_cancelled(fresh_db, monkeypatch):
+    import animations
+
+    monkeypatch.setattr(animations, "ANIMATIONS_ENABLED", True)
+    register(fresh_db, 1)
+    fresh_db.add_to_queue(1, search_pref=None)
+    edits, markups = [], []
+    calls = {"n": 0}
+
+    def check():
+        calls["n"] += 1
+        if calls["n"] == 3:
+            fresh_db.remove_from_queue(1)  # the user pressed Cancel Search
+        return None
+
+    def cancelled():
+        me = fresh_db.get_user(1)
+        return me is None or me.state != ChatState.SEARCHING
+
+    found = asyncio.run(
+        bot.animate_search(
+            FakeContext(), 1, check,
+            target=_recording_target(edits, markups),
+            interval=0,
+            stop_check=cancelled,
+        )
+    )
+
+    assert found is None
+    assert len(edits) == 2  # no frame is drawn after the cancel
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+
+
+def test_animated_search_rewrites_the_frame_when_the_user_cancels(
+    fresh_db, monkeypatch
+):
+    """After Cancel the on-screen frame must not keep saying 'matching...'."""
+    register(fresh_db, 1)
+    edits, markups = [], []
+
+    async def fake_search(context, user_id, check, **kwargs):
+        fresh_db.remove_from_queue(user_id)  # Cancel pressed mid-animation
+        return None
+
+    monkeypatch.setattr(bot, "ANIMATIONS_ENABLED", True)
+    monkeypatch.setattr(bot, "animate_search", fake_search)
+
+    text, markup, mode = asyncio.run(
+        bot.begin_search(
+            FakeContext(), 1, Gender.FEMALE, target=_recording_target(edits, markups)
+        )
+    )
+
+    assert (text, markup, mode) == (None, None, None)
+    assert len(edits) == 1
+    assert "Search cancelled." in edits[0]
+    assert "-2" in edits[0]  # the Girl-search charge is still shown
+    assert any(
+        b.callback_data == "find_partner" for b in _buttons(markups[-1])
+    )
+
+
+# ── Photo/caption card animation helpers ────────────────────────
+
+class _FakeCaptionMsg:
+    def __init__(self, fail_first_edit=False):
+        self.captions = []
+        self.marks = []
+        self._attempts = 0
+        self._fail_first = fail_first_edit
+
+    async def edit_caption(self, caption=None, parse_mode=None, reply_markup=None):
+        self._attempts += 1
+        if self._fail_first and self._attempts == 1:
+            raise RuntimeError("flood control: retry later")
+        self.captions.append(caption)
+        self.marks.append(reply_markup)
+
+
+def test_caption_animation_types_through_every_frame(monkeypatch):
+    import animations
+
+    monkeypatch.setattr(animations, "ANIMATIONS_ENABLED", True)
+    markup = bot.main_menu_keyboard()
+    msg = _FakeCaptionMsg()
+
+    ok = asyncio.run(
+        animations.animate_message_caption(
+            msg, ["c1", "c2", "c3"], reply_markup=markup, interval=0
+        )
+    )
+
+    assert ok is True
+    assert msg.captions == ["c1", "c2", "c3"]
+    # buttons only ride in with the finished frame
+    assert msg.marks[:-1] == [None, None]
+    assert msg.marks[-1] is markup
+
+
+def test_caption_animation_falls_back_to_the_finished_card(monkeypatch):
+    import animations
+
+    monkeypatch.setattr(animations, "ANIMATIONS_ENABLED", True)
+    markup = bot.main_menu_keyboard()
+    msg = _FakeCaptionMsg(fail_first_edit=True)
+
+    ok = asyncio.run(
+        animations.animate_message_caption(
+            msg, ["c1", "c2", "c3"], reply_markup=markup, interval=0
+        )
+    )
+
+    assert ok is True  # the finished card still landed
+    assert msg.captions == ["c3"]
+    assert msg.marks[-1] is markup
+
+
+def test_caption_animation_reports_an_uneditable_message():
+    import animations
+
+    frames = ["c1", "c2"]
+    assert (
+        asyncio.run(animations.animate_message_caption(object(), frames)) is False
+    )
+
+
+def test_photo_card_sends_one_message_and_adds_buttons_at_the_end(monkeypatch):
+    import animations
+
+    monkeypatch.setattr(animations, "ANIMATIONS_ENABLED", True)
+    markup = bot.main_menu_keyboard()
+
+    class RecordingBot:
+        def __init__(self):
+            self.sent = None
+            self.msg = _FakeCaptionMsg()
+
+        async def send_photo(self, **kwargs):
+            self.sent = kwargs
+            return self.msg
+
+    recording = RecordingBot()
+    ok = asyncio.run(
+        animations.animate_photo_card(
+            recording, 1, "photo-id", ["f1", "f2"],
+            reply_markup=markup, interval=0,
+        )
+    )
+
+    assert ok is True
+    assert recording.sent["caption"] == "f1"  # first frame opens the card
+    assert recording.sent.get("reply_markup") is None
+    assert recording.msg.captions == ["f2"]
+    assert recording.msg.marks[-1] is markup  # buttons arrive on ONE message
+
+
+def test_photo_card_returns_false_when_the_photo_cannot_be_sent(monkeypatch):
+    import animations
+
+    class BrokenBot:
+        async def send_photo(self, **kwargs):
+            raise RuntimeError("chat not found")
+
+    assert (
+        asyncio.run(
+            animations.animate_photo_card(
+                BrokenBot(), 1, "photo-id", ["f1"], interval=0
+            )
+        )
+        is False
+    )
 
 
 # ── Payments (Telegram Stars) ───────────────────────────────────
@@ -867,6 +1120,20 @@ def test_profile_card_buttons_match_reference(fresh_db):
     assert any("Notify me when chat ends" in label for label in labels)
 
 
+def test_profile_card_keeps_photo_and_details_in_one_message(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.update_name(2, "Shivani")
+    fresh_db.update_age(2, 19)
+
+    query, context = press(1, f"view_{2}")
+
+    assert len(context.bot.photos) == 1  # one card, not a photo + a text below
+    card = context.bot.photos[-1]
+    assert "Shivani" in card["caption"] and "19" in card["caption"]
+    assert card["reply_markup"] is not None
+
+
 def test_onboarding_collects_name_age_and_city(fresh_db):
     register(fresh_db, 1, complete=False)
     context = FakeContext()
@@ -1010,7 +1277,7 @@ def test_direct_message_charges_one_coin_and_pairs(fresh_db):
     assert fresh_db.get_user(1).state == ChatState.CHATTING
     assert fresh_db.get_user(2).state == ChatState.CHATTING
     assert fresh_db.get_user(1).coins == STARTING_COINS - DIRECT_MESSAGE_COST
-    assert any("Partner found" in m["text"] for m in context.bot.sent)
+    assert any("Partner found" in p["caption"] for p in context.bot.photos)
     assert "Direct chat started" in query.edits[-1]["text"]
     assert f"-{DIRECT_MESSAGE_COST}" in query.edits[-1]["text"]
 
@@ -1194,6 +1461,146 @@ def test_notify_toggle_switches_the_flag(fresh_db):
     assert fresh_db.get_user(1).notify_on_end is True
     press(1, f"notify_{2}")
     assert fresh_db.get_user(1).notify_on_end is False
+
+
+def test_notify_enable_costs_one_coin_and_disable_is_free(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    before = fresh_db.get_user(1).coins
+
+    query, _ = press(1, f"notify_{2}")
+    assert fresh_db.get_user(1).notify_on_end is True
+    assert fresh_db.get_user(1).coins == before - NOTIFY_COST
+    assert f"-{NOTIFY_COST}" in query.answers[-1]["text"]
+
+    press(1, f"notify_{2}")
+    assert fresh_db.get_user(1).notify_on_end is False
+    assert fresh_db.get_user(1).coins == before - NOTIFY_COST  # no refund, no charge
+
+
+def test_notify_enable_is_free_for_vip(fresh_db):
+    user = register(fresh_db, 1)
+    register(fresh_db, 2)
+    user.vip = True
+    before = user.coins
+
+    query, _ = press(1, f"notify_{2}")
+
+    assert fresh_db.get_user(1).notify_on_end is True
+    assert fresh_db.get_user(1).coins == before
+    assert "free for VIP" in query.answers[-1]["text"]
+
+
+def test_notify_enable_is_refused_without_coins(fresh_db):
+    user = register(fresh_db, 1)
+    register(fresh_db, 2)
+    user.coins = 0
+
+    query, _ = press(1, f"notify_{2}")
+
+    assert fresh_db.get_user(1).notify_on_end is False
+    assert query.answers[-1]["show_alert"] is True
+    assert "Not enough Coins" in query.answers[-1]["text"]
+    assert user.coins == 0
+
+
+# ── ⏰ Daily reminder (one message a day) ────────────────────────
+
+def test_settings_has_the_daily_reminder_toggle(fresh_db):
+    register(fresh_db, 1)
+
+    query, _ = press(1, "settings")
+
+    labels = [b.text for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert any("Daily Reminder" in label for label in labels)
+
+
+def test_reminder_toggle_switches_the_flag(fresh_db):
+    register(fresh_db, 1)
+
+    query, _ = press(1, "reminder_toggle")
+    assert fresh_db.get_user(1).daily_reminder is True
+    assert "ON" in query.edits[-1]["text"]
+    assert any(
+        b.callback_data == "reminder_toggle"
+        for b in _buttons(query.edits[-1]["reply_markup"])
+    )
+
+    query, _ = press(1, "reminder_toggle")
+    assert fresh_db.get_user(1).daily_reminder is False
+    assert "OFF" in query.edits[-1]["text"]
+
+
+def test_daily_reminder_goes_out_once_per_day(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_daily_reminder(1, True)
+    context = FakeContext()
+
+    sent = asyncio.run(
+        bot.send_due_reminders(context.bot, current_hour=10, today="2030-01-01")
+    )
+    assert sent == 1
+    assert any(
+        m["chat_id"] == 1 and "reminder" in m["text"].lower()
+        for m in context.bot.sent
+    )
+    assert fresh_db.get_user(1).reminder_date == "2030-01-01"
+
+    # second sweep the same day stays silent
+    assert (
+        asyncio.run(
+            bot.send_due_reminders(context.bot, current_hour=11, today="2030-01-01")
+        )
+        == 0
+    )
+    # outside the waking-hours window nothing goes out
+    assert (
+        asyncio.run(
+            bot.send_due_reminders(context.bot, current_hour=3, today="2030-01-02")
+        )
+        == 0
+    )
+    # the next day it goes out again (exactly one message)
+    assert (
+        asyncio.run(
+            bot.send_due_reminders(context.bot, current_hour=10, today="2030-01-02")
+        )
+        == 1
+    )
+    assert len([m for m in context.bot.sent if m["chat_id"] == 1]) == 2
+
+
+def test_users_without_the_reminder_opt_in_get_nothing(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+
+    sent = asyncio.run(
+        bot.send_due_reminders(context.bot, current_hour=10, today="2030-01-01")
+    )
+
+    assert sent == 0
+    assert context.bot.sent == []
+
+
+def test_a_failed_reminder_is_retried_later(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_daily_reminder(1, True)
+
+    class BrokenBot:
+        async def send_message(self, **kwargs):
+            raise RuntimeError("chat not found")
+
+    sent = asyncio.run(
+        bot.send_due_reminders(BrokenBot(), current_hour=10, today="2030-01-01")
+    )
+    assert sent == 0
+    assert fresh_db.get_user(1).reminder_date != "2030-01-01"  # not burned
+
+    context = FakeContext()
+    sent = asyncio.run(
+        bot.send_due_reminders(context.bot, current_hour=10, today="2030-01-01")
+    )
+    assert sent == 1
 
 
 # ── Persistent bottom bar ──────────────────────────────────────
@@ -1453,7 +1860,7 @@ def test_match_awards_free_coin_to_girls_only(fresh_db):
     assert fresh_db.get_user(1).coins == start1
     assert fresh_db.get_user(2).coins == start2 + bot.DAILY_REWARD_COINS
     # Only the girl's match card carries the free-coin line
-    coin_cards = [m for m in context.bot.sent if "free coin" in m["text"]]
+    coin_cards = [p for p in context.bot.photos if "free coin" in p["caption"]]
     assert len(coin_cards) == 1 and coin_cards[0]["chat_id"] == 2
 
 
