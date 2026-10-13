@@ -1938,3 +1938,469 @@ def test_backup_bot_falls_back_on_bad_token(monkeypatch):
     main = object()
     assert run(bot._get_backup_bot(main)) is main
     monkeypatch.setattr(bot, "_dedicated_backup_bot", None)
+
+
+# ── Restore on a fresh deploy (the "bot started from zero" bug) ──
+
+def _channel_with_backup(backup_path, age_hours=1):
+    """A fake backup channel holding `backup_path` as the pinned bot.db."""
+    import shutil
+    from datetime import datetime, timedelta
+
+    class FakeFile:
+        async def download_to_drive(self, to):
+            shutil.copyfile(backup_path, to)
+
+    class FakeDocument:
+        file_name = "bot.db"
+
+        async def get_file(self):
+            return FakeFile()
+
+    class FakeMsg:
+        date = datetime.now() - timedelta(hours=age_hours)
+        document = FakeDocument()
+
+    class FakeChat:
+        pinned_message = FakeMsg()
+
+    class FakeChannelBot:
+        async def get_chat(self, chat_id):
+            return FakeChat()
+
+    return FakeChannelBot()
+
+
+def _backup_file_with(tmp_path, name, user_ids):
+    from database import Database
+
+    path = str(tmp_path / name)
+    db_file = Database(path=path)
+    for uid in user_ids:
+        db_file.register_user(uid)
+    db_file.close()
+    return path
+
+
+def test_fresh_empty_db_restores_from_an_older_channel_backup(tmp_path, monkeypatch):
+    """bot.db is created EMPTY at boot, so its mtime is always newer than the
+    channel backup. Skipping the restore there is what made redeploys start
+    from zero (and then wipe the backup) — the empty DB must still restore."""
+    from database import Database
+
+    backup_path = _backup_file_with(tmp_path, "channel.db", [111, 222])
+    local = Database(path=str(tmp_path / "bot.db"))  # empty, mtime = now
+    assert local.users == {}
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "BACKUP_BOT_TOKEN", "")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+
+    run(bot.restore_db_from_backup(_channel_with_backup(backup_path)))
+
+    assert len(local.users) == 2
+    assert bot._RESTORE_SKIPPED is False
+
+
+def test_local_db_with_users_is_kept_when_the_backup_is_older(tmp_path, monkeypatch):
+    """Persistent volume: real local users must not be replaced by an older
+    snapshot from the channel."""
+    from database import Database
+
+    backup_path = _backup_file_with(tmp_path, "channel.db", [111, 222])
+    local = Database(path=str(tmp_path / "bot.db"))
+    for uid in (1, 2, 3):
+        local.register_user(uid)
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+
+    run(bot.restore_db_from_backup(_channel_with_backup(backup_path, age_hours=1)))
+
+    assert [u for u in sorted(local.users)] == [1, 2, 3]
+
+
+def test_failed_restore_blocks_the_upload_that_would_wipe_the_backup(
+    tmp_path, monkeypatch
+):
+    """If the channel backup could never be loaded, an empty local DB must
+    never be uploaded — that would delete the last good snapshot."""
+    from database import Database
+
+    local = Database(path=str(tmp_path / "bot.db"))
+
+    class BrokenBot:
+        async def get_chat(self, chat_id):
+            raise RuntimeError("Forbidden: bot is not admin")
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+
+    run(bot.restore_db_from_backup(BrokenBot()))
+
+    assert bot._RESTORE_SKIPPED is True
+
+    uploads = []
+
+    class Recorder:
+        async def send_document(self, **kwargs):
+            uploads.append(kwargs)
+            raise AssertionError("upload must not run")
+
+    local.path = str(tmp_path / "bot.db")
+    assert run(bot.upload_db_backup(Recorder())) is False
+    assert uploads == []
+
+
+def test_a_failed_restore_with_local_users_allows_normal_backups(
+    tmp_path, monkeypatch
+):
+    """The flag is only for 'we have nothing': local data keeps backing up."""
+    from database import Database
+
+    local = Database(path=str(tmp_path / "bot.db"))
+    local.register_user(1)
+
+    class BrokenBot:
+        async def get_chat(self, chat_id):
+            raise RuntimeError("Forbidden")
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+
+    run(bot.restore_db_from_backup(BrokenBot()))
+
+    assert bot._RESTORE_SKIPPED is False
+
+
+def test_after_a_successful_restore_the_startup_upload_changes_nothing(
+    tmp_path, monkeypatch
+):
+    """Restored DB == channel backup → the upload must skip instead of
+    re-sending and deleting the snapshot it just loaded."""
+    from database import Database
+
+    backup_path = _backup_file_with(tmp_path, "channel.db", [111, 222])
+    local = Database(path=str(tmp_path / "bot.db"))
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+
+    run(bot.restore_db_from_backup(_channel_with_backup(backup_path)))
+    assert len(local.users) == 2
+
+    uploads = []
+
+    class Recorder:
+        async def send_document(self, **kwargs):
+            uploads.append(kwargs)
+            return SimpleNamespace(message_id=99)
+
+        async def pin_chat_message(self, *args, **kwargs):
+            pass
+
+        async def delete_message(self, *args, **kwargs):
+            pass
+
+    assert run(bot.upload_db_backup(Recorder())) is False
+    assert uploads == []
+
+
+def test_full_deploy_cycle_keeps_the_member_list_alive(tmp_path, monkeypatch):
+    """Replay the real lifecycle: 200 members → bot backs up → redeploy on a
+    wiped disk → restore brings all 200 back → the new run does NOT replace
+    the channel backup. This is the whole point of the backup bot."""
+    import shutil
+    from datetime import datetime
+    from database import Database
+
+    channel_copy = str(tmp_path / "channel-bot.db")  # what the channel holds
+
+    class FakeDocFile:
+        async def download_to_drive(self, to):
+            shutil.copyfile(channel_copy, to)
+
+    class FakeDocument:
+        file_name = "bot.db"
+
+        async def get_file(self):
+            return FakeDocFile()
+
+    class FakeMsg:
+        message_id = 7
+
+        def __init__(self):
+            self.date = datetime.now()
+            self.document = FakeDocument()
+
+    class FakeChat:
+        pinned_message = FakeMsg()
+
+    class FakeChannelBot:
+        async def get_chat(self, chat_id):
+            return FakeChat()
+
+        async def send_document(self, chat_id, document, filename, caption):
+            shutil.copyfile(document.name, channel_copy)
+            return FakeMsg()
+
+        async def pin_chat_message(self, *args, **kwargs):
+            pass
+
+        async def delete_message(self, *args, **kwargs):
+            pass
+
+    channel = FakeChannelBot()
+
+    # ── deploy #1: the bot everyone joined ──
+    first_run = Database(path=str(tmp_path / "run1" / "bot.db"))
+    for uid in range(1, 201):
+        first_run.register_user(uid)
+    assert len(first_run.users) == 200
+
+    monkeypatch.setattr(bot, "db", first_run)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+    assert run(bot.upload_db_backup(channel)) is True  # backup lands in channel
+
+    # ── deploy #2: wiped disk, empty bot.db created at boot ──
+    second_run = Database(path=str(tmp_path / "run2" / "bot.db"))
+    assert second_run.users == {}
+
+    monkeypatch.setattr(bot, "db", second_run)
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+
+    run(bot.restore_db_from_backup(channel))
+    assert len(second_run.users) == 200  # ← the fix: all members are back
+    assert bot._RESTORE_SKIPPED is False
+
+    # and the startup upload must not touch the snapshot it just restored
+    assert run(bot.upload_db_backup(channel)) is False
+
+    restored_copy = Database(path=channel_copy)
+    assert len(restored_copy.users) == 200  # channel still holds the real data
+
+
+def test_restore_recovers_the_real_backup_from_a_clobbered_channel(
+    tmp_path, monkeypatch
+):
+    """The broken run pinned a 1-user bot.db on top of the real one. The
+    restore must look past the pinned file and bring back the snapshot that
+    actually holds the members — even if it is older than the local file."""
+    import shutil
+    from datetime import datetime, timedelta
+    from database import Database
+
+    good = _backup_file_with(tmp_path, "good.db", range(1, 201))  # 200 members
+    bad = _backup_file_with(tmp_path, "bad.db", [999])  # the clobbered upload
+
+    class FakeDocFile:
+        def __init__(self, path):
+            self.path = path
+
+        async def download_to_drive(self, to):
+            shutil.copyfile(self.path, to)
+
+    class FakeDocument:
+        def __init__(self, path):
+            self.file_name = "bot.db"
+            self.path = path
+
+        async def get_file(self):
+            return FakeDocFile(self.path)
+
+    class FakeMsg:
+        def __init__(self, mid, path, age_hours):
+            self.message_id = mid
+            self.date = datetime.now() - timedelta(hours=age_hours)
+            self.document = FakeDocument(path)
+
+    bad_msg = FakeMsg(10, bad, 1)  # newest — pinned by the broken run
+    good_msg = FakeMsg(9, good, 48)  # older, but holds all 200 members
+
+    class FakeChannelBot:
+        async def get_chat(self, chat_id):
+            class Chat:
+                pinned_message = bad_msg
+
+            return Chat()
+
+        async def get_chat_history(self, chat_id, limit):
+            for m in (bad_msg, good_msg):
+                yield m
+
+    # the bot already restarted and collected a few members of its own
+    local = Database(path=str(tmp_path / "bot.db"))
+    for uid in (501, 502, 503):
+        local.register_user(uid)
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+
+    run(bot.restore_db_from_backup(FakeChannelBot()))
+
+    assert len(local.users) == 200  # all the real members are back
+    assert 999 not in local.users and 1 in local.users
+
+
+def test_upload_keeps_the_last_five_snapshots(tmp_path, monkeypatch):
+    """Old backups used to be deleted after EVERY upload — one bad upload
+    destroyed the last good copy. Now the newest BACKUP_KEEP stay."""
+    from database import Database
+
+    local = Database(path=str(tmp_path / "bot.db"))
+    local.register_user(1)
+
+    docs = [
+        SimpleNamespace(
+            message_id=mid, document=SimpleNamespace(file_name="bot.db")
+        )
+        for mid in range(100, 92, -1)
+    ]
+
+    class Recorder:
+        async def get_chat_history(self, chat_id, limit):
+            for m in docs:
+                yield m
+
+        async def get_chat(self, chat_id):
+            raise RuntimeError("no admin rights for get_chat")
+
+        async def send_document(self, **kwargs):
+            return SimpleNamespace(message_id=200)
+
+        async def pin_chat_message(self, *args, **kwargs):
+            pass
+
+        async def delete_message(self, chat_id, message_id):
+            deleted.append(message_id)
+
+    deleted = []
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(bot, "_BACKUP_MSG", {"id": None, "hash": None})
+    monkeypatch.setattr(bot, "BACKUP_KEEP", 5)
+
+    assert run(bot.upload_db_backup(Recorder())) is True
+
+    assert deleted == [96, 95, 94, 93]  # only beyond the 5 newest
+    assert set(deleted).isdisjoint({100, 99, 98, 97})
+
+
+# ── GitHub backup (online, every version kept forever) ────────────
+
+def _enable_github(monkeypatch):
+    """Point the bot at a GitHub backup repo (network faked in tests)."""
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "")  # github-only
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_REPO", "me/backups")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_TOKEN", "token")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(
+        bot, "_BACKUP_MSG", {"id": None, "hash": None, "gh_hash": None}
+    )
+
+
+def test_github_restore_picks_the_version_with_the_most_members(
+    tmp_path, monkeypatch
+):
+    """The repo holds every commit — restore probes them and brings back the
+    version with the real member list, not the newest broken one."""
+    from datetime import datetime, timedelta
+    from database import Database
+
+    good = _backup_file_with(tmp_path, "good.db", range(1, 201))
+    bad = _backup_file_with(tmp_path, "bad.db", [999])
+    with open(good, "rb") as fh:
+        good_bytes = fh.read()
+    with open(bad, "rb") as fh:
+        bad_bytes = fh.read()
+
+    async def fake_versions(limit):
+        return [
+            {"sha": "aaaa1111", "date": datetime.now()},
+            {"sha": "bbbb2222", "date": datetime.now() - timedelta(days=2)},
+        ]
+
+    async def fake_download(sha):
+        return good_bytes if sha == "bbbb2222" else bad_bytes
+
+    local = Database(path=str(tmp_path / "bot.db"))
+    monkeypatch.setattr(bot, "db", local)
+    _enable_github(monkeypatch)
+    monkeypatch.setattr(bot, "_github_fetch_versions", fake_versions)
+    monkeypatch.setattr(bot, "_github_download", fake_download)
+
+    run(bot.restore_db_from_backup(object()))
+
+    assert len(local.users) == 200
+    assert bot._RESTORE_SKIPPED is False
+
+
+def test_github_upload_commits_the_snapshot(tmp_path, monkeypatch):
+    from database import Database
+
+    local = Database(path=str(tmp_path / "bot.db"))
+    for uid in (1, 2, 3):
+        local.register_user(uid)
+
+    sent = {}
+
+    async def fake_upload(data, message):
+        sent["data"] = data
+        sent["message"] = message
+        return True
+
+    monkeypatch.setattr(bot, "db", local)
+    _enable_github(monkeypatch)
+    monkeypatch.setattr(bot, "_github_upload", fake_upload)
+
+    assert run(bot.upload_db_backup(object())) is True
+    with open(local.path, "rb") as fh:
+        assert sent["data"] == fh.read()
+    assert "3 members" in sent["message"]
+
+    # unchanged database → no duplicate commit
+    assert run(bot.upload_db_backup(object())) is False
+    assert bot._BACKUP_MSG["gh_hash"] is not None
+
+
+def test_github_backup_survives_a_broken_channel(tmp_path, monkeypatch):
+    """One dead target must never block the other."""
+    from database import Database
+
+    local = Database(path=str(tmp_path / "bot.db"))
+    local.register_user(1)
+
+    async def fake_upload(data, message):
+        return True
+
+    class BrokenChannelBot:
+        async def send_document(self, **kwargs):
+            raise RuntimeError("channel gone")
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_REPO", "me/backups")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_TOKEN", "token")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(
+        bot, "_BACKUP_MSG", {"id": None, "hash": None, "gh_hash": None}
+    )
+    monkeypatch.setattr(bot, "_github_upload", fake_upload)
+
+    assert run(bot.upload_db_backup(BrokenChannelBot())) is True  # GitHub went out
+    assert bot._BACKUP_MSG["gh_hash"] is not None  # committed
+    assert bot._BACKUP_MSG["hash"] is None  # channel still pending, no crash

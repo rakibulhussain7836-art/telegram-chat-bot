@@ -517,6 +517,37 @@ class Database:
         self._connect()
         self._load()
 
+    def replace_file_with(self, tmp_path: str) -> None:
+        """Swap the database file for a freshly downloaded backup, then reload.
+
+        The connection is closed BEFORE the swap: Windows refuses to rename
+        over an open file, and the handle must not keep pointing at the
+        replaced-away file. Stale -wal/-shm sidecars of the old file are
+        removed too, so recovery cannot graft the previous file's journal
+        onto the restored one. On failure the previous connection is
+        re-established, so a failed restore never kills the running bot.
+        """
+        if not self.path:
+            raise RuntimeError("cannot restore into an in-memory database")
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+        try:
+            os.replace(tmp_path, self.path)
+        except Exception:
+            if self.path:
+                self._connect()  # keep serving the data we already have
+            raise
+        for suffix in ("-wal", "-shm"):
+            stale = self.path + suffix
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass  # already gone / locked — reload still re-reads the file
+        self.reload()
+
     def close(self):
         """Flush and close the SQLite store."""
         try:

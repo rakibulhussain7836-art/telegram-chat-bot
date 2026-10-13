@@ -22,8 +22,11 @@ Supports: text, photos, stickers, voice, video, documents, GIFs
 import os
 import sys
 import asyncio
+import base64
 import logging
+import sqlite3
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 
 from telegram import (
@@ -145,6 +148,26 @@ BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "600"))  # 10 minutes
 # keeps serving users untouched. Both bots must be ADMIN of the channel.
 # Leave empty to back up with the main bot.
 BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "").strip()
+# How many snapshots stay in the channel. Old ones used to be deleted after
+# every upload — one bad upload could therefore destroy the LAST good copy.
+# Keep a small history so a wiped disk can always be rolled back.
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "5"))
+# How many recent channel messages are inspected when looking for backups.
+BACKUP_SCAN_LIMIT = 20
+
+# ── Online backup: a PRIVATE GitHub repository ─────────────────────
+# Every snapshot is COMMITTED to the repo, so git keeps every previous
+# version forever — a bad upload cannot destroy the copy before it, and the
+# file lives online where a wiped deploy disk can never reach it.
+# 1. Create a PRIVATE repo (e.g. yourname/telegram-db-backup)
+# 2. GitHub → Settings → Developer settings → Fine-grained tokens →
+#    Contents: Read & Write, scoped to that repo
+# 3. Set both variables below (in .env here, and in your host's env vars)
+BACKUP_GITHUB_REPO = os.getenv("BACKUP_GITHUB_REPO", "").strip()  # owner/name
+BACKUP_GITHUB_TOKEN = os.getenv("BACKUP_GITHUB_TOKEN", "").strip()
+BACKUP_GITHUB_PATH = os.getenv("BACKUP_GITHUB_PATH", "bot.db").strip()
+# How many committed versions are probed on startup (biggest one wins).
+BACKUP_GITHUB_HISTORY = int(os.getenv("BACKUP_GITHUB_HISTORY", "10"))
 
 # Shows up in Telegram's ☰ Menu, like the reference bot.
 BOT_COMMANDS = [
@@ -608,7 +631,13 @@ async def enforce_channel(update, context) -> bool:
 # ── Free persistence: database backup via a Telegram channel ────
 
 # id of the last message we uploaded + hash of the contents it contained
-_BACKUP_MSG = {"id": None, "hash": None}
+# ("gh_hash" tracks the GitHub target separately, so one target failing
+# never blocks the other).
+_BACKUP_MSG = {"id": None, "hash": None, "gh_hash": None}
+
+# True while a channel backup exists (or may exist) that this process did NOT
+# load — the upload must never replace that backup with an empty database.
+_RESTORE_SKIPPED = False
 
 
 def _backup_enabled() -> bool:
@@ -659,127 +688,434 @@ def _is_backup_doc(message) -> bool:
     return bool(doc) and name in ("bot.db", "bot.db.backup")
 
 
+def _remove_quiet(path) -> None:
+    """Delete a temp/probe file if it exists — never raise."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+# ── GitHub backup (online, keeps every version forever) ────────────
+
+def _github_enabled() -> bool:
+    return bool(BACKUP_GITHUB_REPO and BACKUP_GITHUB_TOKEN and db.path)
+
+
+def _github_headers(raw: bool = False) -> dict:
+    return {
+        "Authorization": f"Bearer {BACKUP_GITHUB_TOKEN}",
+        "Accept": (
+            "application/vnd.github.raw+json" if raw else "application/vnd.github+json"
+        ),
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-chat-bot-backup",
+    }
+
+
+def _github_file_url() -> str:
+    return (
+        f"https://api.github.com/repos/{BACKUP_GITHUB_REPO}/contents/"
+        f"{BACKUP_GITHUB_PATH}"
+    )
+
+
+async def _github_fetch_versions(limit: int) -> list[dict]:
+    """Newest-first [{"sha", "date"}] of every committed bot.db version."""
+    import httpx
+
+    url = f"https://api.github.com/repos/{BACKUP_GITHUB_REPO}/commits"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            url,
+            params={"path": BACKUP_GITHUB_PATH, "per_page": limit},
+            headers=_github_headers(),
+        )
+        resp.raise_for_status()
+        versions = []
+        for item in resp.json():
+            when = (
+                item.get("commit", {}).get("committer", {}).get("date") or ""
+            ).replace("Z", "+00:00")
+            try:
+                stamp = datetime.fromisoformat(when) if when else None
+            except ValueError:
+                stamp = None
+            versions.append({"sha": item.get("sha", ""), "date": stamp})
+        return versions
+
+
+async def _github_download(sha: str):
+    """Raw bytes of the snapshot committed as `sha` (None when unavailable)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(
+            _github_file_url(), params={"ref": sha}, headers=_github_headers(raw=True)
+        )
+        if resp.status_code != 200:
+            logger.debug(f"GitHub snapshot {sha[:8]}: HTTP {resp.status_code}")
+            return None
+        return resp.content
+
+
+async def _github_upload(data: bytes, message: str) -> bool:
+    """Commit the snapshot. The previous version stays in git history forever."""
+    import httpx
+
+    url = _github_file_url()
+    async with httpx.AsyncClient(timeout=60) as client:
+        sha = None
+        resp = await client.get(url, headers=_github_headers())
+        if resp.status_code == 200:
+            sha = resp.json().get("sha")
+        elif resp.status_code != 404:
+            logger.warning(
+                f"GitHub backup: cannot read current file (HTTP {resp.status_code})"
+            )
+            return False
+        body = {
+            "message": message,
+            "content": base64.b64encode(data).decode(),
+        }
+        if sha:
+            body["sha"] = sha
+        resp = await client.put(url, json=body, headers=_github_headers())
+        if resp.status_code not in (200, 201):
+            logger.warning(
+                f"GitHub backup failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+            return False
+        return True
+
+
 async def restore_db_from_backup(bot) -> None:
-    """Download the newest bot.db snapshot from the backup channel.
+    """Download the best bot.db snapshot from GitHub and/or the channel.
 
     Runs on startup, before any update is handled — this is what makes a
     redeployed bot continue where it stopped (users, coins, queue, chats).
+
+    EVERY recent snapshot (GitHub commits + channel messages) is probed and
+    the one holding the MOST members wins — so a bot.db pinned by a broken
+    run can never shadow the real backup, a local DB with more members than
+    any snapshot is never replaced by a smaller one, and a bigger (even
+    older) snapshot always beats a small fresh one.
     """
-    if not _backup_enabled():
-        return
-    try:
-        chat = await bot.get_chat(_backup_chat())
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"BACKUP_CHANNEL not usable ({e}) — "
-            "is the bot an ADMIN of that channel?"
-        )
+    global _RESTORE_SKIPPED
+    telegram_on = _backup_enabled()
+    github_on = _github_enabled()
+    if not telegram_on and not github_on:
         return
 
-    doc_msg = None
-    pinned = getattr(chat, "pinned_message", None)
-    if pinned is not None and _is_backup_doc(pinned):
-        doc_msg = pinned
-    if doc_msg is None:
-        history = getattr(bot, "get_chat_history", None)
-        if history is None:
-            logger.warning("This python-telegram-bot version has no get_chat_history")
-            return
+    candidates: list[dict] = []  # {"label", "date", "load": coro(path) -> bool}
+    telegram_failed = False
+    github_failed = False
+
+    # ── source 1: every committed version in the GitHub repo ──────
+    if github_on:
         try:
-            async for msg in history(_backup_chat(), limit=20):
-                if _is_backup_doc(msg):
-                    doc_msg = msg
-                    break
+            versions = await _github_fetch_versions(BACKUP_GITHUB_HISTORY)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not scan backup channel history: {e}")
+            logger.warning(f"GitHub backups unreachable: {e}")
+            github_failed = True
+            versions = []
+        for ver in versions:
+
+            async def _gh_load(path, sha=ver["sha"]):
+                try:
+                    data = await _github_download(sha)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"GitHub snapshot {sha[:8]} unreadable: {e}")
+                    return False
+                if not data:
+                    return False
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                return True
+
+            candidates.append(
+                {
+                    "label": f"github:{ver['sha'][:8]}",
+                    "date": ver.get("date"),
+                    "load": _gh_load,
+                }
+            )
+
+    # ── source 2: every bot.db message in the channel ─────────────
+    chat = None
+    if telegram_on:
+        try:
+            chat = await bot.get_chat(_backup_chat())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"BACKUP_CHANNEL not usable ({e}) — "
+                "is the bot an ADMIN of that channel?"
+            )
+            telegram_failed = True
+
+    seen: set = set()
+
+    def _add_channel_candidate(msg) -> None:
+        if not _is_backup_doc(msg):
             return
-    if doc_msg is None:
-        logger.info("No database backup in the channel yet — starting fresh.")
+        mid = getattr(msg, "message_id", None)
+        if mid is not None:
+            if mid in seen:
+                return
+            seen.add(mid)
+
+        async def _tg_load(path, message=msg):
+            try:
+                file = await message.document.get_file()
+                await file.download_to_drive(path)
+                return True
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Channel snapshot unreadable: {e}")
+                return False
+
+        candidates.append(
+            {
+                "label": f"telegram:{mid}",
+                "date": getattr(msg, "date", None),
+                "load": _tg_load,
+            }
+        )
+
+    if chat is not None:
+        history = getattr(bot, "get_chat_history", None)
+        if history is not None:
+            try:
+                async for msg in history(_backup_chat(), limit=BACKUP_SCAN_LIMIT):
+                    _add_channel_candidate(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Could not scan backup channel history: {e}")
+                telegram_failed = True
+        else:
+            logger.warning("This python-telegram-bot version has no get_chat_history")
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned is not None:
+            _add_channel_candidate(pinned)
+
+    source_failed = telegram_failed or github_failed
+
+    if not candidates:
+        if source_failed and not db.users:
+            logger.error(
+                "Backup sources unreachable and the local DB is empty — "
+                "uploads paused until a restore succeeds (see warnings above)."
+            )
+            _RESTORE_SKIPPED = True
+        else:
+            logger.info("No database backup found yet — starting fresh.")
+            _RESTORE_SKIPPED = False
         return
 
-    local_mtime = os.path.getmtime(db.path) if os.path.exists(db.path) else 0
-    if doc_msg.date and doc_msg.date.timestamp() <= local_mtime:
-        logger.info("Local DB is newer than the channel backup — keeping local.")
+    # ── probe candidates: how many members does each one hold? ────
+    best, best_count, best_path = None, -1, None
+    for i, cand in enumerate(candidates):
+        probe = f"{db.path}.probe{i}"
+        count = -1
+        try:
+            if await cand["load"](probe):
+                conn = sqlite3.connect(probe)
+                try:
+                    count = int(
+                        conn.execute("select count(*) from users").fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+        except Exception as e:  # noqa: BLE001 — skip an unreadable snapshot
+            logger.debug(f"Backup candidate {i} ({cand['label']}) unreadable: {e}")
+            count = -1
+        if count > best_count:
+            _remove_quiet(best_path)
+            best, best_count, best_path = cand, count, probe
+        else:
+            _remove_quiet(probe)
+
+    if best_path is None:
+        logger.error("Backups were found but none could be read.")
+        _RESTORE_SKIPPED = not bool(db.users)
         return
 
-    tmp_path = db.path + ".restoring"
-    file = await doc_msg.document.get_file()
-    await file.download_to_drive(tmp_path)
-    os.replace(tmp_path, db.path)
-    db.reload()
-    # The local DB now matches what the channel already holds — remember it
+    # ── decide: does the snapshot beat what we already have? ──────
+    if db.users:
+        if best_count < len(db.users):
+            logger.info(
+                f"Backup holds {best_count} members, local has "
+                f"{len(db.users)} — keeping local."
+            )
+            _remove_quiet(best_path)
+            _RESTORE_SKIPPED = False
+            return
+        if best_count == len(db.users):
+            # Same members: only a NEWER snapshot beats the local file.
+            # (A freshly created file always has a new mtime, so this check
+            # only ever applies to a DB that already holds members.)
+            local_mtime = (
+                os.path.getmtime(db.path) if os.path.exists(db.path) else 0
+            )
+            when = best.get("date")
+            if when is not None and when.timestamp() <= local_mtime:
+                logger.info(
+                    "Local DB is newer than the backup — keeping local."
+                )
+                _remove_quiet(best_path)
+                _RESTORE_SKIPPED = False
+                return
+        # More members in the snapshot → restore it no matter the dates:
+        # this is what recovers a bot that was started from zero.
+    else:
+        if best_count <= 0:
+            logger.info("No backup with members found — starting fresh.")
+            _remove_quiet(best_path)
+            _RESTORE_SKIPPED = False
+            return
+
+    try:
+        db.replace_file_with(best_path)
+    except Exception as e:  # noqa: BLE001 — never kill startup over this
+        logger.error(f"❌ Database restore failed: {e}")
+        _remove_quiet(best_path)
+        _RESTORE_SKIPPED = not bool(db.users)
+        return
+    # The local DB now matches what the backups already hold — remember it
     # so the startup upload skips it instead of re-sending an identical copy.
     _BACKUP_MSG["hash"] = db.snapshot_hash()
-    logger.info(f"✅ Database restored from channel backup ({len(db.users)} users).")
+    _BACKUP_MSG["gh_hash"] = _BACKUP_MSG["hash"]
+    _RESTORE_SKIPPED = False
+    logger.info(
+        f"✅ Database restored from {best['label']} ({len(db.users)} members)."
+    )
 
 
 async def _old_backup_ids(bot) -> set[int]:
-    """Ids of every backup doc already in the channel: the pinned one, the
-    recent ones and the one we sent last run. All are deleted after a new
-    upload so the channel keeps exactly one (current) backup message."""
-    ids: set[int] = set()
-    prev = _BACKUP_MSG.get("id")
-    if prev:
-        ids.add(prev)
-    try:
-        chat = await bot.get_chat(_backup_chat())
-        pinned = getattr(chat, "pinned_message", None)
-        if pinned is not None and _is_backup_doc(pinned):
-            ids.add(pinned.message_id)
-    except Exception:  # noqa: BLE001 — needs admin rights; history scan still runs
-        pass
+    """Ids of backup docs already in the channel, NEWEST FIRST: the recent
+    history, the one we sent last run and the pinned message. Only the ones
+    beyond BACKUP_KEEP are deleted after an upload — the channel always
+    keeps a small history so one bad upload can't destroy every copy."""
+    ids: list[int] = []
+
+    def _add(mid) -> None:
+        if mid is not None and mid not in ids:
+            ids.append(mid)
+
     history = getattr(bot, "get_chat_history", None)
     if history is not None:
         try:
             async for msg in history(_backup_chat(), limit=30):
                 if _is_backup_doc(msg):
-                    ids.add(msg.message_id)
+                    _add(msg.message_id)
         except Exception:  # noqa: BLE001
             pass
+    _add(_BACKUP_MSG.get("id"))
+    try:
+        chat = await bot.get_chat(_backup_chat())
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned is not None and _is_backup_doc(pinned):
+            _add(pinned.message_id)
+    except Exception:  # noqa: BLE001 — needs admin rights; history scan still runs
+        pass
     return ids
 
 
 async def upload_db_backup(bot) -> bool:
-    """Upload a fresh snapshot of the SQLite file to the backup channel.
+    """Push a fresh snapshot of the SQLite file to every online backup.
 
-    Uploads only when the database changed since the last backup, pins the new
-    snapshot and deletes every older one so the channel never fills up.
-    Returns True when a backup was actually sent.
+    GitHub: committed, so every previous version stays in git history
+    forever. Telegram channel: keeps the last BACKUP_KEEP snapshots.
+    Each target has its own change-hash, so one failing never blocks the
+    other. Returns True when at least one snapshot went out.
     """
-    if not _backup_enabled() or not os.path.exists(db.path):
+    if not (_backup_enabled() or _github_enabled()):
+        return False
+    if not os.path.exists(db.path):
+        return False
+    if _RESTORE_SKIPPED:
+        # A backup source exists that this process never loaded. Uploading
+        # would put an empty database in the place of the REAL one.
+        logger.error(
+            "Backup upload skipped — the backups were NOT restored "
+            "(see startup logs). Fix the source access and restart."
+        )
         return False
     try:
         db.flush()  # every pending row on disk, WAL merged into bot.db
         digest = db.snapshot_hash()
-        if digest == _BACKUP_MSG["hash"]:
-            logger.debug("Backup skipped — database unchanged since last backup.")
-            return False
-        old_ids = await _old_backup_ids(bot)
-        with open(db.path, "rb") as fh:
-            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-            msg = await bot.send_document(
-                chat_id=_backup_chat(),
-                document=fh,
-                filename="bot.db",
-                caption=f"🔄 Database backup — {stamp}",
-            )
-        try:
-            await bot.pin_chat_message(
-                _backup_chat(), msg.message_id, disable_notification=True
-            )
-        except Exception as e:  # noqa: BLE001 — pin needs the right admin rights
-            logger.debug(f"Could not pin the backup message: {e}")
-        for old_id in old_ids:
-            if old_id == msg.message_id:
-                continue
-            try:
-                await bot.delete_message(_backup_chat(), old_id)
-            except Exception as e:  # noqa: BLE001 — already deleted is fine
-                logger.debug(f"Could not delete old backup message {old_id}: {e}")
-        _BACKUP_MSG["id"] = msg.message_id
-        _BACKUP_MSG["hash"] = digest
-        logger.info("Backup sent")
-        return True
+        stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        members = len(db.users)
+        delivered = False
+
+        # 1) GitHub — the previous version can never be lost
+        if _github_enabled():
+            if digest == _BACKUP_MSG.get("gh_hash"):
+                logger.debug("GitHub backup skipped — database unchanged.")
+            else:
+                try:
+                    with open(db.path, "rb") as fh:
+                        data = fh.read()
+                    if await _github_upload(
+                        data, f"bot.db — {stamp} — {members} members"
+                    ):
+                        _BACKUP_MSG["gh_hash"] = digest
+                        delivered = True
+                        logger.info(
+                            f"GitHub backup sent ({members} members, "
+                            "previous versions kept in history)"
+                        )
+                    else:
+                        logger.warning("GitHub backup did not go through.")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"GitHub backup failed: {e}")
+
+        # 2) Telegram channel — keeps the last BACKUP_KEEP snapshots
+        if _backup_enabled():
+            if digest == _BACKUP_MSG["hash"]:
+                logger.debug("Channel backup skipped — database unchanged.")
+            else:
+                try:
+                    old_ids = await _old_backup_ids(bot)
+                    with open(db.path, "rb") as fh:
+                        msg = await bot.send_document(
+                            chat_id=_backup_chat(),
+                            document=fh,
+                            filename="bot.db",
+                            caption=(
+                                f"🔄 Database backup — {stamp} "
+                                f"({members} members)"
+                            ),
+                        )
+                    try:
+                        await bot.pin_chat_message(
+                            _backup_chat(),
+                            msg.message_id,
+                            disable_notification=True,
+                        )
+                    except Exception as e:  # noqa: BLE001 — needs admin rights
+                        logger.debug(f"Could not pin the backup message: {e}")
+                    for old_id in old_ids[max(BACKUP_KEEP - 1, 0):]:
+                        if old_id == msg.message_id:
+                            continue
+                        try:
+                            await bot.delete_message(_backup_chat(), old_id)
+                        except Exception as e:  # noqa: BLE001 — already gone
+                            logger.debug(
+                                f"Could not delete old backup {old_id}: {e}"
+                            )
+                    _BACKUP_MSG["id"] = msg.message_id
+                    _BACKUP_MSG["hash"] = digest
+                    delivered = True
+                    logger.info(
+                        f"Channel backup sent "
+                        f"(keeping the last {BACKUP_KEEP} snapshots)"
+                    )
+                except Exception as e:  # noqa: BLE001 — other target must live
+                    logger.warning(f"Channel backup failed: {e}")
+
+        return delivered
     except Exception as e:  # noqa: BLE001 — backup must never kill the bot
         logger.warning(f"Backup failed: {e}")
         return False
@@ -790,6 +1126,9 @@ async def _backup_loop(bot) -> None:
     while True:
         await asyncio.sleep(BACKUP_INTERVAL)
         try:
+            if _RESTORE_SKIPPED:
+                # A transient failure at boot must not block backups forever.
+                await restore_db_from_backup(bot)
             await upload_db_backup(bot)
         except asyncio.CancelledError:
             raise
@@ -3396,20 +3735,25 @@ async def on_startup(application):
     backup_bot = await _get_backup_bot(application.bot)
     await restore_db_from_backup(backup_bot)
     await _startup_checks(application)
-    if _backup_enabled():
+    if _backup_enabled() or _github_enabled():
         await upload_db_backup(backup_bot)
         application.create_task(_backup_loop(backup_bot))
-        who = "dedicated bot" if backup_bot is not application.bot else "main bot"
+        targets = []
+        if _github_enabled():
+            targets.append(f"github:{BACKUP_GITHUB_REPO}")
+        if _backup_enabled():
+            who = "dedicated bot" if backup_bot is not application.bot else "main bot"
+            targets.append(f"channel {BACKUP_CHANNEL} via {who}")
         logger.info(
-            f"💾 Auto-backup enabled → channel {BACKUP_CHANNEL} "
-            f"every {BACKUP_INTERVAL // 60} min (only if the DB changed, via {who})."
+            f"💾 Auto-backup enabled → {' + '.join(targets)} "
+            f"every {BACKUP_INTERVAL // 60} min (only when the DB changed)."
         )
 
 
 async def on_shutdown(application):
     """Take one final snapshot so the next deploy resumes exactly here."""
     try:
-        if _backup_enabled():
+        if _backup_enabled() or _github_enabled():
             await upload_db_backup(await _get_backup_bot(application.bot))
     finally:
         if _dedicated_backup_bot is not None:
