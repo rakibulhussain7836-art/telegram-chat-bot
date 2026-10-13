@@ -840,6 +840,7 @@ async def restore_db_from_backup(bot) -> None:
                 {
                     "label": f"github:{ver['sha'][:8]}",
                     "date": ver.get("date"),
+                    "source": "github",
                     "load": _gh_load,
                 }
             )
@@ -880,6 +881,7 @@ async def restore_db_from_backup(bot) -> None:
             {
                 "label": f"telegram:{mid}",
                 "date": getattr(msg, "date", None),
+                "source": "channel",
                 "load": _tg_load,
             }
         )
@@ -982,10 +984,17 @@ async def restore_db_from_backup(bot) -> None:
         _remove_quiet(best_path)
         _RESTORE_SKIPPED = not bool(db.users)
         return
-    # The local DB now matches what the backups already hold — remember it
-    # so the startup upload skips it instead of re-sending an identical copy.
-    _BACKUP_MSG["hash"] = db.snapshot_hash()
-    _BACKUP_MSG["gh_hash"] = _BACKUP_MSG["hash"]
+    # The local DB now equals ONE of the snapshots. Mark only THAT source as
+    # up to date (so it isn't re-sent) and leave the other one pending —
+    # a channel restore must still seed GitHub, a GitHub restore must still
+    # seed the channel. Otherwise one target could stay empty forever.
+    digest = db.snapshot_hash()
+    if best.get("source") == "github":
+        _BACKUP_MSG["gh_hash"] = digest
+        _BACKUP_MSG["hash"] = None
+    else:
+        _BACKUP_MSG["hash"] = digest
+        _BACKUP_MSG["gh_hash"] = None
     _RESTORE_SKIPPED = False
     logger.info(
         f"✅ Database restored from {best['label']} ({len(db.users)} members)."

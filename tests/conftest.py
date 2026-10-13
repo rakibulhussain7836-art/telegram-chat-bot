@@ -14,6 +14,12 @@ if str(ROOT) not in sys.path:
 os.environ["DB_PATH"] = ""
 # Keep the suite fast and deterministic — no frame-by-frame animations.
 os.environ["BOT_ANIMATIONS"] = "0"
+# Backup targets must never be REAL: load_dotenv() would otherwise pull the
+# developer's .env in and tests would send files to live Telegram/GitHub.
+os.environ["BACKUP_CHANNEL"] = ""
+os.environ["BACKUP_BOT_TOKEN"] = ""
+os.environ["BACKUP_GITHUB_REPO"] = ""
+os.environ["BACKUP_GITHUB_TOKEN"] = ""
 
 
 @pytest.fixture

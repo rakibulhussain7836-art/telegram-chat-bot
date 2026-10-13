@@ -2404,3 +2404,122 @@ def test_github_backup_survives_a_broken_channel(tmp_path, monkeypatch):
     assert run(bot.upload_db_backup(BrokenChannelBot())) is True  # GitHub went out
     assert bot._BACKUP_MSG["gh_hash"] is not None  # committed
     assert bot._BACKUP_MSG["hash"] is None  # channel still pending, no crash
+
+
+def test_a_channel_restore_still_seeds_github(tmp_path, monkeypatch):
+    """The file was loaded FROM the channel — GitHub has never seen it, so
+    the first upload must commit it there even though nothing changed."""
+    from database import Database
+
+    backup_path = _backup_file_with(tmp_path, "channel.db", [111, 222])
+    local = Database(path=str(tmp_path / "bot.db"))
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_REPO", "me/backups")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_TOKEN", "token")
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(
+        bot, "_BACKUP_MSG", {"id": None, "hash": None, "gh_hash": None}
+    )
+
+    async def no_github_versions(limit):
+        return []
+
+    monkeypatch.setattr(bot, "_github_fetch_versions", no_github_versions)
+
+    run(bot.restore_db_from_backup(_channel_with_backup(backup_path)))
+    assert len(local.users) == 2
+    assert bot._BACKUP_MSG["hash"] is not None  # channel already holds it
+    assert bot._BACKUP_MSG["gh_hash"] is None  # GitHub does not
+
+    sent = {}
+
+    async def fake_upload(data, message):
+        sent["message"] = message
+        return True
+
+    monkeypatch.setattr(bot, "_github_upload", fake_upload)
+
+    channel_uploads = []
+
+    class Recorder:
+        async def send_document(self, **kwargs):
+            channel_uploads.append(kwargs)
+            return SimpleNamespace(message_id=99)
+
+        async def pin_chat_message(self, *args, **kwargs):
+            pass
+
+        async def delete_message(self, *args, **kwargs):
+            pass
+
+    assert run(bot.upload_db_backup(Recorder())) is True
+    assert "2 members" in sent["message"]
+    assert channel_uploads == []  # channel copy already exists → skipped
+
+
+def test_a_github_restore_still_seeds_the_channel(tmp_path, monkeypatch):
+    """Mirror of the test above: restored from GitHub → the channel gets its
+    first copy right away."""
+    from datetime import datetime
+    from database import Database
+
+    gh_file = _backup_file_with(tmp_path, "gh.db", [111, 222])
+    with open(gh_file, "rb") as fh:
+        gh_bytes = fh.read()
+    local = Database(path=str(tmp_path / "bot.db"))
+
+    async def fake_versions(limit):
+        return [{"sha": "abc12345", "date": datetime.now()}]
+
+    async def fake_download(sha):
+        return gh_bytes
+
+    class NoChannelHistory:
+        async def get_chat(self, chat_id):
+            class Chat:
+                pinned_message = None
+
+            return Chat()
+
+    monkeypatch.setattr(bot, "db", local)
+    monkeypatch.setattr(bot, "BACKUP_CHANNEL", "-100123")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_REPO", "me/backups")
+    monkeypatch.setattr(bot, "BACKUP_GITHUB_TOKEN", "token")
+    monkeypatch.setattr(bot, "_github_fetch_versions", fake_versions)
+    monkeypatch.setattr(bot, "_github_download", fake_download)
+    monkeypatch.setattr(bot, "_RESTORE_SKIPPED", False)
+    monkeypatch.setattr(
+        bot, "_BACKUP_MSG", {"id": None, "hash": None, "gh_hash": None}
+    )
+
+    run(bot.restore_db_from_backup(NoChannelHistory()))
+    assert len(local.users) == 2
+    assert bot._BACKUP_MSG["gh_hash"] is not None  # GitHub already holds it
+    assert bot._BACKUP_MSG["hash"] is None  # channel does not
+
+    gh_calls = []
+
+    async def fake_upload(data, message):
+        gh_calls.append(message)
+        return True
+
+    monkeypatch.setattr(bot, "_github_upload", fake_upload)
+
+    channel_uploads = []
+
+    class Recorder:
+        async def send_document(self, **kwargs):
+            channel_uploads.append(kwargs)
+            return SimpleNamespace(message_id=77)
+
+        async def pin_chat_message(self, *args, **kwargs):
+            pass
+
+        async def delete_message(self, *args, **kwargs):
+            pass
+
+    assert run(bot.upload_db_backup(Recorder())) is True
+    assert len(channel_uploads) == 1  # channel seeded
+    assert gh_calls == []  # GitHub already has this exact snapshot → skipped
