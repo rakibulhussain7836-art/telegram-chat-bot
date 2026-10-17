@@ -50,6 +50,7 @@ GUY_SEARCH_COST = 2        # coins per "Chat With Guy" search (Random stays free
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
 CHAT_REQUEST_COST = 2      # coins to send a chat request from Nearby / by ID
 DIRECT_MESSAGE_COST = 1    # coins to start a Direct Message from a profile card
+LIST_MESSAGE_COST = 2      # flat fee for "📋 Send Message to List" broadcasts
 NOTIFY_COST = 1            # coins to enable 🔔 "notify me" alerts (VIP: free)
 REMINDER_HOUR_START = 9    # daily reminder window (local bot time)
 REMINDER_HOUR_END = 22

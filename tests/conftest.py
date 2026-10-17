@@ -37,6 +37,8 @@ def fresh_db():
         bot.db._by_public_id.clear()
         # Force-join answers must never leak between tests
         bot._MEMBER_CACHE.clear()
+        # 🗑 chat logs are keyed by user id — they must not survive a reset
+        bot._CHAT_LOGS.clear()
 
     clear()
     yield bot.db

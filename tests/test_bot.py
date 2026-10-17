@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import bot
+from keyboards import SECURE_LABEL, SECURE_ON_LABEL
 from database import (
     BAN_REPORT_THRESHOLD,
     ChatState,
@@ -70,21 +71,46 @@ class FakeBot:
     def __init__(self):
         self.sent = []
         self.photos = []
+        self.deleted = []      # (chat_id, message_id) pairs
+        self.pins = []         # (chat_id, message_id) pairs
         self.member_status = "member"   # force-join gate: "left" = not joined
+        self._seq = 0
 
     async def get_chat_member(self, chat_id, user_id):
         return SimpleNamespace(status=self.member_status)
 
+    def _next_id(self):
+        self._seq += 1
+        return self._seq
+
     async def send_message(self, chat_id=None, text=None, **kwargs):
-        self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+        message_id = self._next_id()
+        self.sent.append(
+            {"chat_id": chat_id, "text": text, "message_id": message_id, **kwargs}
+        )
+        return SimpleNamespace(message_id=message_id)
 
     async def send_photo(self, chat_id=None, photo=None, caption=None, **kwargs):
+        message_id = self._next_id()
         self.photos.append({
             "chat_id": chat_id,
             "photo": photo,
             "caption": caption,
             "reply_markup": kwargs.get("reply_markup"),
+            "message_id": message_id,
         })
+        return SimpleNamespace(message_id=message_id)
+
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        self.sent.append({
+            "chat_id": chat_id, "text": text, "message_id": message_id, **kwargs
+        })
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+
+    async def pin_chat_message(self, chat_id, message_id):
+        self.pins.append((chat_id, message_id))
 
 
 class FakeContext:
@@ -261,7 +287,7 @@ def test_pairing_after_girl_search_notifies_partner(fresh_db):
     # ONE card per user: the partner's photo carries the info + buttons
     assert len(ctx.bot.photos) == 2
     for card in ctx.bot.photos:
-        assert "Partner found" in card["caption"]
+        assert "found partner for you" in card["caption"]
         assert card["reply_markup"] is not None
     assert ctx.bot.sent == []  # never a separate text message underneath
 
@@ -372,9 +398,9 @@ def test_animated_search_rewrites_the_frame_when_the_user_cancels(
     assert len(edits) == 1
     assert "Search cancelled." in edits[0]
     assert "-2" in edits[0]  # the Girl-search charge is still shown
-    assert any(
-        b.callback_data == "find_partner" for b in _buttons(markups[-1])
-    )
+    # back to the reference bot's four-door menu
+    labels = [b.callback_data for b in _buttons(markups[-1])]
+    assert {"contacts", "blocked_list", "settings", "my_profile"} <= set(labels)
 
 
 # ── Photo/caption card animation helpers ────────────────────────
@@ -572,7 +598,7 @@ def test_start_ends_an_active_chat(fresh_db):
 
     assert fresh_db.get_user(1).state == ChatState.IDLE
     assert fresh_db.get_user(2).state == ChatState.IDLE
-    assert any("partner has left" in m["text"] for m in ctx.bot.sent)
+    assert any("has left the chat" in m["text"] for m in ctx.bot.sent)
 
 
 # ── Reports ─────────────────────────────────────────────────────
@@ -747,6 +773,46 @@ def test_id_search_shows_profile_card(fresh_db):
     labels = [b.text for b in _buttons(reply["reply_markup"])]
     assert any("Like" in label for label in labels)
     assert any(f"{CHAT_REQUEST_COST}" in label for label in labels)
+
+
+def test_own_profile_id_is_tappable_deep_link(fresh_db, monkeypatch):
+    monkeypatch.setattr(bot, "_bot_username", "talkNhappybot")
+    user = register(fresh_db, 1)
+    text = bot.build_profile_text(user)
+    slug = bot.public_id_slug(user)
+    assert (
+        f"[{bot.format_public_id(user)}]"
+        f"(https://t.me/talkNhappybot?start=chat_{slug})" in text
+    )
+
+
+def test_start_own_id_deep_link_keeps_chat_active(fresh_db):
+    me = register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+
+    ctx = FakeContext()
+    ctx.args = [f"chat_{bot.public_id_slug(me)}"]
+    update = FakeUpdate(1)
+    run(bot.start_command(update, ctx))
+
+    assert "your own ID" in update.message.replies[0]["text"]
+    assert fresh_db.get_user(1).state == ChatState.CHATTING
+    assert fresh_db.get_user(1).partner_id == 2
+    assert not any("has left the chat" in m["text"] for m in ctx.bot.sent)
+
+
+def test_start_stale_deep_link_reports_missing(fresh_db):
+    register(fresh_db, 1)
+    ctx = FakeContext()
+    ctx.args = ["chat_user_zzzz"]
+    update = FakeUpdate(1)
+
+    run(bot.start_command(update, ctx))
+
+    assert "no longer exists" in update.message.replies[0]["text"]
 
 
 def test_id_search_with_unknown_id(fresh_db):
@@ -1277,7 +1343,7 @@ def test_direct_message_charges_one_coin_and_pairs(fresh_db):
     assert fresh_db.get_user(1).state == ChatState.CHATTING
     assert fresh_db.get_user(2).state == ChatState.CHATTING
     assert fresh_db.get_user(1).coins == STARTING_COINS - DIRECT_MESSAGE_COST
-    assert any("Partner found" in p["caption"] for p in context.bot.photos)
+    assert any("found partner for you" in p["caption"] for p in context.bot.photos)
     assert "Direct chat started" in query.edits[-1]["text"]
     assert f"-{DIRECT_MESSAGE_COST}" in query.edits[-1]["text"]
 
@@ -1447,7 +1513,7 @@ def test_notify_on_end_pings_when_chat_ends(fresh_db):
 
     assert fresh_db.get_user(1).state == ChatState.IDLE
     assert any(
-        m["chat_id"] == 1 and "chat has ended" in m["text"]
+        "Choose who you want to chat with" in m["text"]
         for m in context.bot.sent
     )
     assert fresh_db.get_user(1).notify_on_end is False
@@ -1646,11 +1712,321 @@ def test_reply_keyboard_text_is_relayed_while_chatting(fresh_db):
     fresh_db.pair_users(1, 2)
 
     context = FakeContext()
-    update = FakeUpdate(1, message=FakeMessage(text=bot.NEW_CHAT_LABEL))
+    update = FakeUpdate(1, message=FakeMessage(text="hello from the bar 👋"))
     asyncio.run(bot.relay_message(update, context))
 
     assert fresh_db.get_user(1).state == ChatState.CHATTING
     assert any(m["chat_id"] == 2 for m in context.bot.sent)
+
+
+# ── MeChat reference layout ───────────────────────────────────────
+
+def _rows(markup):
+    """[[first row], [second row], ...] for a reply/inline keyboard."""
+    return [[b.text for b in row] for row in markup.keyboard]
+
+
+def tap_bar(user_id, text, context=None):
+    """Press a button on the persistent bar under the message field."""
+    context = context if context is not None else FakeContext()
+    update = FakeUpdate(user_id, message=FakeMessage(text=text))
+    asyncio.run(bot.relay_message(update, context))
+    return update, context
+
+
+def test_bar_matches_the_reference_layout():
+    assert _rows(bot.main_reply_keyboard()) == [
+        [SECURE_LABEL, bot.CONTACT_PROFILE_LABEL],
+        [bot.END_CHAT_LABEL, bot.DELETE_LABEL],
+        [bot.NEW_CHAT_LABEL],
+        [bot.BROWSE_LABEL, bot.NEARBY_LABEL],
+    ]
+    on = bot.main_reply_keyboard(secure=True)
+    assert _rows(on)[0] == [SECURE_ON_LABEL, bot.CONTACT_PROFILE_LABEL]
+    assert on.is_persistent is True
+    assert on.resize_keyboard is True
+
+
+def test_idle_menu_matches_the_reference_doors():
+    labels = [b.text for row in bot.main_menu_keyboard().inline_keyboard for b in row]
+    assert labels == [
+        "📇 Contact List",
+        "🚫 Blocked Users",
+        "⚙️ Advanced Settings ⚙️",
+        "📝 Edit Profile Information",
+    ]
+
+
+def test_choose_menu_matches_the_reference():
+    rows = [
+        [b.text for b in row] for row in bot.search_choice_keyboard().inline_keyboard
+    ]
+    assert rows == [
+        ["🎲 Random(Free)"],
+        ["🐒 Chat With Guy", "💃 Chat With Girl"],
+    ]
+
+
+def test_settings_menu_keeps_every_editor_reachable():
+    labels = [b.text for row in bot.settings_keyboard().inline_keyboard for b in row]
+    assert "🔎 Find by ID" in labels
+    assert "📷 Set Profile Photo" in labels
+
+
+def test_searching_text_matches_the_reference():
+    text = bot.SEARCHING_TEXT.format(count=7)
+    assert "Searching for your anonymous contact" in text
+    assert "-Random Search" in text
+    assert "7 people searching" in text
+
+
+def test_match_card_carries_the_persistent_bar(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+    asyncio.run(bot.notify_partner_found(context, 1, 2))
+
+    assert len(context.bot.photos) == 2
+    for card in context.bot.photos:
+        assert "found partner for you" in card["caption"]
+        assert _rows(card["reply_markup"])[0] == [
+            SECURE_LABEL, bot.CONTACT_PROFILE_LABEL
+        ]
+
+
+# ── Bar buttons while chatting ────────────────────────────────────
+
+def test_end_chat_bar_leaves_both_sides_with_the_reference_notice(fresh_db):
+    _paired(fresh_db)
+    update, context = tap_bar(1, bot.END_CHAT_LABEL)
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert fresh_db.get_user(2).state == ChatState.IDLE
+
+    to1 = [m["text"] for m in context.bot.sent if m["chat_id"] == 1]
+    to2 = [m["text"] for m in context.bot.sent if m["chat_id"] == 2]
+    assert any("You left the chat" in t for t in to1)
+    assert any("has left the chat" in t for t in to2)
+    assert any("within 30 minutes" in t for t in to1)
+    assert any("/delet_messages_" in t for t in to1)
+
+    choice = next(
+        m for m in context.bot.sent
+        if m["chat_id"] == 1 and "Choose who you want to chat with" in m["text"]
+    )
+    assert [b.callback_data for b in _buttons(choice["reply_markup"])] == [
+        "search_random", "search_guy", "search_girl"
+    ]
+
+
+def test_end_chat_bar_refused_outside_a_chat(fresh_db):
+    register(fresh_db, 1)
+    update, _ = tap_bar(1, bot.END_CHAT_LABEL)
+    assert "not in a chat" in update.message.replies[-1]["text"]
+
+
+def test_new_chat_bar_while_chatting_ends_the_chat_and_offers_a_choice(fresh_db):
+    _paired(fresh_db)
+    update, context = tap_bar(1, bot.NEW_CHAT_LABEL)
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert fresh_db.get_user(2).state == ChatState.IDLE
+    choice = next(
+        m for m in context.bot.sent
+        if m["chat_id"] == 1 and "Choose who you want to chat with" in m["text"]
+    )
+    assert [b.callback_data for b in _buttons(choice["reply_markup"])] == [
+        "search_random", "search_guy", "search_girl"
+    ]
+
+
+def test_newchat_command_while_chatting_ends_the_chat_first(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+    asyncio.run(bot.newchat_command(FakeUpdate(1), context))
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert any(
+        "Choose who you want to chat with" in m["text"]
+        for m in context.bot.sent
+    )
+
+
+def test_find_command_while_chatting_ends_the_chat_first(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+    asyncio.run(bot.find_command(FakeUpdate(1), context))
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert any(
+        "Choose who you want to chat with" in m["text"]
+        for m in context.bot.sent
+    )
+
+
+def test_begin_search_while_chatting_ends_the_chat_and_returns_the_choice(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+
+    text, markup, mode = run(bot.begin_search(context, 1, Gender.ANY))
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert fresh_db.get_user(2).state == ChatState.IDLE
+    assert "Choose who you want to chat with" in text
+    assert [b.callback_data for b in _buttons(markup)] == [
+        "search_random", "search_guy", "search_girl"
+    ]
+    # the 🗑 delete hint still went out to both sides underneath
+    assert any("/delet_messages_" in m["text"] for m in context.bot.sent)
+
+
+def test_find_partner_callback_while_chatting_ends_the_chat(fresh_db):
+    _paired(fresh_db)
+    query, _ = press(1, "find_partner")
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert "Choose who you want to chat with" in query.edits[-1]["text"]
+    assert [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])] == [
+        "search_random", "search_guy", "search_girl"
+    ]
+
+
+def test_secure_chat_bar_notifies_both_and_flips_the_label(fresh_db):
+    _paired(fresh_db)
+    _, context = tap_bar(1, SECURE_LABEL)
+
+    assert fresh_db.get_user(1).secure_chat is True
+    assert fresh_db.get_user(2).secure_chat is True
+    for uid in (1, 2):
+        notice = next(
+            m for m in context.bot.sent
+            if m["chat_id"] == uid and "Private chat activated" in m["text"]
+        )
+        assert _rows(notice["reply_markup"])[0][0] == SECURE_ON_LABEL
+
+
+def test_secure_chat_bar_accepts_the_on_label_to_switch_back(fresh_db):
+    _paired(fresh_db)
+    tap_bar(1, SECURE_LABEL)
+    _, context = tap_bar(1, SECURE_ON_LABEL)
+
+    assert fresh_db.get_user(1).secure_chat is False
+    assert fresh_db.get_user(2).secure_chat is False
+    assert any("deactivated" in m["text"] for m in context.bot.sent)
+
+
+def test_secure_chat_bar_refused_outside_a_chat(fresh_db):
+    register(fresh_db, 1)
+    update, _ = tap_bar(1, SECURE_LABEL)
+    assert "not in a chat" in update.message.replies[-1]["text"]
+
+
+def test_contact_profile_bar_shows_the_partner_card(fresh_db):
+    _paired(fresh_db)
+    update, _ = tap_bar(1, bot.CONTACT_PROFILE_LABEL)
+
+    reply = update.message.replies[-1]
+    assert "Age:" in reply["text"] and "ID:" in reply["text"]
+    labels = [b.callback_data for b in _buttons(reply["reply_markup"])]
+    assert "pback" in labels
+    assert "dm_2" in labels
+
+
+def test_contact_profile_bar_refused_outside_a_chat(fresh_db):
+    register(fresh_db, 1)
+    update, _ = tap_bar(1, bot.CONTACT_PROFILE_LABEL)
+    assert "not in a chat" in update.message.replies[-1]["text"]
+
+
+def test_browse_and_nearby_bars_work_while_chatting(fresh_db):
+    _paired(fresh_db)
+
+    update, _ = tap_bar(1, bot.BROWSE_LABEL)
+    assert "Who do you want to see" in update.message.replies[-1]["text"]
+
+    update, _ = tap_bar(1, bot.NEARBY_LABEL)
+    assert "Nearby People" in update.message.replies[-1]["text"]
+
+
+# ── 🗑 Delete Messages ────────────────────────────────────────────
+
+def _relay_text(context, from_id, text="secret"):
+    update = FakeUpdate(from_id, message=FakeMessage(text=text))
+    asyncio.run(bot.relay_message(update, context))
+    return context.bot.sent[-1]
+
+
+def test_delete_messages_bar_wipes_what_you_sent(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+    relayed = _relay_text(context, 1)
+    assert relayed["chat_id"] == 2
+
+    update, context = tap_bar(1, bot.DELETE_LABEL, context)
+
+    assert (2, relayed["message_id"]) in context.bot.deleted
+    assert any("Deleted 1 message" in r["text"] for r in update.message.replies)
+    # a second tap finds an empty log
+    update, context = tap_bar(1, bot.DELETE_LABEL, context)
+    assert any(
+        "nothing to delete" in r["text"].lower() for r in update.message.replies
+    )
+
+
+def test_delete_messages_bar_respects_the_30_minute_window(fresh_db):
+    import time
+
+    _paired(fresh_db)
+    context = FakeContext()
+    _relay_text(context, 1)          # a message that must now stay undeleted
+    fresh_db.end_chat(1)
+    bot._chat_log(1)["partner"] = 2
+    bot._chat_log(2)["ended_at"] = time.time() - 3600
+
+    update, context = tap_bar(1, bot.DELETE_LABEL, context)
+
+    assert context.bot.deleted == []
+    assert any("30 minutes" in r["text"] for r in update.message.replies)
+
+
+def test_delet_messages_command_wipes_the_last_chat(fresh_db):
+    _paired(fresh_db)
+    context = FakeContext()
+    relayed = _relay_text(context, 1)
+    slug = bot._delete_slug(fresh_db.get_user(1))
+
+    update = FakeUpdate(1, message=FakeMessage(text=f"/delet_messages_{slug}"))
+    asyncio.run(bot.delete_messages_command(update, context))
+
+    assert (2, relayed["message_id"]) in context.bot.deleted
+
+
+# ── 📌 pinned promo ───────────────────────────────────────────────
+
+def test_promo_is_sent_once_and_pinned(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+
+    asyncio.run(bot.send_promo(context, 1))
+    asyncio.run(bot.send_promo(context, 1))
+
+    promos = [m for m in context.bot.sent if "Start Random Chat" in m["text"]]
+    assert len(promos) == 1
+    # sent once, but kept pinned (re-pinned on every later /start)
+    assert set(context.bot.pins) == {(1, promos[0]["message_id"])}
+    assert "search_random" in [
+        b.callback_data for b in _buttons(promos[0]["reply_markup"])
+    ]
+
+
+def test_start_sends_the_pinned_promo_only_once(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+
+    asyncio.run(bot.start_command(FakeUpdate(1), context))
+    asyncio.run(bot.start_command(FakeUpdate(1), context))
+
+    promos = [m for m in context.bot.sent if "Start Random Chat" in m["text"]]
+    assert len(promos) == 1
 
 
 # ── Browse / swipe ─────────────────────────────────────────────
@@ -1714,6 +2090,30 @@ def test_swipe_out_of_range_is_refused(fresh_db):
 
     assert query.answers[-1]["text"] == "No more profiles."
     assert query.edits == []
+
+
+def test_browse_keyboard_keeps_three_option_rows_always():
+    option_rows = [
+        ["browse_more"],
+        ["browse_swipe"],
+        ["browse_msg"],
+    ]
+    for has_more in (True, False):
+        markup = bot.browse_keyboard(has_more, pairs=[])
+        rows = [[b.callback_data for b in row] for row in markup.inline_keyboard]
+        for expected in option_rows:
+            assert expected in rows, f"missing {expected} when has_more={has_more}"
+
+
+def test_browse_more_when_exhausted_answers_alert(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+
+    query, _ = press(1, "browse_more", context)
+
+    assert query.answers[-1]["show_alert"] is True
+    assert "everyone" in query.answers[-1]["text"]
+    assert context.user_data.get("browse_ids") is None
 
 
 # ── VIP ────────────────────────────────────────────────────────
@@ -1819,6 +2219,7 @@ def test_direct_message_is_hidden_until_viewed(fresh_db):
     context = FakeContext()
     context.user_data["browse_ids"] = [2]
     context.user_data["awaiting_broadcast"] = True
+    before = fresh_db.get_user(sender.user_id).coins
 
     update = FakeUpdate(1, message=FakeMessage(text="secret hello"))
     asyncio.run(bot.relay_message(update, context))
@@ -1831,6 +2232,55 @@ def test_direct_message_is_hidden_until_viewed(fresh_db):
     assert not any("secret hello" in m["text"] for m in context.bot.sent)
     # Content is stored, waiting to be revealed
     assert fresh_db.pending_dms[receiver.user_id]["text"] == "secret hello"
+    # The list broadcast costs a flat 2 coins, charged on delivery
+    assert fresh_db.get_user(sender.user_id).coins == before - bot.LIST_MESSAGE_COST
+    assert f"-{bot.LIST_MESSAGE_COST}" in update.message.replies[-1]["text"]
+
+
+def test_broadcast_prompt_mentions_the_cost(fresh_db):
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    context = FakeContext()
+    context.user_data["browse_ids"] = [2]
+
+    query, _ = press(1, "browse_msg", context)
+
+    assert str(bot.LIST_MESSAGE_COST) in query.edits[-1]["text"]
+    assert context.user_data["awaiting_broadcast"] is True
+
+
+def test_broadcast_refused_without_coins(fresh_db):
+    sender = register(fresh_db, 1)
+    receiver = register(fresh_db, 2)
+    sender.coins = 0
+    context = FakeContext()
+    context.user_data["browse_ids"] = [2]
+    context.user_data["awaiting_broadcast"] = True
+
+    update = FakeUpdate(1, message=FakeMessage(text="hello everyone"))
+    asyncio.run(bot.relay_message(update, context))
+
+    reply = update.message.replies[-1]["text"]
+    assert "Not enough Coins" in reply
+    assert fresh_db.get_user(1).coins == 0
+    assert fresh_db.pending_dms.get(receiver.user_id) is None
+    assert not any(
+        m["chat_id"] == receiver.user_id and "direct message" in m["text"]
+        for m in context.bot.sent
+    )
+
+
+def test_broadcast_empty_message_is_free_cancel(fresh_db):
+    user = register(fresh_db, 1)
+    context = FakeContext()
+    context.user_data["browse_ids"] = [2]
+    context.user_data["awaiting_broadcast"] = True
+
+    update = FakeUpdate(1, message=FakeMessage(text="   "))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert "cancelled" in update.message.replies[-1]["text"]
+    assert fresh_db.get_user(user.user_id).coins == STARTING_COINS
 
 
 def test_view_msg_reveals_stored_dm(fresh_db):

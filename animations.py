@@ -378,11 +378,15 @@ async def animate_photo_card(
     reply_markup=None,
     parse_mode=None,
     interval: float = 0.45,
+    on_sent=None,
 ) -> bool:
     """
     Send `photo` with the first frame as its caption, then 'type' through
     the remaining frames — the buttons land with the final frame, so the
     whole card is ONE message (photo + info + buttons).
+
+    `on_sent` (if given) is called with the sent Message so the caller can
+    remember where the card lives (needed to flip it in place later).
 
     Returns True when the photo went out (callers may then skip their
     text fallback), False when the photo could not be sent.
@@ -393,13 +397,15 @@ async def animate_photo_card(
 
     if not ANIMATIONS_ENABLED:
         try:
-            await bot.send_photo(
+            msg = await bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
                 caption=frames[-1],
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
+            if on_sent is not None:
+                on_sent(msg)
             return True
         except Exception as e:  # noqa: BLE001
             logger.debug(f"photo card skipped: {e}")
@@ -414,6 +420,8 @@ async def animate_photo_card(
         return False
     if msg is None:
         return True  # delivered, but there is no message object to animate
+    if on_sent is not None:
+        on_sent(msg)
     await animate_message_caption(
         msg, frames[1:], reply_markup=reply_markup, parse_mode=parse_mode,
         interval=interval,

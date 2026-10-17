@@ -37,7 +37,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -59,6 +59,7 @@ from database import (
     GUY_SEARCH_COST,
     CHAT_REQUEST_COST,
     DIRECT_MESSAGE_COST,
+    LIST_MESSAGE_COST,
     NOTIFY_COST,
     CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
@@ -100,6 +101,10 @@ from keyboards import (
     NEW_CHAT_LABEL,
     BROWSE_LABEL,
     NEARBY_LABEL,
+    SECURE_LABELS,
+    CONTACT_PROFILE_LABEL,
+    END_CHAT_LABEL,
+    DELETE_LABEL,
 )
 from animations import (
     ANIMATIONS_ENABLED,
@@ -257,7 +262,7 @@ PROFILE_TEMPLATE = """
 Age: {age} • City: {city}
 
 👁 {online}
-ID: `{public_id}`
+ID: {public_id}
 
 ❤️ {likes} likes
 🪙 {coins} Coins
@@ -270,15 +275,32 @@ ID: `{public_id}`
 """
 
 SEARCH_CHOICE_TEXT = """
-👫 **Choose who you want to chat with** 👇
-
-🎲 **Random (Free)**
-🕺 **Chat With Guy ({cost} 🪙 per search)**
-💃 **Chat With Girl ({cost} 🪙 per search)**
-
-💡 Talking to anyone is free — only starting a Guy or Girl search costs
-{cost} 🪙. 👑 VIP members search for free.
+🎲 **Choose who you want to chat with** 👇
 """
+
+# Sent when a chat ends (MeChat wording) — the choose-menu rides on top.
+CHAT_ENDED_TEXT = "User {who} has left the chat."
+DELETE_HINT_TEXT = (
+    "🗑 You can delete messages you sent within 30 minutes after the chat "
+    "ends.\n/delet_messages_{slug}"
+)
+
+# Secure Chat notices (verbatim from the reference bot).
+SECURE_ON_SELF = (
+    "✅ **Private chat activated!**\n\n"
+    "- When activated, your sent media will no longer have the ability to be "
+    "forwarded, screenshot, or saved by contact!"
+)
+SECURE_OFF_SELF = (
+    "🔓 **Private chat deactivated.**\n\n"
+    "- Your media can be forwarded and saved again."
+)
+SECURE_ON_PARTNER = (
+    "🤖 **Chat Notice** 👇\n\n" + SECURE_ON_SELF
+)
+SECURE_OFF_PARTNER = (
+    "🤖 **Chat Notice** 👇\n\n" + SECURE_OFF_SELF
+)
 
 NAME_ASK_TEXT = """
 ✏️ **What should people call you?**
@@ -305,11 +327,11 @@ Use the buttons below to find a partner, browse people or open the menu.
 """
 
 SEARCHING_TEXT = """
-🔍 **Searching for a partner…**
+🔍 **Searching for your anonymous contact** 🎀💘
+🎲 -Random Search
 
-🔎 Matching you with a partner…
-{count} 👥 people searching right now
-⏳ Hang tight — you'll be connected as soon as a match is found!
+⏳ Please wait up to 2 minutes.
+👥 {count} people searching right now
 """
 
 PROMO_TEXT = (
@@ -320,16 +342,28 @@ PROMO_TEXT = (
 
 
 async def send_promo(context, chat_id: int) -> None:
-    """MeChat-style pinned promo: nudges the user into a random chat."""
+    """MeChat-style pinned promo: sent once, then kept pinned."""
+    ud = _user_data(context, chat_id)
+    promo_id = ud.get("promo_msg_id")
+    if not promo_id:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=PROMO_TEXT,
+                parse_mode="Markdown",
+                reply_markup=promo_keyboard(None),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"promo skipped for {chat_id}: {e}")
+            return
+        promo_id = getattr(msg, "message_id", None)
+        ud["promo_msg_id"] = promo_id
+        if not promo_id:
+            return
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=PROMO_TEXT,
-            parse_mode="Markdown",
-            reply_markup=promo_keyboard(None),
-        )
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=promo_id)
     except Exception as e:  # noqa: BLE001
-        logger.debug(f"promo skipped for {chat_id}: {e}")
+        logger.debug(f"pin skipped for {chat_id}: {e}")
 
 
 # ── ⏰ Daily reminder: one message a day, reminding the user to come
@@ -539,10 +573,17 @@ def public_id_link(user, label: str | None = None) -> str:
 
 
 def _user_data(context, user_id: int) -> dict:
-    """Per-user data store — works for the OTHER side of a match too."""
+    """Per-user data store — works for the OTHER side of a match too.
+
+    PTB exposes `Application.user_data` as a read-only `MappingProxyType`,
+    so we must reach the mutable backing defaultdict `_user_data` to write
+    into another user's slot.
+    """
     app = getattr(context, "application", None)
     if app is not None:
-        return app.user_data.setdefault(user_id, {})
+        store = getattr(app, "_user_data", None)
+        if store is not None:
+            return store.setdefault(user_id, {})
     return context.user_data
 
 
@@ -1274,6 +1315,10 @@ async def notify_partner_found(context, user_id, partner_id):
     if not user or not partner:
         return
     await ensure_bot_username(context.bot)
+    # Remember who was talking to whom — 🗑 Delete Messages needs it
+    # after the chat (and thus user.partner_id) is gone.
+    _remember_chat_partner(user_id, partner_id)
+    _remember_chat_partner(partner_id, user_id)
 
     async def deliver(u, p):
         # MeChat-style free coin for starting a chat
@@ -1284,7 +1329,7 @@ async def notify_partner_found(context, user_id, partner_id):
             else ""
         )
         partner_info = (
-            f"🎉 **Partner found!**\n\n"
+            f"💖 **found partner for you!** Say hi 👋\n\n"
             f"{gender_emoji(p.gender)} **{md_escape(display_name(p, u))}**"
             f"{f', {p.age}' if p.age else ''}\n"
             f"📍 {p.city or p.country or 'Unknown'}\n"
@@ -1292,10 +1337,10 @@ async def notify_partner_found(context, user_id, partner_id):
             f"🪩 {verified_label(p)}\n"
             + ("👑 VIP member\n" if p.vip else "")
             + f"🆔 {public_id_link(p)}\n\n"
-            f"Say hi! Type your message below.\n"
-            f"Use ⏭ Next Partner to skip.{reward_line}"
+            f"Type your message below — it's forwarded anonymously."
+            f"{reward_line}"
         )
-        # Keep the card text so 👤 Partner Profile / ⬅️ Back can flip
+        # Keep the card text so 👤 Contact Profile / ⬅️ Back can flip
         # this very message between the match card and the profile card.
         _user_data(context, u.user_id)["match_card"] = (p.user_id, partner_info)
         # Short "typing…" beat + match reveal on the photo card itself
@@ -1306,7 +1351,7 @@ async def notify_partner_found(context, user_id, partner_id):
             u.user_id,
             open_photo(profile_photo_of(p)),
             match_photo_frames(partner_info),
-            reply_markup=chat_keyboard(secure=u.secure_chat),
+            reply_markup=main_reply_keyboard(secure=u.secure_chat),
             parse_mode="Markdown",
             interval=0.5,
         )
@@ -1318,7 +1363,7 @@ async def notify_partner_found(context, user_id, partner_id):
                 chat_id=u.user_id,
                 text=partner_info,
                 parse_mode="Markdown",
-                reply_markup=chat_keyboard(secure=u.secure_chat),
+                reply_markup=main_reply_keyboard(secure=u.secure_chat),
             )
         except Exception as e:
             logger.warning(f"Failed to send match card to {u.user_id}: {e}")
@@ -1379,7 +1424,7 @@ def build_profile_text(user) -> str:
         age=user.age if user.age else "—",
         city=user.city or (user.country or "—"),
         online=format_online(user),
-        public_id=format_public_id(user),
+        public_id=public_id_link(user),
         likes=user.likes,
         coins=user.coins,
         country=user.country or "Not set",
@@ -1679,30 +1724,123 @@ async def _ping_chat_end(context, user_id: int, partner_id) -> None:
         target = db.get_user(uid)
         if target and target.notify_on_end:
             db.set_notify_end(uid, False)
-            try:
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text="🔔 Your chat has ended.",
-                    reply_markup=main_menu_keyboard(),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send chat-end notice to {uid}: {e}")
+            await _safe_send(
+                context, uid, "🔔 Your chat has ended.",
+                reply_markup=main_menu_keyboard(),
+            )
 
 
-async def close_chat(context, user_id: int, leaver_notice: str = "👋 You left the chat."):
+# ── 🗑 chat log: remember the messages the bot put in a chat so the
+#    "Delete Messages" button can wipe them (30 min after the chat ends).
+#    Telegram only lets a bot delete its OWN messages, and what you send
+#    lands in the partner's chat as a bot message — so we log there and
+#    tag every entry with the original sender. ─────────────────────
+
+CHAT_DELETE_WINDOW = 30 * 60          # seconds after the chat ends
+_CHAT_LOGS: dict[int, dict] = {}      # user_id -> log (see _chat_log)
+_CHAT_LOG_USERS = 4                   # most recent chats kept per user
+
+
+def _chat_log(chat_id: int) -> dict:
+    log = _CHAT_LOGS.get(chat_id)
+    if log is None:
+        log = _CHAT_LOGS[chat_id] = {"partner": None, "ids": [], "ended_at": None}
+        while len(_CHAT_LOGS) > _CHAT_LOG_USERS * 8:
+            _CHAT_LOGS.pop(next(iter(_CHAT_LOGS)))
+    return log
+
+
+def _track_chat_msg(chat_id: int, message, src=None) -> None:
+    """Remember a message the bot sent into `chat_id` (`src` = the user
+    whose message it was, None for the bot's own notices)."""
+    mid = getattr(message, "message_id", None)
+    if mid is None:
+        return
+    log = _chat_log(chat_id)
+    if not any(e["mid"] == mid for e in log["ids"]):
+        log["ids"].append({"mid": mid, "src": src})
+        del log["ids"][:-120]
+
+
+def _remember_chat_partner(chat_id: int, partner_id) -> None:
+    log = _chat_log(chat_id)
+    log["partner"] = partner_id
+    log["ended_at"] = None
+
+
+def _stamp_chat_end(chat_id: int) -> None:
+    if chat_id in _CHAT_LOGS:
+        _CHAT_LOGS[chat_id]["ended_at"] = time.time()
+
+
+async def _safe_send(context, chat_id, text, **kwargs):
+    """Send a message without ever letting a dead chat break the flow."""
+    try:
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except Forbidden as e:
+        logger.debug(f"cannot reach {chat_id}: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to message {chat_id}: {e}")
+        return None
+
+
+def _delete_slug(user) -> str:
+    """/delet_messages_<slug> token for a user (the ID without the prefix)."""
+    slug = public_id_slug(user)
+    return slug[5:] if slug.startswith("user_") else slug
+
+
+async def _send_end_block(context, uid, *, notice, offer_choice: bool) -> None:
+    """MeChat's chat-end sequence: notice → 🗑 delete hint → 🎲 choose menu.
+
+    With a choice on the way the two preceding messages stay clean (the
+    persistent bar under the message field is all the navigation needed).
     """
-    End a chat for user_id, tell both sides and honour the
-    🔔 "notify me when chat ends" toggle.
+    quiet = None if offer_choice else main_menu_keyboard()
+    me = db.get_user(uid)
+    await _safe_send(context, uid, notice, reply_markup=quiet)
+    if me:
+        await _safe_send(
+            context, uid, DELETE_HINT_TEXT.format(slug=_delete_slug(me)),
+            reply_markup=quiet,
+        )
+    if offer_choice:
+        await _safe_send(
+            context, uid, SEARCH_CHOICE_TEXT,
+            parse_mode="Markdown",
+            reply_markup=search_choice_keyboard(),
+        )
+
+
+async def close_chat(
+    context,
+    user_id: int,
+    leaver_notice: str = "👋 You left the chat.",
+    *,
+    offer_choice: bool = True,
+) -> None:
+    """
+    End a chat for user_id, tell both sides in the reference bot's wording
+    (notice → 🗑 delete hint → 🎲 choose who to chat with next) and honour
+    the 🔔 "notify me when chat ends" toggle.
     """
     partner_id = db.end_chat(user_id)
-    await context.bot.send_message(
-        chat_id=user_id, text=leaver_notice, reply_markup=main_menu_keyboard()
+    me = db.get_user(user_id)
+    _stamp_chat_end(user_id)
+    if partner_id:
+        _stamp_chat_end(partner_id)
+
+    await _send_end_block(
+        context, user_id, notice=leaver_notice, offer_choice=offer_choice
     )
     if partner_id:
-        await context.bot.send_message(
-            chat_id=partner_id,
-            text="⚠️ Your partner has left the chat.",
-            reply_markup=main_menu_keyboard(),
+        who = format_public_id(me) if me else "your partner"
+        await _send_end_block(
+            context,
+            partner_id,
+            notice=CHAT_ENDED_TEXT.format(who=who),
+            offer_choice=offer_choice,
         )
     await _ping_chat_end(context, user_id, partner_id)
 
@@ -1739,7 +1877,13 @@ async def begin_search(
         return pending
 
     if user.state == ChatState.CHATTING:
-        return "You're already in a chat! Use /stop to leave first.", chat_keyboard(secure=user.secure_chat), None
+        # A stale 🎲 Choose-menu tap while talking: leave the chat first,
+        # then hand back the choice — never the "already in a chat" wall.
+        await close_chat(
+            context, user_id, leaver_notice="👋 You left the chat.",
+            offer_choice=False,
+        )
+        return SEARCH_CHOICE_TEXT, search_choice_keyboard(), "Markdown"
 
     if user.state == ChatState.SEARCHING:
         return "⏳ You're already searching for a partner...", searching_keyboard(), None
@@ -1773,6 +1917,8 @@ async def begin_search(
     if match_id:
         db.pair_users(user_id, match_id)
         await notify_partner_found(context, user_id, match_id)
+        # Resolve whatever "Searching…" message the caller is holding —
+        # otherwise a stale search frame keeps claiming a search is running.
         return "🎉 Partner found! Connecting..." + _charge_line(), None, None
 
     # Continuous matching animation — cycles until a match lands.
@@ -1839,7 +1985,11 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
 
     partner_id = user.partner_id
     banned_now = db.add_report(reporter_id, partner_id)
-    await close_chat(context, reporter_id, leaver_notice="👋 You left the chat.")
+    await close_chat(
+        context, reporter_id,
+        leaver_notice="👋 You left the chat.",
+        offer_choice=False,
+    )
 
     if banned_now:
         db.remove_from_queue(partner_id)
@@ -1879,14 +2029,31 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.record_view(user_id, target.user_id)
             await reply_profile_card(update.message, user_id, target)
             return
+        if target:
+            # Your own ID — never end an active chat just for this.
+            await update.message.reply_text(
+                "🙂 That's your own ID — open it with /profile.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        await update.message.reply_text(
+            "🔎 This profile no longer exists.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
     # End any existing chat
     partner_id = db.end_chat(user_id)
+    _stamp_chat_end(user_id)
     if partner_id:
-        await context.bot.send_message(
-            chat_id=partner_id,
-            text="⚠️ Your partner has left the chat.",
-            reply_markup=main_menu_keyboard(),
+        _stamp_chat_end(partner_id)
+        await _send_end_block(
+            context,
+            partner_id,
+            notice=CHAT_ENDED_TEXT.format(
+                who=format_public_id(existing) if existing else "your partner"
+            ),
+            offer_choice=False,
         )
 
     db.remove_from_queue(user_id)
@@ -1990,10 +2157,8 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user.state == ChatState.CHATTING:
-        await update.message.reply_text(
-            "You're already in a chat! Use /stop to leave first.",
-            reply_markup=chat_keyboard(secure=user.secure_chat),
-        )
+        # Never a dead end: leave the current chat and offer the choice.
+        await close_chat(context, user_id, leaver_notice="👋 You left the chat.")
         return
 
     if user.state == ChatState.SEARCHING:
@@ -2010,7 +2175,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        SEARCH_CHOICE_TEXT.format(cost=GIRL_SEARCH_COST),
+        SEARCH_CHOICE_TEXT,
         parse_mode="Markdown",
         reply_markup=search_choice_keyboard(),
     )
@@ -2041,6 +2206,21 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def delete_messages_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """"/delet_messages_<slug>" — the 🗑 link handed out when a chat ends.
+
+    Wipes the messages this user sent in the most recent chat, while the
+    30-minute window is still open.
+    """
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    await _delete_messages_action(update, context, user)
+
+
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = db.get_user(user_id)
@@ -2052,6 +2232,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_channel(update, context):
         return
 
+    await ensure_bot_username(context.bot)
     await update.message.reply_text(
         build_profile_text(user),
         parse_mode="Markdown",
@@ -2120,18 +2301,14 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def newchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """💬 Start new chat — jumps straight into a random search."""
-    user_id = update.effective_user.id
-    if not db.get_user(user_id):
+    """💬 Start new chat — leaves any active chat, then searches."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
         await update.message.reply_text("Please /start first.")
         return
     if not await enforce_channel(update, context):
         return
-    text, markup, mode = await begin_search(
-        context, user_id, Gender.ANY, target=update.message
-    )
-    if text:
-        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+    await start_new_chat_flow(update, context, user)
 
 
 BROWSE_MENU_TEXT = (
@@ -2499,12 +2676,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if user.state == ChatState.CHATTING:
-            await safe_edit(
-                query,
-                "You're already in a chat! Use /stop to leave first.",
-                reply_markup=chat_keyboard(secure=user.secure_chat),
+            # Leave the chat you're in, then offer the choice — no dead end.
+            await close_chat(
+                context, user_id, leaver_notice="👋 You left the chat.",
+                offer_choice=False,
             )
-            return
 
         if user.state == ChatState.SEARCHING:
             await safe_edit(
@@ -2516,7 +2692,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_edit(
             query,
-            SEARCH_CHOICE_TEXT.format(cost=GIRL_SEARCH_COST),
+            SEARCH_CHOICE_TEXT,
             parse_mode="Markdown",
             reply_markup=search_choice_keyboard(),
         )
@@ -2537,6 +2713,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "my_profile":
         # MeChat-style: own profile always arrives as a photo card
         # (AI avatar is used when no photo was set)
+        await ensure_bot_username(context.bot)
         try:
             await typing_pulse(context.bot, user_id, times=1, interval=0.3)
             await context.bot.send_photo(
@@ -3057,6 +3234,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id,
                 leaver_notice="🔒 **User blocked.** Chat ended — you won't be "
                               "matched with them again.",
+                offer_choice=False,
             )
         else:
             await query.answer("🔒 Blocked — you won't be matched again.")
@@ -3083,6 +3261,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id,
                 leaver_notice="🚩 **Report submitted.** This user won't be "
                               "matched with you again.",
+                offer_choice=False,
             )
         else:
             await query.answer("🚩 Report submitted — thank you!")
@@ -3243,6 +3422,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page, total = await asyncio.to_thread(
                 db.browse_filtered, user_id, kind, offset, BROWSE_PAGE_SIZE
             )
+            if not page:
+                await query.answer(
+                    "That's everyone for now — check back soon!", show_alert=True
+                )
+                return
             seen = context.user_data.get("browse_ids", [])
             context.user_data["browse_ids"] = (seen + [u.user_id for u in page])[:20]
             context.user_data["browse_offset"] = min(
@@ -3308,8 +3492,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(
             query,
             "📋 **Send Message to List**\n\n"
-            "Type the message you want to send to the people in your current "
-            "list.",
+            f"Type the message you want to send to the people in your current "
+            f"list.\n\n"
+            f"🪙 Costs **{LIST_MESSAGE_COST} coins** — charged when the "
+            f"message is sent.",
             parse_mode="Markdown",
         )
 
@@ -3467,47 +3653,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         enabled = not user.secure_chat
         partner_id = db.set_secure_chat(user_id, enabled)
-        # Refresh the Secure Chat button label on the match card.
+        # Keep the match card in place, but re-label its Secure Chat button.
+        stored = _user_data(context, user_id).get("match_card")
+        card_text = (
+            stored[1]
+            if stored and stored[0] == user.partner_id
+            else (SECURE_ON_SELF if enabled else SECURE_OFF_SELF)
+        )
         await safe_edit(
-            query,
-            "🔓 **Secure Chat ON**\n\nYour sent media can no longer be "
-            "forwarded or saved by your partner."
-            if enabled
-            else "🔐 **Secure Chat OFF**\n\nYour media can be forwarded and "
-            "saved again.",
-            parse_mode="Markdown",
+            query, card_text, parse_mode="Markdown",
             reply_markup=chat_keyboard(secure=enabled),
         )
+        # Refresh the 📌 bar on BOTH sides — its Secure Chat label flips too.
+        await _safe_send(
+            context, user_id,
+            SECURE_ON_SELF if enabled else SECURE_OFF_SELF,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(secure=enabled),
+        )
         if partner_id:
-            notice = (
-                "🤖 **Chat Notice** 👇\n\n"
-                "✅ **Private chat activated!**\n\n"
-                "- When activated, your sent media will no longer have the "
-                "ability to be forwarded, screenshot, or saved by contact!"
-                if enabled
-                else "🔓 **Private chat deactivated.**\n\n"
-                     "- Media can now be forwarded and saved again."
+            await _safe_send(
+                context, partner_id,
+                SECURE_ON_PARTNER if enabled else SECURE_OFF_PARTNER,
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(secure=enabled),
             )
-            try:
-                await context.bot.send_message(
-                    chat_id=partner_id,
-                    text=notice,
-                    parse_mode="Markdown",
-                    reply_markup=chat_keyboard(secure=enabled),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to notify {partner_id} of secure chat: {e}")
 
     elif data == "end_chat":
         partner_id = db.end_chat(user_id)
+        _stamp_chat_end(user_id)
+        if partner_id:
+            _stamp_chat_end(partner_id)
         await safe_edit(
-            query, "👋 Chat ended.", reply_markup=main_menu_keyboard()
+            query, "👋 You left the chat.", reply_markup=search_choice_keyboard()
+        )
+        await _send_end_block(
+            context, user_id, notice="👋 You left the chat.", offer_choice=False
         )
         if partner_id:
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text="⚠️ Your partner has left the chat.",
-                reply_markup=main_menu_keyboard(),
+            await _send_end_block(
+                context,
+                partner_id,
+                notice=CHAT_ENDED_TEXT.format(
+                    who=format_public_id(user) if user else "your partner"
+                ),
+                offer_choice=True,
             )
         await _ping_chat_end(context, user_id, partner_id)
 
@@ -3518,18 +3708,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "next_partner":
-        # End current chat and let the user choose who to search for next
-        partner_id = db.end_chat(user_id)
-        if partner_id:
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text="⚠️ Your partner has left the chat.",
-                reply_markup=main_menu_keyboard(),
-            )
-
+        # End current chat, then let the user choose who to search for next
+        await close_chat(context, user_id, offer_choice=False)
         await safe_edit(
             query,
-            SEARCH_CHOICE_TEXT.format(cost=GIRL_SEARCH_COST),
+            SEARCH_CHOICE_TEXT,
             parse_mode="Markdown",
             reply_markup=search_choice_keyboard(),
         )
@@ -3557,6 +3740,198 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 #  MESSAGE RELAY (forwards messages between paired users)
 # ═══════════════════════════════════════════════════════════════════
+
+_BAR_NO_CHAT = "⚠️ You're not in a chat right now."
+
+
+async def _apply_secure_chat(context, user, enabled: bool) -> None:
+    """Flip 🔒 Secure Chat for both sides and re-send the bar with the
+    new label (a reply keyboard only changes when a message carries it)."""
+    partner_id = db.set_secure_chat(user.user_id, enabled)
+    await _safe_send(
+        context, user.user_id,
+        SECURE_ON_SELF if enabled else SECURE_OFF_SELF,
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(secure=enabled),
+    )
+    if partner_id:
+        await _safe_send(
+            context, partner_id,
+            SECURE_ON_PARTNER if enabled else SECURE_OFF_PARTNER,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(secure=enabled),
+        )
+
+
+async def _send_contact_profile(update: Update, context, user) -> None:
+    """👤 Contact Profile — the partner's full profile card, in the chat."""
+    target = db.get_user(user.partner_id) if user.partner_id else None
+    if not target:
+        await update.message.reply_text(
+            _BAR_NO_CHAT, reply_markup=main_reply_keyboard(secure=user.secure_chat)
+        )
+        return
+    await update.message.reply_text(
+        build_user_card(target, user.user_id),
+        parse_mode="Markdown",
+        reply_markup=profile_view_keyboard(
+            target.user_id,
+            user.user_id in target.liked_by,
+            notify=user.notify_on_end,
+            back="pback",
+        ),
+    )
+
+
+async def _delete_messages_action(update: Update, context, user) -> None:
+    """🗑 Delete Messages — wipe what you sent in the last chat.
+
+    Telegram only lets a bot delete its OWN messages, and the copies of
+    what you sent live in the partner's chat — so that's the log we go
+    after, but only for messages you originally sent.
+    """
+    bar = main_reply_keyboard(secure=user.secure_chat)
+    partner_id = user.partner_id or _chat_log(user.user_id).get("partner")
+    if not partner_id:
+        await update.message.reply_text(_BAR_NO_CHAT, reply_markup=bar)
+        return
+
+    log = _chat_log(partner_id)
+    ended_at = log.get("ended_at")
+    if ended_at and time.time() - ended_at > CHAT_DELETE_WINDOW:
+        await update.message.reply_text(
+            "⏰ Too late — messages can only be deleted within 30 minutes "
+            "after the chat ends.",
+            reply_markup=bar,
+        )
+        return
+
+    mine = [e for e in log["ids"] if e.get("src") == user.user_id]
+    if not mine:
+        await update.message.reply_text(
+            "🗑 There's nothing to delete here.", reply_markup=bar
+        )
+        return
+
+    deleted = 0
+    for entry in mine:
+        try:
+            await context.bot.delete_message(
+                chat_id=partner_id, message_id=entry["mid"]
+            )
+            deleted += 1
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"could not delete {entry['mid']}: {e}")
+    log["ids"] = [e for e in log["ids"] if e.get("src") != user.user_id]
+    await update.message.reply_text(
+        f"🗑 Deleted {deleted} message{'s' if deleted != 1 else ''}.",
+        reply_markup=bar,
+    )
+
+
+async def start_new_chat_flow(update: Update, context, user) -> None:
+    """💬 /newchat and 💕 New Anonymous Chat! — never a dead end."""
+    if user.state == ChatState.SEARCHING:
+        await update.message.reply_text(
+            "⏳ You're already searching for a partner...",
+            reply_markup=searching_keyboard(),
+        )
+        return
+    if user.state == ChatState.CHATTING and user.partner_id:
+        # Leave the old chat — close_chat hands over the 🎲 choose menu.
+        await close_chat(context, user.user_id, leaver_notice="👋 You left the chat.")
+        return
+    pending = profile_setup_reply(context, user)
+    if pending:
+        text, markup, mode = pending
+        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+        return
+    text, markup, mode = await begin_search(
+        context, user.user_id, Gender.ANY, target=update.message
+    )
+    if text:
+        await update.message.reply_text(text, parse_mode=mode, reply_markup=markup)
+
+
+async def handle_chat_bar(update: Update, context, user) -> bool:
+    """Consume a tap on the persistent bar. Returns True when handled.
+
+    Every bar button works in every state — chatting, searching or idle.
+    """
+    text = (update.message.text or "").strip()
+    if not text:
+        return False
+
+    bar = lambda: main_reply_keyboard(secure=user.secure_chat)
+    in_chat = user.state == ChatState.CHATTING and user.partner_id
+
+    if text in SECURE_LABELS:
+        if not in_chat:
+            await update.message.reply_text(_BAR_NO_CHAT, reply_markup=bar())
+            return True
+        await _apply_secure_chat(context, user, not user.secure_chat)
+        return True
+
+    if text == CONTACT_PROFILE_LABEL:
+        if not in_chat:
+            await update.message.reply_text(_BAR_NO_CHAT, reply_markup=bar())
+            return True
+        await _send_contact_profile(update, context, user)
+        return True
+
+    if text == END_CHAT_LABEL:
+        if not in_chat:
+            await update.message.reply_text(_BAR_NO_CHAT, reply_markup=bar())
+            return True
+        await close_chat(context, user.user_id, leaver_notice="👋 You left the chat.")
+        return True
+
+    if text == DELETE_LABEL:
+        await _delete_messages_action(update, context, user)
+        return True
+
+    if text == NEW_CHAT_LABEL:
+        await start_new_chat_flow(update, context, user)
+        return True
+
+    if text == BROWSE_LABEL:
+        pending = profile_setup_reply(context, user)
+        if pending:
+            p_text, p_markup, p_mode = pending
+            await update.message.reply_text(p_text, parse_mode=p_mode, reply_markup=p_markup)
+            return True
+        await update.message.reply_text(
+            BROWSE_MENU_TEXT,
+            parse_mode="Markdown",
+            reply_markup=browse_menu_keyboard(),
+        )
+        return True
+
+    if text == NEARBY_LABEL:
+        uid = user.user_id
+        if not db.has_location(uid):
+            context.user_data["awaiting_location"] = True
+            await update.message.reply_text(
+                f"📍 **Nearby People**\n\nShare your location to see people "
+                f"within {NEARBY_RADIUS_KM} km of you.",
+                parse_mode="Markdown",
+                reply_markup=share_location_keyboard(),
+            )
+        else:
+            pairs = await asyncio.to_thread(_nearby_pairs, uid)
+            await send_nearby_cards(context, uid, pairs)
+            context.user_data["list_ids"] = [u.user_id for _, u in pairs]
+            context.user_data["list_title"] = "📍 People near you"
+            context.user_data["list_kind"] = "nearby"
+            await update.message.reply_text(
+                _list_text("📍 People near you", pairs),
+                parse_mode="Markdown",
+                reply_markup=user_list_keyboard(pairs),
+            )
+        return True
+
+    return False
+
 
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward any message to the chat partner."""
@@ -3752,6 +4127,20 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for uid in context.user_data.get("browse_ids", [])[:20]
             if uid != user_id and db.get_user(uid) and not db.get_user(uid).banned
         ]
+        if not recipients:
+            await update.message.reply_text(
+                "No one to send to right now.", reply_markup=main_reply_keyboard()
+            )
+            return
+        if user.coins < LIST_MESSAGE_COST:
+            await update.message.reply_text(
+                f"🪙 **Not enough Coins!** Sending a message to the list costs "
+                f"**{LIST_MESSAGE_COST} 🪙**.",
+                parse_mode="Markdown",
+                reply_markup=credit_keyboard(),
+            )
+            return
+        db.spend_coins(user_id, LIST_MESSAGE_COST)
         sent = 0
         for uid in recipients:
             db.queue_dm(uid, user_id, text)
@@ -3773,56 +4162,15 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Failed to deliver list message to {uid}: {e}")
         await update.message.reply_text(
-            f"✅ Message sent to {sent} {'person' if sent == 1 else 'people'}.",
+            f"✅ Message sent to {sent} {'person' if sent == 1 else 'people'} "
+            f"(-{LIST_MESSAGE_COST} 🪙).",
             reply_markup=main_reply_keyboard(),
         )
         return
 
-    # ── Persistent bottom bar buttons ───────────────────────
-    if user.state != ChatState.CHATTING and update.message.text:
-        text = update.message.text.strip()
-        if text == NEW_CHAT_LABEL:
-            reply, markup, mode = await begin_search(
-                context, user_id, Gender.ANY, target=update.message
-            )
-            if reply:
-                await update.message.reply_text(reply, parse_mode=mode, reply_markup=markup)
-            return
-        if text == BROWSE_LABEL:
-            pending = profile_setup_reply(context, user)
-            if pending:
-                p_text, p_markup, p_mode = pending
-                await update.message.reply_text(
-                    p_text, parse_mode=p_mode, reply_markup=p_markup
-                )
-                return
-            await update.message.reply_text(
-                BROWSE_MENU_TEXT,
-                parse_mode="Markdown",
-                reply_markup=browse_menu_keyboard(),
-            )
-            return
-        if text == NEARBY_LABEL:
-            if not db.has_location(user_id):
-                context.user_data["awaiting_location"] = True
-                await update.message.reply_text(
-                    f"📍 **Nearby People**\n\nShare your location to see people "
-                    f"within {NEARBY_RADIUS_KM} km of you.",
-                    parse_mode="Markdown",
-                    reply_markup=share_location_keyboard(),
-                )
-            else:
-                pairs = await asyncio.to_thread(_nearby_pairs, user_id)
-                await send_nearby_cards(context, user_id, pairs)
-                context.user_data["list_ids"] = [u.user_id for _, u in pairs]
-                context.user_data["list_title"] = "📍 People near you"
-                context.user_data["list_kind"] = "nearby"
-                await update.message.reply_text(
-                    _list_text("📍 People near you", pairs),
-                    parse_mode="Markdown",
-                    reply_markup=user_list_keyboard(pairs),
-                )
-            return
+    # ── Persistent bottom bar (works in every state) ────────────
+    if update.message.text and await handle_chat_bar(update, context, user):
+        return
 
     # Check if user is in a chat
     if user.state != ChatState.CHATTING or not user.partner_id:
@@ -3845,61 +4193,64 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Secure Chat: block forwarding/saving of the relayed message.
     secure = user.secure_chat
 
+    async def _to_partner(kind: str, **kwargs):
+        """Send to the partner and remember it for 🗑 Delete Messages."""
+        sent = await getattr(context.bot, f"send_{kind}")(
+            chat_id=partner_id, protect_content=secure, **kwargs
+        )
+        _track_chat_msg(partner_id, sent, src=user.user_id)
+        return sent
+
     try:
         # Relay different message types — raw content only, no emoji prefixes
         if msg.text:
-            await context.bot.send_message(
-                chat_id=partner_id, text=msg.text, protect_content=secure
-            )
+            await _to_partner("message", text=msg.text)
         elif msg.photo:
-            await context.bot.send_photo(
-                chat_id=partner_id,
+            await _to_partner(
+                "photo",
                 photo=msg.photo[-1].file_id,
                 caption=msg.caption or "",
-                protect_content=secure,
             )
         elif msg.sticker:
-            await context.bot.send_sticker(
-                chat_id=partner_id, sticker=msg.sticker.file_id, protect_content=secure
-            )
+            await _to_partner("sticker", sticker=msg.sticker.file_id)
         elif msg.voice:
-            await context.bot.send_voice(
-                chat_id=partner_id, voice=msg.voice.file_id, protect_content=secure
-            )
+            await _to_partner("voice", voice=msg.voice.file_id)
         elif msg.video:
-            await context.bot.send_video(
-                chat_id=partner_id,
-                video=msg.video.file_id,
-                caption=msg.caption or "",
-                protect_content=secure,
+            await _to_partner(
+                "video", video=msg.video.file_id, caption=msg.caption or ""
             )
         elif msg.video_note:
-            await context.bot.send_video_note(
-                chat_id=partner_id, video_note=msg.video_note.file_id, protect_content=secure
-            )
+            await _to_partner("video_note", video_note=msg.video_note.file_id)
         elif msg.animation:
-            await context.bot.send_animation(
-                chat_id=partner_id,
+            await _to_partner(
+                "animation",
                 animation=msg.animation.file_id,
                 caption=msg.caption or "",
-                protect_content=secure,
             )
         elif msg.document:
-            await context.bot.send_document(
-                chat_id=partner_id,
+            await _to_partner(
+                "document",
                 document=msg.document.file_id,
                 caption=msg.caption or "",
-                protect_content=secure,
             )
         elif msg.location:
-            await context.bot.send_location(
-                chat_id=partner_id,
+            await _to_partner(
+                "location",
                 latitude=msg.location.latitude,
                 longitude=msg.location.longitude,
-                protect_content=secure,
             )
         else:
             await update.message.reply_text("⚠️ This message type is not supported.")
+    except Forbidden as e:
+        # The partner blocked the bot / deleted their account — wrap up
+        # politely instead of spamming a dead chat with failures.
+        logger.debug(f"partner {partner_id} unreachable: {e}")
+        await close_chat(
+            context, user.user_id,
+            leaver_notice="⚠️ Your partner is no longer available — "
+                          "the chat has ended.",
+            offer_choice=True,
+        )
     except Exception as e:
         logger.error(f"Failed to relay message: {e}")
         await update.message.reply_text("⚠️ Failed to send message to your partner.")
@@ -4100,6 +4451,11 @@ def main():
     # Tappable / pasted profile IDs: /user_9d0b (or /user_9d0b@botname)
     app.add_handler(MessageHandler(
         filters.Regex(r"^/user_[0-9a-zA-Z]+"), user_id_command
+    ))
+
+    # 🗑 /delet_messages_9d0b — handed out by the chat-end notice
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/delet_messages_[0-9a-zA-Z]+"), delete_messages_command
     ))
 
     # Payments (Telegram Stars)

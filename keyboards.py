@@ -14,8 +14,6 @@ from telegram import (
 from database import (
     CHAT_REQUEST_COST,
     DIRECT_MESSAGE_COST,
-    GIRL_SEARCH_COST,
-    GUY_SEARCH_COST,
 )
 
 
@@ -80,20 +78,16 @@ def country_keyboard() -> InlineKeyboardMarkup:
 # ── Main menu ────────────────────────────────────────────────────
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """The reference bot's idle menu — everything else lives behind these
+    four doors: the profile card carries Credits/Stats/Find by ID-adjacent
+    actions, Advanced Settings carries the editors."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Find a Partner", callback_data="find_partner")],
         [
-            InlineKeyboardButton("📍 Nearby", callback_data="nearby"),
-            InlineKeyboardButton("🔎 Find by ID", callback_data="find_id"),
+            InlineKeyboardButton("📇 Contact List", callback_data="contacts"),
+            InlineKeyboardButton("🚫 Blocked Users", callback_data="blocked_list"),
         ],
-        [
-            InlineKeyboardButton("👤 My Profile", callback_data="my_profile"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-        ],
-        [
-            InlineKeyboardButton("💎 Credits", callback_data="credit_menu"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats"),
-        ],
+        [InlineKeyboardButton("⚙️ Advanced Settings ⚙️", callback_data="settings")],
+        [InlineKeyboardButton("📝 Edit Profile Information", callback_data="my_profile")],
     ])
 
 
@@ -102,12 +96,24 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 NEW_CHAT_LABEL = "💕 New Anonymous Chat!"
 BROWSE_LABEL = "🎉 Browse People"
 NEARBY_LABEL = "🧭 Nearby People"
+SECURE_LABEL = "🔒 Secure Chat"
+SECURE_ON_LABEL = "🔓 Secure Chat ON"
+CONTACT_PROFILE_LABEL = "👤 Contact Profile"
+END_CHAT_LABEL = "End Chat"
+DELETE_LABEL = "🗑 Delete Messages"
+# The bar is only replaced when a message goes out, so the buttons may still
+# wear yesterday's Secure Chat spelling — recognise every variant.
+SECURE_LABELS = (SECURE_LABEL, SECURE_ON_LABEL)
 
 
-def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """The always-visible bar under the message field."""
+def main_reply_keyboard(secure: bool = False) -> ReplyKeyboardMarkup:
+    """The always-visible bar under the message field (MeChat layout):
+    chat controls on top, discovery buttons underneath."""
+    secure_label = SECURE_ON_LABEL if secure else SECURE_LABEL
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton(secure_label), KeyboardButton(CONTACT_PROFILE_LABEL)],
+            [KeyboardButton(END_CHAT_LABEL), KeyboardButton(DELETE_LABEL)],
             [KeyboardButton(NEW_CHAT_LABEL)],
             [KeyboardButton(BROWSE_LABEL), KeyboardButton(NEARBY_LABEL)],
         ],
@@ -120,12 +126,11 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 def search_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎲 Start Random Chat (Free)", callback_data="search_random")],
+        [InlineKeyboardButton("🎲 Random(Free)", callback_data="search_random")],
         [
-            InlineKeyboardButton(f"🕺 Chat With Guy ({GUY_SEARCH_COST} 🪙)", callback_data="search_guy"),
-            InlineKeyboardButton(f"💃 Chat With Girl ({GIRL_SEARCH_COST} 🪙)", callback_data="search_girl"),
+            InlineKeyboardButton("🐒 Chat With Guy", callback_data="search_guy"),
+            InlineKeyboardButton("💃 Chat With Girl", callback_data="search_girl"),
         ],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
     ])
 
 
@@ -239,6 +244,7 @@ def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
         [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
         [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
+        [InlineKeyboardButton("🔎 Find by ID", callback_data="find_id")],
         [InlineKeyboardButton(reminder_label, callback_data="reminder_toggle")],
         [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
@@ -363,12 +369,10 @@ def browse_keyboard(has_more: bool, pairs=()) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label, callback_data=f"view_{user.user_id}")]
         for label, user in pairs
     ]
-    if has_more:
-        rows.append([InlineKeyboardButton("➡️ View More List", callback_data="browse_more")])
-    rows.append([
-        InlineKeyboardButton("✨ View Profiles by Swiping", callback_data="browse_swipe"),
-        InlineKeyboardButton("📋 Send Message to List", callback_data="browse_msg"),
-    ])
+    # Reference layout: three full-width options, always shown together.
+    rows.append([InlineKeyboardButton("➡️ View More List", callback_data="browse_more")])
+    rows.append([InlineKeyboardButton("✨ View Profiles by Swiping", callback_data="browse_swipe")])
+    rows.append([InlineKeyboardButton("📋 Send Message to List", callback_data="browse_msg")])
     rows.append([InlineKeyboardButton("🌟 Change Category", callback_data="browse_menu")])
     rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
