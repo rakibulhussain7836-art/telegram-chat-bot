@@ -109,12 +109,9 @@ from animations import (
     animate_message_caption,
     animated_reply,
     typing_pulse,
-    celebration_pulse,
     match_photo_frames,
-    reveal_frames,
     bounce_frames,
     coin_frames,
-    heart_frames,
     emoji_cycle_frames,
 )
 
@@ -223,7 +220,7 @@ HELP_MSG = """
 **Discover people:**
 • 🎉 **Browse People** — see who is around right now
 • 🧭 **Nearby People** — share your location and see people around you
-• 🔎 **Find by ID** — search anyone with their 6-digit ID (see yours in /profile)
+• 🔎 **Find by ID** — search anyone with their 6-digit ID or `/user_xxx` ID (see yours in /profile)
 • 📨 **Chat Request** ({request_cost} 🪙) — they accept within two minutes
 • 📨 **Direct Message** ({dm_cost} 🪙) — start a chat instantly from a profile card
 • ❤️ Like / 💔 Unlike profiles from the profile view
@@ -495,6 +492,60 @@ def display_name(user, viewer=None) -> str:
     return "Stranger"
 
 
+# ── Bot username cache (profile deep links, referral links) ─────
+
+_bot_username = ""
+
+
+def set_bot_username(name: str) -> None:
+    global _bot_username
+    _bot_username = (name or "").lstrip("@")
+
+
+def bot_username() -> str:
+    return _bot_username
+
+
+async def ensure_bot_username(bot) -> str:
+    """Fetch the bot's @username once and cache it for every later render."""
+    if _bot_username:
+        return _bot_username
+    if not hasattr(bot, "get_me"):
+        return _bot_username
+    try:
+        me = await bot.get_me()
+    except Exception as e:  # noqa: BLE001 — never block a reply on this
+        logger.debug(f"Could not cache bot username: {e}")
+        return _bot_username
+    set_bot_username(me.username)
+    return _bot_username
+
+
+def public_id_link(user, label: str | None = None) -> str:
+    """
+    A tappable user ID — tapping it opens this user's profile card
+    (via the bot's /start chat_<slug> deep link).
+
+    Falls back to the old monospace code span when the bot username is
+    not known yet (e.g. in tests): the text stays copyable either way.
+    """
+    if user is None:
+        return "`?`"
+    label = label or format_public_id(user)
+    name = _bot_username
+    if not name:
+        return f"`{label}`"
+    return f"[{label}](https://t.me/{name}?start=chat_{public_id_slug(user)})"
+
+
+def _user_data(context, user_id: int) -> dict:
+    """Per-user data store — works for the OTHER side of a match too."""
+    app = getattr(context, "application", None)
+    if app is not None:
+        return app.user_data.setdefault(user_id, {})
+    return context.user_data
+
+
 # ── Mandatory profile fields (name → age → city) ────────────────
 
 PROFILE_FIELDS = ("name", "age", "city")
@@ -580,16 +631,32 @@ def force_join_required() -> bool:
     return bool(FORCE_CHANNEL) and force_join_link() is not None
 
 
+# Positive channel-membership results, cached briefly so the force-join
+# gate doesn't cost a Telegram API round-trip on every single message.
+# Only "joined" answers are cached — a "left" answer is re-checked live,
+# and pressing "✅ I've Joined" always bypasses the cache.
+_MEMBER_CACHE: dict[int, tuple[float, bool]] = {}
+_MEMBER_CACHE_TTL = 60.0
+
+
 async def is_channel_member(context, user_id: int) -> bool:
     """True when the user follows the forced channel (or no channel is set)."""
     if not force_join_required():
         return True
+    hit = _MEMBER_CACHE.get(user_id)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
     try:
         member = await context.bot.get_chat_member(FORCE_CHANNEL, user_id)
-        return member.status in ("member", "administrator", "creator")
+        is_member = member.status in ("member", "administrator", "creator")
     except Exception as e:  # noqa: BLE001 — fail open, never brick the bot
         logger.warning(f"Force-join check failed for {user_id}: {e}")
         return True
+    if is_member:
+        _MEMBER_CACHE[user_id] = (time.monotonic() + _MEMBER_CACHE_TTL, True)
+    else:
+        _MEMBER_CACHE.pop(user_id, None)
+    return is_member
 
 
 async def enforce_channel(update, context) -> bool:
@@ -1198,11 +1265,17 @@ async def notify_partner_found(context, user_id, partner_id):
     Match card for BOTH users: one photo message that carries the
     partner's picture AND their profile info AND the chat buttons —
     never a text message with the photo bolted on underneath.
+
+    Both cards go out concurrently so a match feels instant instead
+    of waiting for the first side's animation to finish.
     """
     user = db.get_user(user_id)
     partner = db.get_user(partner_id)
+    if not user or not partner:
+        return
+    await ensure_bot_username(context.bot)
 
-    for u, p in [(user, partner), (partner, user)]:
+    async def deliver(u, p):
         # MeChat-style free coin for starting a chat
         reward = db.award_match_reward(u.user_id)
         reward_line = (
@@ -1218,10 +1291,13 @@ async def notify_partner_found(context, user_id, partner_id):
             f"👁 {format_online(p)}\n"
             f"🪩 {verified_label(p)}\n"
             + ("👑 VIP member\n" if p.vip else "")
-            + f"🆔 `{format_public_id(p)}`\n\n"
+            + f"🆔 {public_id_link(p)}\n\n"
             f"Say hi! Type your message below.\n"
             f"Use ⏭ Next Partner to skip.{reward_line}"
         )
+        # Keep the card text so 👤 Partner Profile / ⬅️ Back can flip
+        # this very message between the match card and the profile card.
+        _user_data(context, u.user_id)["match_card"] = (p.user_id, partner_info)
         # Short "typing…" beat + match reveal on the photo card itself
         if ANIMATIONS_ENABLED:
             await typing_pulse(context.bot, u.user_id, times=2, interval=0.4)
@@ -1230,22 +1306,29 @@ async def notify_partner_found(context, user_id, partner_id):
             u.user_id,
             open_photo(profile_photo_of(p)),
             match_photo_frames(partner_info),
-            reply_markup=chat_keyboard(),
+            reply_markup=chat_keyboard(secure=u.secure_chat),
             parse_mode="Markdown",
             interval=0.5,
         )
         if delivered:
-            continue
+            return
         # No photo available — the match must still be delivered as text.
         try:
             await context.bot.send_message(
                 chat_id=u.user_id,
                 text=partner_info,
                 parse_mode="Markdown",
-                reply_markup=chat_keyboard(),
+                reply_markup=chat_keyboard(secure=u.secure_chat),
             )
         except Exception as e:
             logger.warning(f"Failed to send match card to {u.user_id}: {e}")
+
+    results = await asyncio.gather(
+        deliver(user, partner), deliver(partner, user), return_exceptions=True
+    )
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning(f"Match card delivery failed: {r}")
 
 
 class _MsgTarget:
@@ -1285,8 +1368,8 @@ async def safe_edit(query, text, parse_mode=None, reply_markup=None):
 
 
 async def get_referral_link(context, user_id: int) -> str:
-    me = await context.bot.get_me()
-    return f"https://t.me/{me.username}?start={user_id}"
+    name = await ensure_bot_username(context.bot)
+    return f"https://t.me/{name}?start={user_id}"
 
 
 def build_profile_text(user) -> str:
@@ -1334,7 +1417,7 @@ def build_user_card(target, viewer_id: int) -> str:
         f"• Number of likes: {target.likes}",
         "",
         f"Currently {format_online(target)}",
-        f"ID: `{format_public_id(target)}`",
+        f"ID: {public_id_link(target)}",
         "",
     ]
     if target.vip:
@@ -1366,9 +1449,13 @@ async def show_user_card(query, context, viewer_id: int, target) -> None:
     A continuous emoji cycle plays over the card when it arrives.
     Users without a photo get their AI avatar — everyone has a photo card.
     """
+    await ensure_bot_username(context.bot)
     liked = viewer_id in target.liked_by
     notify = db.get_user(viewer_id).notify_on_end
-    markup = profile_view_keyboard(target.user_id, liked, notify)
+    markup = profile_view_keyboard(
+        target.user_id, liked, notify,
+        back=context.user_data.get("profile_back", "back_list"),
+    )
     text = build_user_card(target, viewer_id)
 
     _remember_list_message(context, query)
@@ -1400,6 +1487,9 @@ async def show_user_card(query, context, viewer_id: int, target) -> None:
 
 async def reply_profile_card(message, viewer_id: int, target) -> None:
     """Same card, but as a reply (text input flows such as Find by ID)."""
+    bot_instance = getattr(message, "bot", None)
+    if bot_instance is not None:
+        await ensure_bot_username(bot_instance)
     markup = profile_view_keyboard(
         target.user_id,
         viewer_id in target.liked_by,
@@ -1475,7 +1565,7 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
             f"{_plain_label(target, viewer)}\n"
             f"📍 {dist:.0f} km away • {target.city or target.country or ''}\n"
             f"👀 {format_online(target)}\n"
-            f"ID: `{format_public_id(target)}`"
+            f"ID: {public_id_link(target)}"
         )
         try:
             await context.bot.send_photo(
@@ -1521,7 +1611,7 @@ def _browse_entry(target, viewer=None) -> str:
     return (
         f"{gender_emoji(target.gender)} {_list_badges(target)}"
         f"**{md_escape(display_name(target, viewer))}**"
-        f"{f', {target.age}' if target.age else ''} • `{public_id_slug(target)}`\n"
+        f"{f', {target.age}' if target.age else ''} • {public_id_link(target, public_id_slug(target))}\n"
         f"📍 {place}\n"
         f"👀 {format_online(target)}\n"
         f"{'〰️' * 8}"
@@ -1649,7 +1739,7 @@ async def begin_search(
         return pending
 
     if user.state == ChatState.CHATTING:
-        return "You're already in a chat! Use /stop to leave first.", chat_keyboard(), None
+        return "You're already in a chat! Use /stop to leave first.", chat_keyboard(secure=user.secure_chat), None
 
     if user.state == ChatState.SEARCHING:
         return "⏳ You're already searching for a partner...", searching_keyboard(), None
@@ -1902,7 +1992,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.state == ChatState.CHATTING:
         await update.message.reply_text(
             "You're already in a chat! Use /stop to leave first.",
-            reply_markup=chat_keyboard(),
+            reply_markup=chat_keyboard(secure=user.secure_chat),
         )
         return
 
@@ -2113,8 +2203,12 @@ async def link_anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await enforce_channel(update, context):
         return
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start=chat_{public_id_slug(user)}"
+    await ensure_bot_username(context.bot)
+    link = (
+        f"https://t.me/{bot_username()}?start=chat_{public_id_slug(user)}"
+        if bot_username()
+        else f"/start chat_{public_id_slug(user)}"
+    )
     await update.message.reply_text(
         f"👀 **Your anonymous Chat link:**\n`{link}`\n\n"
         f"Anyone who opens it lands straight on your profile card — they can "
@@ -2122,6 +2216,45 @@ async def link_anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def user_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Tapping or pasting a displayed `/user_xxx` ID opens that person's
+    profile card — the same flow as the /start chat_<id> deep link.
+    """
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = getattr(update.effective_user, "first_name", None)
+    parts = (update.message.text or "").strip().split()
+    if not parts:
+        return
+    token = parts[0].split("@", 1)[0]  # /user_9d0b@botname → /user_9d0b
+
+    db.register_user(user_id, username, name=first_name)
+    if not await enforce_channel(update, context):
+        return
+
+    target = db.resolve_id(token)
+    if target and target.user_id == user_id:
+        await update.message.reply_text(
+            "🙂 That's your own ID — open it with /profile.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if not target:
+        shown = token.replace("`", "")[:60]
+        await update.message.reply_text(
+            f"🔎 No account found for ID `{shown}`.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    db.record_view(user_id, target.user_id)
+    context.user_data["list_ids"] = [target.user_id]
+    context.user_data["list_title"] = "🔎 Search result"
+    context.user_data["list_kind"] = "plain"
+    await reply_profile_card(update.message, user_id, target)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2236,6 +2369,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    await ensure_bot_username(context.bot)
+
     user = db.get_user(user_id)
     if not user:
         db.register_user(user_id, query.from_user.username)
@@ -2243,6 +2378,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Force-join: "✅ I've Joined" re-check ───────────────
     if data == "joined_check":
+        _MEMBER_CACHE.pop(user_id, None)  # always re-verify this tap
         if await is_channel_member(context, user_id):
             await query.answer("✅ Welcome aboard!", show_alert=True)
             await safe_edit(
@@ -2366,7 +2502,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(
                 query,
                 "You're already in a chat! Use /stop to leave first.",
-                reply_markup=chat_keyboard(),
+                reply_markup=chat_keyboard(secure=user.secure_chat),
             )
             return
 
@@ -2429,7 +2565,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             me = db.get_user(user_id)
             lines = [
-                f"• {md_escape(display_name(u, me))} `{format_public_id(u)}`"
+                f"• {md_escape(display_name(u, me))} {public_id_link(u)}"
                 for u in blocked
             ]
             text = (
@@ -2586,8 +2722,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for liker in likers[:20]:
                 name = display_name(liker, user)
                 if name == "Stranger":
-                    name = public_id_slug(liker)
-                lines.append(f"• {md_escape(name)}")
+                    lines.append(f"• {public_id_link(liker)}")
+                else:
+                    lines.append(f"• {md_escape(name)}")
             more = f"\n…and {len(likers) - 20} more" if len(likers) > 20 else ""
             text = (
                 f"❤️ **People who liked you** ({len(likers)})\n\n"
@@ -2723,7 +2860,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(
             query,
             "🔎 **Find by ID**\n\n"
-            "Type the person's 6-digit ID (they can see it in /profile).",
+            "Type the person's ID: their 6-digit number (see yours in "
+            "/profile) or their `/user_xxx` ID — both work.",
             parse_mode="Markdown",
         )
 
@@ -2748,6 +2886,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ids = context.user_data.get("list_ids", [])
         title = context.user_data.get("list_title", "Results")
         kind = context.user_data.get("list_kind", "plain")
+
+        # Profile opened without a list behind it (deep link, /user_xxx,
+        # "someone viewed you" toast) — Back returns to the main menu.
+        if kind != "browse" and not ids:
+            await safe_edit(
+                query,
+                "🏠 **Main Menu**",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
 
         # A photo card is its own message — drop it and refresh the list.
         message = getattr(query, "message", None)
@@ -2799,10 +2948,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target:
             await query.answer("That account no longer exists.", show_alert=True)
             return
+        context.user_data["profile_back"] = "back_list"
         _remember_list_message(context, query)
         await show_user_card(query, context, user_id, target)
         if db.record_view(user_id, target.user_id):
             await notify_profile_view(context, user_id, target)
+
+    # ── In-chat: flip the match card into the partner's profile ──
+    elif data == "pview":
+        target = db.get_user(user.partner_id) if user.partner_id else None
+        if user.state != ChatState.CHATTING or not target:
+            await query.answer("⚠️ No active chat right now.", show_alert=True)
+            return
+        context.user_data["profile_back"] = "pback"
+        await safe_edit(
+            query,
+            build_user_card(target, user_id),
+            parse_mode="Markdown",
+            reply_markup=profile_view_keyboard(
+                target.user_id,
+                user_id in target.liked_by,
+                notify=user.notify_on_end,
+                back="pback",
+            ),
+        )
+
+    elif data == "pback":
+        stored = _user_data(context, user_id).get("match_card")
+        if (
+            user.state == ChatState.CHATTING
+            and user.partner_id
+            and stored
+            and stored[0] == user.partner_id
+        ):
+            context.user_data["profile_back"] = "back_list"
+            await safe_edit(
+                query, stored[1], parse_mode="Markdown", reply_markup=chat_keyboard(secure=user.secure_chat)
+            )
+        else:
+            await safe_edit(
+                query,
+                "🏠 **Main Menu**",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
 
     # ── Profile card actions ───────────────────────────────
     elif data.startswith("dm_"):
@@ -2852,7 +3041,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 **Direct chat started! Say hi 👋**\n"
             f"🪙 -{DIRECT_MESSAGE_COST} | Balance: {balance}",
             parse_mode="Markdown",
-            reply_markup=chat_keyboard(),
+            reply_markup=chat_keyboard(secure=db.get_user(user_id).secure_chat),
         )
         await notify_partner_found(context, user_id, target.user_id)
 
@@ -2872,8 +3061,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("🔒 Blocked — you won't be matched again.")
 
-    elif data.startswith("rpt_"):
-        target = db.get_user(int(data[len("rpt_"):]))
+    elif data.startswith("rpt_") or (
+        data.startswith("report_")
+        and data != "report_partner"
+        and data[len("report_"):].isdigit()
+    ):
+        # "report_<id>" is what 🚩 Report User sends — accept it as well
+        # as the short "rpt_<id>" form used by older messages.
+        raw_id = (
+            data[len("rpt_"):] if data.startswith("rpt_") else data[len("report_"):]
+        )
+        target = db.get_user(int(raw_id))
         if not target:
             await query.answer("That account no longer exists.", show_alert=True)
             return
@@ -2951,7 +3149,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             build_user_card(target, user_id),
             parse_mode="Markdown",
             reply_markup=profile_view_keyboard(
-                target.user_id, user_id in target.liked_by, notify=enabled
+                target.user_id, user_id in target.liked_by, notify=enabled,
+                back=context.user_data.get("profile_back", "back_list"),
             ),
         )
 
@@ -2986,7 +3185,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             build_user_card(target, user_id),
             parse_mode="Markdown",
             reply_markup=profile_view_keyboard(
-                target.user_id, liked, notify=user.notify_on_end
+                target.user_id, liked, notify=user.notify_on_end,
+                back=context.user_data.get("profile_back", "back_list"),
             ),
         )
 
@@ -3139,7 +3339,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"button below 👇\n\n"
             f"{gender_emoji(requester.gender)} "
             f"**{md_escape(display_name(requester, db.get_user(user_id)))}** "
-            f"• `{format_public_id(requester)}`",
+            f"• {public_id_link(requester)}",
             parse_mode="Markdown",
             reply_markup=request_keyboard(requester_id),
         )
@@ -3191,7 +3391,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + "\n\n📨 **Request sent — waiting for their answer.**",
             parse_mode="Markdown",
             reply_markup=profile_view_keyboard(
-                target.user_id, False, notify=user.notify_on_end
+                target.user_id, False, notify=user.notify_on_end,
+                back=context.user_data.get("profile_back", "back_list"),
             ),
         )
 
@@ -3231,7 +3432,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.pair_users(requester_id, user_id)
         await safe_edit(
             query, "✅ **Request accepted! Say hi 👋**",
-            parse_mode="Markdown", reply_markup=chat_keyboard(),
+            parse_mode="Markdown", reply_markup=chat_keyboard(secure=me.secure_chat),
         )
         await notify_partner_found(context, requester_id, user_id)
 
@@ -3260,6 +3461,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Already in your contacts.")
 
     # ── Chat controls ───────────────────────────────────────
+    elif data == "secure_chat":
+        if user.state != ChatState.CHATTING or not user.partner_id:
+            await query.answer("⚠️ No active chat right now.", show_alert=True)
+            return
+        enabled = not user.secure_chat
+        partner_id = db.set_secure_chat(user_id, enabled)
+        # Refresh the Secure Chat button label on the match card.
+        await safe_edit(
+            query,
+            "🔓 **Secure Chat ON**\n\nYour sent media can no longer be "
+            "forwarded or saved by your partner."
+            if enabled
+            else "🔐 **Secure Chat OFF**\n\nYour media can be forwarded and "
+            "saved again.",
+            parse_mode="Markdown",
+            reply_markup=chat_keyboard(secure=enabled),
+        )
+        if partner_id:
+            notice = (
+                "🤖 **Chat Notice** 👇\n\n"
+                "✅ **Private chat activated!**\n\n"
+                "- When activated, your sent media will no longer have the "
+                "ability to be forwarded, screenshot, or saved by contact!"
+                if enabled
+                else "🔓 **Private chat deactivated.**\n\n"
+                     "- Media can now be forwarded and saved again."
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=partner_id,
+                    text=notice,
+                    parse_mode="Markdown",
+                    reply_markup=chat_keyboard(secure=enabled),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify {partner_id} of secure chat: {e}")
+
     elif data == "end_chat":
         partner_id = db.end_chat(user_id)
         await safe_edit(
@@ -3301,6 +3539,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(
             query, "❌ Search cancelled.", reply_markup=main_menu_keyboard()
         )
+
+    else:
+        # Unknown/expired callback (old message, stale button) — never a
+        # silent dead tap: point the user back at the menu.
+        logger.debug(f"Unhandled callback data: {data!r}")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⌛ That button has expired — here's the menu again.",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not send stale-button notice: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3369,10 +3620,12 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_id"):
         context.user_data["awaiting_id"] = False
         raw = (update.message.text or "").strip()
-        target = db.resolve_id(raw) if raw.isdigit() else None
+        # Accepts 123456, user_xxx or /user_xxx — all resolve the same way.
+        target = db.resolve_id(raw)
         if not target:
+            shown = (raw or "?").replace("`", "")[:60]
             await update.message.reply_text(
-                f"🔎 No account found for ID `{raw or '?'}`.",
+                f"🔎 No account found for ID `{shown}`.",
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(),
             )
@@ -3507,8 +3760,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=uid,
                     text=(
-                        f"🔔 You have a new #direct message\n\n"
-                        f"To view the message, click the button below"
+                        "🔔 You have a new #direct message\n\n"
+                        "To view the message, click the button below"
                     ),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(
@@ -3589,46 +3842,61 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     partner_id = user.partner_id
     msg = update.message
+    # Secure Chat: block forwarding/saving of the relayed message.
+    secure = user.secure_chat
 
     try:
         # Relay different message types — raw content only, no emoji prefixes
         if msg.text:
-            await context.bot.send_message(chat_id=partner_id, text=msg.text)
+            await context.bot.send_message(
+                chat_id=partner_id, text=msg.text, protect_content=secure
+            )
         elif msg.photo:
             await context.bot.send_photo(
                 chat_id=partner_id,
                 photo=msg.photo[-1].file_id,
                 caption=msg.caption or "",
+                protect_content=secure,
             )
         elif msg.sticker:
-            await context.bot.send_sticker(chat_id=partner_id, sticker=msg.sticker.file_id)
+            await context.bot.send_sticker(
+                chat_id=partner_id, sticker=msg.sticker.file_id, protect_content=secure
+            )
         elif msg.voice:
-            await context.bot.send_voice(chat_id=partner_id, voice=msg.voice.file_id)
+            await context.bot.send_voice(
+                chat_id=partner_id, voice=msg.voice.file_id, protect_content=secure
+            )
         elif msg.video:
             await context.bot.send_video(
                 chat_id=partner_id,
                 video=msg.video.file_id,
                 caption=msg.caption or "",
+                protect_content=secure,
             )
         elif msg.video_note:
-            await context.bot.send_video_note(chat_id=partner_id, video_note=msg.video_note.file_id)
+            await context.bot.send_video_note(
+                chat_id=partner_id, video_note=msg.video_note.file_id, protect_content=secure
+            )
         elif msg.animation:
             await context.bot.send_animation(
                 chat_id=partner_id,
                 animation=msg.animation.file_id,
                 caption=msg.caption or "",
+                protect_content=secure,
             )
         elif msg.document:
             await context.bot.send_document(
                 chat_id=partner_id,
                 document=msg.document.file_id,
                 caption=msg.caption or "",
+                protect_content=secure,
             )
         elif msg.location:
             await context.bot.send_location(
                 chat_id=partner_id,
                 latitude=msg.location.latitude,
                 longitude=msg.location.longitude,
+                protect_content=secure,
             )
         else:
             await update.message.reply_text("⚠️ This message type is not supported.")
@@ -3739,6 +4007,11 @@ async def set_bot_commands(application):
 
 async def on_startup(application):
     """Start the hourly reminder sweep, then restore/backup the DB."""
+    try:
+        me = await application.bot.get_me()
+        set_bot_username(me.username)
+    except Exception as e:  # noqa: BLE001 — non-fatal, links degrade gracefully
+        logger.warning(f"Could not cache bot username at startup: {e}")
     await set_bot_commands(application)
     application.create_task(_reminder_loop(application.bot))
     backup_bot = await _get_backup_bot(application.bot)
@@ -3823,6 +4096,11 @@ def main():
     app.add_handler(CommandHandler("verifylist", verifylist_command))
     app.add_handler(CommandHandler("verifyok", verifyok_command))
     app.add_handler(CommandHandler("verifyno", verifyno_command))
+
+    # Tappable / pasted profile IDs: /user_9d0b (or /user_9d0b@botname)
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/user_[0-9a-zA-Z]+"), user_id_command
+    ))
 
     # Payments (Telegram Stars)
     app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))

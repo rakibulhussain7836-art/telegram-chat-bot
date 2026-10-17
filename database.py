@@ -42,8 +42,8 @@ class ChatState(Enum):
 
 
 # ── Economy / moderation settings ────────────────────────────────
-STARTING_COINS = 10        # free coins for every new user
-REFERRAL_REWARD = 15       # coins earned by the referrer per friend
+STARTING_COINS = 4         # free coins for every new user
+REFERRAL_REWARD = 8        # coins earned by the referrer per friend
 REFERRED_BONUS = 5         # extra coins for the newly referred friend
 GIRL_SEARCH_COST = 2       # coins per "Chat With Girl" search
 GUY_SEARCH_COST = 2        # coins per "Chat With Guy" search (Random stays free)
@@ -107,6 +107,8 @@ class UserProfile:
     preferred_gender: Gender = Gender.ANY
     state: ChatState = ChatState.IDLE
     partner_id: Optional[int] = None
+    # ── Secure Chat: when ON, relayed media can't be forwarded/saved ──
+    secure_chat: bool = False
     registered_at: float = field(default_factory=time.time)
     total_chats: int = 0
     # ── Economy ──
@@ -161,6 +163,7 @@ def _user_to_json(user: UserProfile) -> str:
             "preferred_gender": user.preferred_gender.value,
             "state": user.state.value,
             "partner_id": user.partner_id,
+            "secure_chat": user.secure_chat,
             "registered_at": user.registered_at,
             "total_chats": user.total_chats,
             "coins": user.coins,
@@ -226,6 +229,7 @@ def _user_from_json(data: str) -> UserProfile:
         ),
         state=_enum_or_none(ChatState, d.get("state"), ChatState.IDLE),
         partner_id=d.get("partner_id"),
+        secure_chat=bool(d.get("secure_chat", False)),
         registered_at=d.get("registered_at") or time.time(),
         total_chats=d.get("total_chats", 0),
         coins=d.get("coins", STARTING_COINS),
@@ -1257,6 +1261,7 @@ class Database:
             user = self.users[uid]
             user.state = ChatState.CHATTING
             user.search_pref = None
+            user.secure_chat = False
             user.total_chats += 1
 
         # Remember each other in chat history (newest first, capped)
@@ -1282,6 +1287,7 @@ class Database:
         user.state = ChatState.IDLE
         user.partner_id = None
         user.search_pref = None
+        user.secure_chat = False
         changed: list[UserProfile] = [user]
 
         if partner_id and partner_id in self.users:
@@ -1289,10 +1295,28 @@ class Database:
             partner.state = ChatState.IDLE
             partner.partner_id = None
             partner.search_pref = None
+            partner.secure_chat = False
             changed.append(partner)
 
         self._write_users(*changed)
         return partner_id
+
+    def set_secure_chat(self, user_id: int, enabled: bool) -> Optional[int]:
+        """
+        Turn Secure Chat on/off for the caller's active chat. The flag is
+        applied to BOTH partners so it stays in sync; returns the partner id.
+        """
+        user = self.users.get(user_id)
+        if not user or user.state != ChatState.CHATTING or not user.partner_id:
+            return None
+        partner = self.users.get(user.partner_id)
+        user.secure_chat = enabled
+        changed = [user]
+        if partner:
+            partner.secure_chat = enabled
+            changed.append(partner)
+        self._write_users(*changed)
+        return user.partner_id
 
     # ── Stats ────────────────────────────────────────────────────
 

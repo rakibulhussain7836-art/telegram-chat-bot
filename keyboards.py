@@ -247,17 +247,22 @@ def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
 
 # ── In-chat controls ────────────────────────────────────────────
 
-def chat_keyboard() -> InlineKeyboardMarkup:
+def chat_keyboard(secure: bool = False) -> InlineKeyboardMarkup:
+    """
+    MeChat-style in-chat bar: Secure Chat / Contact Profile,
+    End Chat / Report. `secure` reflects the Secure Chat toggle so the
+    button shows its current state.
+    """
+    secure_label = "🔓 Secure Chat ON" if secure else "🔐 Secure Chat"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏭️ Next Partner", callback_data="next_partner"),
-            InlineKeyboardButton("🛑 End Chat", callback_data="end_chat"),
+            InlineKeyboardButton(secure_label, callback_data="secure_chat"),
+            InlineKeyboardButton("👤 Contact Profile", callback_data="pview"),
         ],
         [
-            InlineKeyboardButton("❤️ Like Partner", callback_data="like_partner"),
-            InlineKeyboardButton("🚩 Report Partner", callback_data="report_partner"),
+            InlineKeyboardButton("🛑 End Chat", callback_data="end_chat"),
+            InlineKeyboardButton("🚩 Report", callback_data="report_partner"),
         ],
-        [InlineKeyboardButton("➕ Add to Contacts", callback_data="add_contact")],
     ])
 
 
@@ -298,7 +303,7 @@ def share_location_keyboard() -> InlineKeyboardMarkup:
 # ── Someone else's profile (viewed by ID / Nearby / Contacts) ──
 
 def profile_view_keyboard(
-    target_id: int, liked: bool, notify: bool = False
+    target_id: int, liked: bool, notify: bool = False, back: str = "back_list"
 ) -> InlineKeyboardMarkup:
     like_label = "💔 Unlike" if liked else "❤️ Like"
     notify_label = "🔕 Alerts off" if notify else "🔔 Notify me when chat ends"
@@ -316,13 +321,13 @@ def profile_view_keyboard(
         ],
         [
             InlineKeyboardButton("🔒 Block User", callback_data=f"block_{target_id}"),
-            InlineKeyboardButton("🚩 Report User", callback_data=f"report_{target_id}"),
+            InlineKeyboardButton("🚩 Report User", callback_data=f"rpt_{target_id}"),
         ],
         [
             InlineKeyboardButton("➕ Add to Contacts", callback_data=f"addc_{target_id}"),
             InlineKeyboardButton(notify_label, callback_data=f"notify_{target_id}"),
         ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_list")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=back)],
     ])
 
 

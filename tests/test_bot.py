@@ -215,10 +215,10 @@ def test_guy_search_without_coins_is_refused(fresh_db):
     assert user.coins == 1
 
 
-def test_new_users_start_with_10_tokens(fresh_db):
+def test_new_users_start_with_4_tokens(fresh_db):
     user = fresh_db.register_user(42)
-    assert user.coins == 10
-    assert STARTING_COINS == 10
+    assert user.coins == 4
+    assert STARTING_COINS == 4
 
 
 def test_search_requires_complete_profile(fresh_db):
@@ -2523,3 +2523,279 @@ def test_a_github_restore_still_seeds_the_channel(tmp_path, monkeypatch):
     assert run(bot.upload_db_backup(Recorder())) is True
     assert len(channel_uploads) == 1  # channel seeded
     assert gh_calls == []  # GitHub already has this exact snapshot → skipped
+
+
+# ── Tappable public IDs (tap /user_xxx → open that profile) ──────
+
+def test_public_id_link_falls_back_to_code_span(fresh_db):
+    user = register(fresh_db, 2)
+    assert bot.public_id_link(user) == f"`{bot.format_public_id(user)}`"
+
+
+def test_public_id_link_becomes_profile_deep_link(fresh_db, monkeypatch):
+    monkeypatch.setattr(bot, "_bot_username", "talkNhappybot")
+    user = register(fresh_db, 2)
+    slug = bot.public_id_slug(user)
+    assert bot.public_id_link(user) == (
+        f"[{bot.format_public_id(user)}]"
+        f"(https://t.me/talkNhappybot?start=chat_{slug})"
+    )
+
+
+def test_match_card_carries_tappable_id(fresh_db, monkeypatch):
+    monkeypatch.setattr(bot, "_bot_username", "talkNhappybot")
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(2, search_pref=None)
+    ctx = FakeContext()
+
+    text, _, _ = run(bot.begin_search(ctx, 1, Gender.FEMALE))
+
+    assert "Partner found" in text
+    assert len(ctx.bot.photos) == 2
+    for card in ctx.bot.photos:
+        assert "https://t.me/talkNhappybot?start=chat_" in card["caption"]
+
+
+def test_user_id_command_opens_profile(fresh_db):
+    register(fresh_db, 1)
+    target = register(fresh_db, 2, gender=Gender.FEMALE)
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text=f"/{bot.public_id_slug(target)}"))
+
+    run(bot.user_id_command(update, context))
+
+    reply = update.message.replies[0]
+    assert f"`{bot.format_public_id(target)}`" in reply["text"]
+    labels = [b.text for b in _buttons(reply["reply_markup"])]
+    assert any("Like" in label for label in labels)
+
+
+def test_user_id_command_unknown_id(fresh_db):
+    register(fresh_db, 1)
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text="/user_zzzz"))
+
+    run(bot.user_id_command(update, context))
+
+    assert "No account found" in update.message.replies[0]["text"]
+
+
+def test_user_id_command_own_id(fresh_db):
+    user = register(fresh_db, 1)
+    context = FakeContext()
+    update = FakeUpdate(1, message=FakeMessage(text=f"/{bot.public_id_slug(user)}"))
+
+    run(bot.user_id_command(update, context))
+
+    assert "your own ID" in update.message.replies[0]["text"]
+
+
+def test_id_search_accepts_user_slug(fresh_db):
+    register(fresh_db, 1)
+    target = register(fresh_db, 2, gender=Gender.FEMALE)
+    context = FakeContext()
+    context.user_data["awaiting_id"] = True
+    update = FakeUpdate(
+        1, message=FakeMessage(text=f"/{bot.public_id_slug(target)}")
+    )
+
+    run(bot.relay_message(update, context))
+
+    reply = update.message.replies[0]
+    assert f"`{bot.format_public_id(target)}`" in reply["text"]
+
+
+# ── 👤 Partner Profile / ⬅️ Back on the match card ───────────────
+
+def test_chat_keyboard_has_partner_profile_button():
+    labels = [b.callback_data for b in _buttons(bot.chat_keyboard())]
+    assert "pview" in labels
+    assert "secure_chat" in labels
+    assert "end_chat" in labels
+    assert "report_partner" in labels
+
+
+def test_pview_flips_match_card_and_pback_restores_it(fresh_db):
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    assert fresh_db.find_match(1) == 2
+    fresh_db.pair_users(1, 2)
+
+    context = FakeContext()
+    match_text = "🎉 **Partner found!** ... card body ..."
+    context.user_data["match_card"] = (2, match_text)
+
+    # 👤 Partner Profile turns the card into the partner's profile
+    query, _ = press(1, "pview", context)
+    text = query.edits[-1]["text"]
+    assert "Age:" in text and "ID:" in text
+    labels = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "pback" in labels
+    assert "dm_2" in labels  # full profile actions are available in-chat
+
+    # ⬅️ Back flips the very same message back to the match card
+    query2, _ = press(1, "pback", context)
+    assert query2.edits[-1]["text"] == match_text
+    labels2 = [b.callback_data for b in _buttons(query2.edits[-1]["reply_markup"])]
+    assert "secure_chat" in labels2 and "pview" in labels2
+
+
+# ── 🔐 Secure Chat (MeChat-style) ───────────────────────────────
+
+def _paired(fresh_db, a=1, b=2):
+    register(fresh_db, a, gender=Gender.MALE, country="US")
+    register(fresh_db, b, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(a)
+    fresh_db.add_to_queue(b)
+    fresh_db.pair_users(a, b)
+
+
+def test_secure_chat_toggle_sets_both_and_notifies(fresh_db):
+    _paired(fresh_db)
+    assert fresh_db.get_user(1).secure_chat is False
+
+    query, ctx = press(1, "secure_chat")
+
+    # Both partners are flagged, so the toggle stays in sync.
+    assert fresh_db.get_user(1).secure_chat is True
+    assert fresh_db.get_user(2).secure_chat is True
+    # The match-card button now reflects the ON state.
+    labels = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "secure_chat" in labels
+    # The partner got the "Private chat activated" notice.
+    assert any("Private chat activated" in m["text"] for m in ctx.bot.sent)
+
+
+def test_secure_chat_toggle_off(fresh_db):
+    _paired(fresh_db)
+    press(1, "secure_chat")          # on
+    query, ctx = press(1, "secure_chat")  # off
+
+    assert fresh_db.get_user(1).secure_chat is False
+    assert fresh_db.get_user(2).secure_chat is False
+    assert any("deactivated" in m["text"] for m in ctx.bot.sent)
+
+
+def test_secure_chat_refused_without_active_chat(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "secure_chat")
+    assert query.answers[-1]["show_alert"] is True
+    assert query.edits == []
+
+
+def test_secure_chat_resets_on_new_match_and_end_chat(fresh_db):
+    _paired(fresh_db)
+    fresh_db.set_secure_chat(1, True)
+    assert fresh_db.get_user(1).secure_chat is True
+
+    fresh_db.end_chat(1)
+    assert fresh_db.get_user(1).secure_chat is False
+    assert fresh_db.get_user(2).secure_chat is False
+
+    fresh_db.pair_users(1, 2)
+    assert fresh_db.get_user(1).secure_chat is False
+
+
+def test_relay_sets_protect_content_when_secure(fresh_db):
+    _paired(fresh_db)
+    ctx = FakeContext()
+
+    # Secure OFF → protect_content False
+    update = FakeUpdate(1, message=FakeMessage(text="hello"))
+    asyncio.run(bot.relay_message(update, ctx))
+    assert ctx.bot.sent[-1]["protect_content"] is False
+
+    # Secure ON → protect_content True
+    fresh_db.set_secure_chat(1, True)
+    update2 = FakeUpdate(1, message=FakeMessage(text="secret"))
+    asyncio.run(bot.relay_message(update2, ctx))
+    assert ctx.bot.sent[-1]["protect_content"] is True
+
+
+def test_chat_keyboard_secure_label_changes():
+    off = [b.text for row in bot.chat_keyboard().inline_keyboard for b in row]
+    on = [b.text for row in bot.chat_keyboard(secure=True).inline_keyboard for b in row]
+    assert any("Secure Chat" in t for t in off)
+    assert any("ON" in t for t in on)
+
+
+def test_pview_without_active_chat_is_refused(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "pview")
+    assert query.answers[-1]["show_alert"] is True
+    assert query.edits == []
+
+
+def test_pback_without_active_chat_returns_to_menu(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "pback")
+    assert "Main Menu" in query.edits[-1]["text"]
+
+
+def test_back_without_a_list_returns_to_menu(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "back_list")
+    assert "Main Menu" in query.edits[-1]["text"]
+
+
+# ── 🚩 Report button on profile cards ───────────────────────────
+
+def test_report_button_from_profile_keyboard_works(fresh_db):
+    target = 300
+    register(fresh_db, target, gender=Gender.FEMALE)
+    markup = bot.profile_view_keyboard(target, liked=False)
+    report_btn = next(b for b in _buttons(markup) if "Report" in b.text)
+
+    query, _ = press(1, report_btn.callback_data)
+    assert "Report submitted" in query.edits[-1]["text"]
+
+
+def test_report_from_keyboard_bans_at_threshold(fresh_db):
+    from database import BAN_REPORT_THRESHOLD
+
+    target = 300
+    register(fresh_db, target, gender=Gender.FEMALE)
+    report_btn = next(
+        b for b in _buttons(bot.profile_view_keyboard(target, liked=False))
+        if "Report" in b.text
+    )
+    for i in range(BAN_REPORT_THRESHOLD):
+        reporter = 400 + i
+        register(fresh_db, reporter)
+        press(reporter, report_btn.callback_data)
+    assert fresh_db.get_user(target).banned is True
+
+
+def test_stale_callback_points_back_to_menu(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "button_from_an_old_message")
+    assert any("expired" in m["text"] for m in context.bot.sent)
+
+
+# -- Force-join membership cache ----------------------------------
+
+def test_channel_membership_is_cached_and_joined_check_is_fresh(
+    fresh_db, monkeypatch
+):
+    _enable_force_join(monkeypatch)
+    register(fresh_db, 1)
+
+    context = FakeContext()
+    context.bot.member_status = "member"
+    assert run(bot.is_channel_member(context, 1)) is True
+
+    # positive answers stay cached for a short while (no extra API calls)
+    context.bot.member_status = "left"
+    assert run(bot.is_channel_member(context, 1)) is True
+
+    # ...but "✅ I've Joined" always bypasses the cache and re-checks
+    query, _ = press(1, "joined_check", context)
+    assert "haven't joined" in query.answers[-1]["text"]
+
+    # fresh membership flips the same button back to the welcome menu
+    context.bot.member_status = "member"
+    query, _ = press(1, "joined_check", context)
+    assert "Welcome" in query.answers[-1]["text"]

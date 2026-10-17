@@ -35,6 +35,8 @@ def fresh_db():
         bot.db.pending_verifications.clear()
         bot.db.pending_dms.clear()
         bot.db._by_public_id.clear()
+        # Force-join answers must never leak between tests
+        bot._MEMBER_CACHE.clear()
 
     clear()
     yield bot.db

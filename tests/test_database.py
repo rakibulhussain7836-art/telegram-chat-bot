@@ -330,9 +330,9 @@ def test_girl_search_is_not_free():
 
 
 def test_price_list_matches_the_release_notes():
-    """New users get 10 tokens; guy/girl search and chat requests cost 2,
+    """New users get 4 tokens; guy/girl search and chat requests cost 2,
     switching on the 🔔 notify alert costs 1."""
-    assert STARTING_COINS == 10
+    assert STARTING_COINS == 4
     assert GIRL_SEARCH_COST == 2
     assert GUY_SEARCH_COST == 2
     assert CHAT_REQUEST_COST == 2
