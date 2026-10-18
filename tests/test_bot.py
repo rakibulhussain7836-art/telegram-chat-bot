@@ -1163,6 +1163,36 @@ def test_user_card_shows_name_age_and_online_status(fresh_db):
     assert f"`{bot.format_public_id(target)}`" in text
 
 
+def test_user_card_shows_all_profile_information(fresh_db):
+    """👤 Contact Profile must list every public field — name, gender,
+    age, city, country, preference, likes, chats, contacts and more."""
+    register(fresh_db, 1)
+    target = register(fresh_db, 2)
+    fresh_db.update_name(2, "Shivani")
+    fresh_db.update_age(2, 19)
+    fresh_db.update_city(2, "Bangalore")
+    fresh_db.update_country(2, "India")
+    fresh_db.update_gender(2, Gender.FEMALE)
+    fresh_db.pair_users(1, 2)
+
+    text = bot.build_user_card(target, 1)
+    for expected in (
+        "Name: Shivani",
+        "Gender: 👩 Female",
+        "Age: 19",
+        "City: Bangalore",
+        "Country: India",
+        "Number of likes:",
+        "Looking for:",
+        "Total chats:",
+        "Contacts:",
+        "Member since:",
+        "Currently",
+        "ID:",
+    ):
+        assert expected in text, f"missing {expected!r} in card:\n{text}"
+
+
 def test_profile_card_buttons_match_reference(fresh_db):
     register(fresh_db, 1)
     register(fresh_db, 2)

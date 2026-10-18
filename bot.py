@@ -1451,20 +1451,32 @@ def verified_label(user) -> str:
 
 
 def build_user_card(target, viewer_id: int) -> str:
-    """Profile card in the reference bot's bullet style."""
+    """Full profile card — every public field, MeChat bullet style."""
     viewer = db.get_user(viewer_id)
-    place_parts = [p for p in (target.country, target.city) if p]
-    place = " (".join([place_parts[0], place_parts[1] + ")"]) if len(place_parts) > 1 else (place_parts[0] if place_parts else "Not set")
     lines = [
         f"{gender_emoji(target.gender)} **{md_escape(display_name(target, viewer))}**",
+        f"• Name: {md_escape(display_name(target, viewer))}",
+        f"• Gender: {format_gender(target.gender)}",
         f"• Age: {target.age if target.age else '—'}",
-        f"• City: {place}",
+        f"• City: {target.city or 'Not set'}",
+        f"• Country: {target.country or 'Not set'}",
         f"• Number of likes: {target.likes}",
         "",
         f"Currently {format_online(target)}",
         f"ID: {public_id_link(target)}",
         "",
     ]
+    pref = (
+        format_gender(target.preferred_gender)
+        if target.preferred_gender != Gender.ANY
+        else "🌍 Anyone"
+    )
+    lines.append(f"🔹 Looking for: {pref}")
+    lines.append(f"🔹 Total chats: {target.total_chats}")
+    lines.append(f"📇 Contacts: {len(target.contacts)}")
+    if target.registered_at:
+        joined = time.strftime("%d %b %Y", time.localtime(target.registered_at))
+        lines.append(f"📅 Member since: {joined}")
     if target.vip:
         lines.append("👑 VIP member")
     lines.append(f"🪩 {verified_label(target)}")
