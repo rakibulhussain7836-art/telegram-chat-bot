@@ -15,6 +15,8 @@ import logging
 import os
 from typing import Optional
 
+from telegram import InlineKeyboardMarkup, ReplyKeyboardMarkup
+
 logger = logging.getLogger(__name__)
 
 ANIMATIONS_ENABLED = os.getenv("BOT_ANIMATIONS", "1") == "1"
@@ -395,6 +397,16 @@ async def animate_photo_card(
     if not frames:
         return False
 
+    # ReplyKeyboardMarkup (the persistent bottom bar) can ONLY be set on a
+    # fresh send — Telegram edits may carry inline keyboards, never reply
+    # keyboards. Attach it to the initial send and leave the caption edits
+    # with no markup so the bar updates the moment the card arrives.
+    bar_markup = None
+    card_markup = reply_markup
+    if isinstance(reply_markup, ReplyKeyboardMarkup):
+        bar_markup = reply_markup
+        card_markup = None
+
     if not ANIMATIONS_ENABLED:
         try:
             msg = await bot.send_photo(
@@ -413,7 +425,11 @@ async def animate_photo_card(
 
     try:
         msg = await bot.send_photo(
-            chat_id=chat_id, photo=photo, caption=frames[0], parse_mode=parse_mode
+            chat_id=chat_id,
+            photo=photo,
+            caption=frames[0],
+            parse_mode=parse_mode,
+            reply_markup=bar_markup,
         )
     except Exception as e:  # noqa: BLE001
         logger.debug(f"photo card send skipped: {e}")
@@ -423,7 +439,7 @@ async def animate_photo_card(
     if on_sent is not None:
         on_sent(msg)
     await animate_message_caption(
-        msg, frames[1:], reply_markup=reply_markup, parse_mode=parse_mode,
+        msg, frames[1:], reply_markup=card_markup, parse_mode=parse_mode,
         interval=interval,
     )
     return True

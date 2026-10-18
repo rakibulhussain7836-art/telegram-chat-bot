@@ -127,6 +127,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Bump on every deploy so the startup log + /version show exactly what's live.
+BOT_VERSION = "2026.10.18.1"
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Telegram user ID of the admin (you) — reviews verification photos.
 _admin = os.getenv("ADMIN_ID", "")
@@ -2024,6 +2027,11 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
 # ═══════════════════════════════════════════════════════════════════
 #  COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the running bot version — used to verify a deploy actually landed."""
+    await update.message.reply_text(f"talkNhappybot v{BOT_VERSION}")
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -4370,6 +4378,7 @@ async def set_bot_commands(application):
 
 async def on_startup(application):
     """Start the hourly reminder sweep, then restore/backup the DB."""
+    logger.info(f"talkNhappybot v{BOT_VERSION} starting up")
     try:
         me = await application.bot.get_me()
         set_bot_username(me.username)
@@ -4454,6 +4463,7 @@ def main():
     app.add_handler(CommandHandler("link", link_command))
     app.add_handler(CommandHandler("link_anon", link_anon_command))
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("version", version_command))
 
     # Admin verification review
     app.add_handler(CommandHandler("verifylist", verifylist_command))
