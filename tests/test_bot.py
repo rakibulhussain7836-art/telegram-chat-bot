@@ -1703,6 +1703,100 @@ def test_a_failed_reminder_is_retried_later(fresh_db):
     assert sent == 1
 
 
+# ── 📨 Daily broadcast: one automated message a day to EVERY member ──
+
+def _set_broadcast(monkeypatch, text="Hello everyone!"):
+    """Enable the broadcast for a test and make it fast (no sleep)."""
+    monkeypatch.setattr(bot, "DAILY_BROADCAST_TEXT", text)
+    monkeypatch.setattr(bot, "DAILY_BROADCAST_DELAY", 0)
+
+
+def test_daily_broadcast_goes_out_to_every_member_once_per_day(fresh_db, monkeypatch):
+    _set_broadcast(monkeypatch)
+    for uid in (1, 2, 3):
+        register(fresh_db, uid)
+    context = FakeContext()
+
+    sent = asyncio.run(
+        bot.send_daily_broadcast(context.bot, current_hour=18, today="2030-01-01")
+    )
+    assert sent == 3
+    assert {m["chat_id"] for m in context.bot.sent} == {1, 2, 3}
+    for uid in (1, 2, 3):
+        assert fresh_db.get_user(uid).broadcast_date == "2030-01-01"
+
+    # a second sweep the same day stays silent (no double-send)
+    assert (
+        asyncio.run(
+            bot.send_daily_broadcast(context.bot, current_hour=20, today="2030-01-01")
+        )
+        == 0
+    )
+    # before the configured hour nothing goes out
+    assert (
+        asyncio.run(
+            bot.send_daily_broadcast(context.bot, current_hour=9, today="2030-01-02")
+        )
+        == 0
+    )
+    # the next day it goes out again — exactly one message per member
+    assert (
+        asyncio.run(
+            bot.send_daily_broadcast(context.bot, current_hour=18, today="2030-01-02")
+        )
+        == 3
+    )
+    for uid in (1, 2, 3):
+        assert len([m for m in context.bot.sent if m["chat_id"] == uid]) == 2
+
+
+def test_daily_broadcast_disabled_with_empty_text(fresh_db, monkeypatch):
+    monkeypatch.setattr(bot, "DAILY_BROADCAST_TEXT", "")
+    register(fresh_db, 1)
+    context = FakeContext()
+
+    sent = asyncio.run(
+        bot.send_daily_broadcast(context.bot, current_hour=18, today="2030-01-01")
+    )
+    assert sent == 0
+    assert context.bot.sent == []
+
+
+def test_daily_broadcast_skips_banned_users(fresh_db, monkeypatch):
+    _set_broadcast(monkeypatch)
+    register(fresh_db, 1)
+    register(fresh_db, 2)
+    fresh_db.get_user(2).banned = True
+    context = FakeContext()
+
+    sent = asyncio.run(
+        bot.send_daily_broadcast(context.bot, current_hour=18, today="2030-01-01")
+    )
+    assert sent == 1
+    assert [m["chat_id"] for m in context.bot.sent] == [1]
+
+
+def test_daily_broadcast_is_not_burned_by_a_failed_send(fresh_db, monkeypatch):
+    _set_broadcast(monkeypatch)
+    register(fresh_db, 1)
+
+    class BrokenBot:
+        async def send_message(self, **kwargs):
+            raise RuntimeError("chat not found")
+
+    sent = asyncio.run(
+        bot.send_daily_broadcast(BrokenBot(), current_hour=18, today="2030-01-01")
+    )
+    assert sent == 0
+    assert fresh_db.get_user(1).broadcast_date != "2030-01-01"  # not burned
+
+    context = FakeContext()
+    sent = asyncio.run(
+        bot.send_daily_broadcast(context.bot, current_hour=18, today="2030-01-01")
+    )
+    assert sent == 1
+
+
 # ── Persistent bottom bar ──────────────────────────────────────
 
 def test_reply_keyboard_starts_random_chat(fresh_db):

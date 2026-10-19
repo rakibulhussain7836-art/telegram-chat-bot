@@ -467,6 +467,79 @@ async def _reminder_loop(bot) -> None:
             logger.warning(f"Reminder loop error: {e}")
 
 
+# ── 📨 Daily broadcast: one automated message a day to EVERY member ──
+# Configurable via .env. Leave DAILY_BROADCAST empty to disable it.
+
+DAILY_BROADCAST_TEXT = os.getenv("DAILY_BROADCAST", "").strip()
+# Hour (bot timezone, 0-23) the daily message goes out; default 18 (6 PM).
+DAILY_BROADCAST_HOUR = int(os.getenv("DAILY_BROADCAST_HOUR", "18"))
+# Small delay between sends so we stay well under Telegram's flood limit.
+DAILY_BROADCAST_DELAY = float(os.getenv("DAILY_BROADCAST_DELAY", "0.05"))
+# How often the sweep loop wakes up to check whether it's time to send.
+BROADCAST_SWEEP_INTERVAL = 60  # seconds
+
+
+def broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Start Chatting", callback_data="find_partner")],
+        [InlineKeyboardButton("🎁 Daily Check-in", callback_data="checkin")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_menu")],
+    ])
+
+
+def _broadcast_due(hour: int) -> bool:
+    """True once the local clock has reached today's broadcast hour."""
+    return hour >= DAILY_BROADCAST_HOUR
+
+
+async def send_daily_broadcast(bot, current_hour=None, today=None) -> int:
+    """
+    Send DAILY_BROADCAST_TEXT to EVERY member — at most one message per
+    user per day. Users who already got today's broadcast (tracked in
+    user.broadcast_date) are skipped, so restarts / overlapping sweeps can
+    never double-send. Banned users and dead chats are skipped silently.
+    Returns how many messages went out.
+    """
+    if not DAILY_BROADCAST_TEXT:
+        return 0
+    hour = bot_now().hour if current_hour is None else current_hour
+    if not _broadcast_due(hour):
+        return 0
+    date = today or bot_today()
+    sent = 0
+    for user in list(db.users.values()):
+        if user.banned or user.broadcast_date == date:
+            continue
+        try:
+            await bot.send_message(
+                chat_id=user.user_id,
+                text=DAILY_BROADCAST_TEXT,
+                parse_mode="Markdown",
+                reply_markup=broadcast_keyboard(),
+            )
+            db.mark_broadcast_sent(user.user_id, date)
+            sent += 1
+            if DAILY_BROADCAST_DELAY > 0:
+                await asyncio.sleep(DAILY_BROADCAST_DELAY)
+        except Exception as e:  # noqa: BLE001 — one dead chat stops no sweep
+            logger.debug(f"Daily broadcast to {user.user_id} failed: {e}")
+    return sent
+
+
+async def _broadcast_loop(bot) -> None:
+    """Wake up every minute; send the daily message once the hour is reached."""
+    while True:
+        await asyncio.sleep(BROADCAST_SWEEP_INTERVAL)
+        try:
+            sent = await send_daily_broadcast(bot)
+            if sent:
+                logger.info(f"📨 Daily broadcast sent to {sent} members.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Broadcast loop error: {e}")
+
+
 WEEKLY_SWEEP_INTERVAL = 1800  # every 30 min: finalize week + expire statuses
 
 
@@ -5536,6 +5609,7 @@ async def on_startup(application):
     await set_bot_commands(application)
     application.create_task(_reminder_loop(application.bot))
     application.create_task(_weekly_sweep_loop(application.bot))
+    application.create_task(_broadcast_loop(application.bot))
     backup_bot = await _get_backup_bot(application.bot)
     await restore_db_from_backup(backup_bot)
     await _startup_checks(application)

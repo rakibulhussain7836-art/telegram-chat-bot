@@ -340,7 +340,7 @@ def test_rows_without_reminder_fields_opt_out_by_default(tmp_path):
         "SELECT data FROM users WHERE user_id = 1"
     ).fetchone()
     row = json.loads(data)
-    for old_key in ("daily_reminder", "reminder_date"):
+    for old_key in ("daily_reminder", "reminder_date", "broadcast_date"):
         row.pop(old_key, None)
     conn.execute(
         "UPDATE users SET data = ? WHERE user_id = 1", (json.dumps(row),)
@@ -353,6 +353,21 @@ def test_rows_without_reminder_fields_opt_out_by_default(tmp_path):
     assert user is not None
     assert user.daily_reminder is False
     assert not user.reminder_date  # blank, i.e. never sent
+    assert not user.broadcast_date  # blank, i.e. never sent
+    db2.close()
+
+
+def test_daily_broadcast_date_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.mark_broadcast_sent(1, "2030-01-01")
+    db.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user.broadcast_date == "2030-01-01"
     db2.close()
 
 

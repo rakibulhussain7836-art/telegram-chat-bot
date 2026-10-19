@@ -246,6 +246,8 @@ class UserProfile:
     # ── Daily reminder (one nudge a day to come back and chat) ──
     daily_reminder: bool = False
     reminder_date: str = ""
+    # ── Daily broadcast (one automated message a day to EVERY member) ──
+    broadcast_date: str = ""
     # ── 🟢 Availability status (Ready / Busy / Invisible) ──
     availability: Availability = Availability.READY
     availability_set_at: float = 0.0
@@ -309,6 +311,7 @@ def _user_to_json(user: UserProfile) -> str:
             "reward_count": user.reward_count,
             "daily_reminder": user.daily_reminder,
             "reminder_date": user.reminder_date,
+            "broadcast_date": user.broadcast_date,
             "availability": user.availability.value,
             "availability_set_at": user.availability_set_at,
             "last_checkin": user.last_checkin,
@@ -385,6 +388,7 @@ def _user_from_json(data: str) -> UserProfile:
         reward_count=d.get("reward_count", 0),
         daily_reminder=bool(d.get("daily_reminder", False)),
         reminder_date=d.get("reminder_date", ""),
+        broadcast_date=d.get("broadcast_date", ""),
         availability=_enum_or_none(Availability, d.get("availability"), Availability.READY),
         availability_set_at=d.get("availability_set_at", 0.0),
         last_checkin=d.get("last_checkin", ""),
@@ -868,6 +872,15 @@ class Database:
         if not user:
             return False
         user.reminder_date = date
+        self._write_user(user)
+        return True
+
+    def mark_broadcast_sent(self, user_id: int, date: str) -> bool:
+        """Remember the day this user got the daily broadcast (one per day)."""
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.broadcast_date = date
         self._write_user(user)
         return True
 
