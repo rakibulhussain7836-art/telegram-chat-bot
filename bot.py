@@ -52,6 +52,7 @@ from database import (
     db,
     Gender,
     ChatState,
+    Availability,
     STARTING_COINS,
     REFERRAL_REWARD,
     REFERRED_BONUS,
@@ -65,10 +66,18 @@ from database import (
     NEARBY_RADIUS_KM,
     BROWSE_PAGE_SIZE,
     DAILY_REWARD_COINS,
+    DAILY_CHECKIN_COINS,
     REMINDER_HOUR_START,
     REMINDER_HOUR_END,
+    WEEKLY_REWARD_COINS,
+    POINT_CAPS,
+    AVAILABILITY_TTL,
     format_public_id,
     public_id_slug,
+    bot_today,
+    bot_now,
+    current_week_id,
+    previous_week_id,
 )
 from keyboards import (
     gender_keyboard,
@@ -98,6 +107,14 @@ from keyboards import (
     vip_keyboard,
     verify_keyboard,
     force_join_keyboard,
+    discover_keyboard,
+    privacy_keyboard,
+    availability_keyboard,
+    games_menu_keyboard,
+    game_controls_keyboard,
+    checkin_keyboard,
+    leaderboard_keyboard,
+    theme_keyboard,
     NEW_CHAT_LABEL,
     BROWSE_LABEL,
     NEARBY_LABEL,
@@ -106,6 +123,8 @@ from keyboards import (
     END_CHAT_LABEL,
     DELETE_LABEL,
 )
+import games as games_mod
+from themes import THEMES, BUYABLE_THEMES, get_theme, theme_line
 from animations import (
     ANIMATIONS_ENABLED,
     animate_edit,
@@ -128,7 +147,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bump on every deploy so the startup log + /version show exactly what's live.
-BOT_VERSION = "2026.10.18.1"
+BOT_VERSION = "2026.10.19.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Telegram user ID of the admin (you) — reviews verification photos.
@@ -185,6 +204,11 @@ BOT_COMMANDS = [
     BotCommand("help", "❓ How it works"),
     BotCommand("link", "🔗 Invite & earn coins"),
     BotCommand("credit", "💰 Check your coins or buy more"),
+    BotCommand("checkin", "🎁 Daily check-in reward"),
+    BotCommand("games", "🎮 Play mini-games"),
+    BotCommand("leaderboard", "🏆 Weekly leaderboard"),
+    BotCommand("themes", "🎨 Customize your theme"),
+    BotCommand("avail", "🟢 Set availability status"),
     BotCommand("link_anon", "👀 Get your anonymous Chat link"),
     BotCommand("vip", "🔥 Upgrade to VIP"),
 ]
@@ -244,12 +268,20 @@ HELP_MSG = """
 
 **Coins:**
 • 🎁 Every new account starts with **{free} 🪙**
+• 🎁 **Daily Check-in** — claim **{checkin} 🪙** once per day
+• 🏆 **Weekly Leaderboard** — top 3 earn 6 / 4 / 2 coins every week
 • Chatting with anyone is **free**
 • Searching for a 🕺 **Guy** or a 👩 **Girl** costs **{cost} 🪙 per search**
   (🎲 Random search is free)
 • 👑 **VIP** members search for free
 • Earn Coins by inviting friends with /link
 • Buy Coins with Telegram Stars via /credit
+
+**Fun:**
+• 🎮 **Mini-Games** — Would You Rather, Truth or Dare, Quiz Battle,
+  Emoji Guess, Rapid-Fire, Guess the Number, Friendship Quiz
+• 🎨 **Custom Themes** — unlock with coins (/themes)
+• 🟢 **Availability** — Ready / Busy / Invisible (/avail)
 """
 
 HELP_KWARGS = dict(
@@ -258,6 +290,7 @@ HELP_KWARGS = dict(
     dm_cost=DIRECT_MESSAGE_COST,
     notify_cost=NOTIFY_COST,
     free=STARTING_COINS,
+    checkin=DAILY_CHECKIN_COINS,
 )
 
 PROFILE_TEMPLATE = """
@@ -267,6 +300,7 @@ Age: {age} • City: {city}
 👁 {online}
 ID: {public_id}
 
+{bio_line}{interests_line}{languages_line}
 ❤️ {likes} likes
 🪙 {coins} Coins
 🌍 Country: {country}
@@ -275,6 +309,7 @@ ID: {public_id}
 📇 Contacts: {contacts}
 👥 Referrals: {referrals}
 🪩 {verified}
+🎨 Theme: {theme}
 """
 
 SEARCH_CHOICE_TEXT = """
@@ -399,7 +434,7 @@ async def send_due_reminders(bot, current_hour=None, today=None) -> int:
     hour = time.localtime().tm_hour if current_hour is None else current_hour
     if not (REMINDER_HOUR_START <= hour < REMINDER_HOUR_END):
         return 0
-    date = today or time.strftime("%Y-%m-%d")
+    date = today or bot_today()
     sent = 0
     for user in list(db.users.values()):
         if not user.daily_reminder or user.reminder_date == date or user.banned:
@@ -430,6 +465,62 @@ async def _reminder_loop(bot) -> None:
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Reminder loop error: {e}")
+
+
+WEEKLY_SWEEP_INTERVAL = 1800  # every 30 min: finalize week + expire statuses
+
+
+async def _weekly_sweep_loop(bot) -> None:
+    """Periodic maintenance: weekly leaderboard rewards + stale statuses.
+
+    Rewards are finalized atomically inside the Database (idempotent), so
+    overlapping runs can never double-pay the top 3.
+    """
+    while True:
+        await asyncio.sleep(WEEKLY_SWEEP_INTERVAL)
+        try:
+            expired = await asyncio.to_thread(db.expire_stale_availability)
+            if expired:
+                logger.info(f"🟢 Expired {expired} stale availability statuses.")
+            result = await asyncio.to_thread(db.sweep_weekly_rewards)
+            if result:
+                await _announce_weekly_winners(bot, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Weekly sweep error: {e}")
+
+
+async def _announce_weekly_winners(bot, result: dict) -> None:
+    """Tell the top 3 (and everyone interested) that rewards were paid."""
+    week = result.get("week", "?")
+    results = result.get("results", [])
+    if not results:
+        return
+    medals = ["🥇 1st", "🥈 2nd", "🥉 3rd"]
+    for res in results:
+        rank = res.get("rank", 0)
+        uid = res.get("user_id")
+        coins = res.get("coins", 0)
+        points = res.get("points", 0)
+        if not uid or not coins:
+            continue
+        medal = medals[rank - 1] if 1 <= rank <= 3 else f"{rank}."
+        user = db.get_user(uid)
+        try:
+            await bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"🏆 **Weekly leaderboard reward!**\n\n"
+                    f"You finished {medal} in {week} with **{points} points**.\n"
+                    f"🪙 **+{coins} coins** added — balance: "
+                    f"**{user.coins if user else '?'} 🪙**"
+                ),
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception as e:  # noqa: BLE001 — dead chats skip silently
+            logger.debug(f"Weekly reward notify to {uid} failed: {e}")
 
 
 def credit_text(user) -> str:
@@ -498,12 +589,19 @@ def format_state(s):
 
 
 def format_online(user) -> str:
-    """👁 Online status line shown on profile cards."""
+    """👁 Online status line shown on profile cards (availability-aware)."""
+    avail = getattr(user, "availability", Availability.READY)
     if user.state == ChatState.CHATTING:
-        return "👁 Online (Chatting🗣)"
-    if user.state == ChatState.SEARCHING:
-        return "👁 Online (Searching🔍)"
-    return "👁 Online"
+        base = "👁 Online (Chatting🗣)"
+    elif user.state == ChatState.SEARCHING:
+        base = "👁 Online (Searching🔍)"
+    else:
+        base = "👁 Online"
+    if avail == Availability.BUSY:
+        return f"{base} • 🟡 Busy"
+    if avail == Availability.INVISIBLE:
+        return "⚫ Invisible"
+    return f"{base} • 🟢 Ready"
 
 
 def md_escape(text: str) -> str:
@@ -1421,6 +1519,12 @@ async def get_referral_link(context, user_id: int) -> str:
 
 
 def build_profile_text(user) -> str:
+    bio = (user.bio or "").strip()
+    bio_line = f"📝 {md_escape(bio)}\n" if bio else ""
+    interests = ", ".join(user.interests) if user.interests else ""
+    interests_line = f"🎯 {md_escape(interests)}\n" if interests else ""
+    langs = ", ".join(user.languages) if user.languages else ""
+    languages_line = f"🗣 {md_escape(langs)}\n" if langs else ""
     return PROFILE_TEMPLATE.format(
         badge="👑" if user.vip else gender_emoji(user.gender),
         name=md_escape(display_name(user, user)),
@@ -1428,6 +1532,9 @@ def build_profile_text(user) -> str:
         city=user.city or (user.country or "—"),
         online=format_online(user),
         public_id=public_id_link(user),
+        bio_line=bio_line,
+        interests_line=interests_line,
+        languages_line=languages_line,
         likes=user.likes,
         coins=user.coins,
         country=user.country or "Not set",
@@ -1438,6 +1545,7 @@ def build_profile_text(user) -> str:
         contacts=len(user.contacts),
         referrals=user.referral_count,
         verified=verified_label(user),
+        theme=get_theme(user.theme).name,
     )
 
 
@@ -1474,6 +1582,12 @@ def build_user_card(target, viewer_id: int) -> str:
         if target.preferred_gender != Gender.ANY
         else "🌍 Anyone"
     )
+    if target.bio:
+        lines.append(f"📝 {md_escape(target.bio[:160])}")
+    if target.interests:
+        lines.append(f"🎯 {md_escape(', '.join(target.interests))}")
+    if target.languages:
+        lines.append(f"🗣 {md_escape(', '.join(target.languages))}")
     lines.append(f"🔹 Looking for: {pref}")
     lines.append(f"🔹 Total chats: {target.total_chats}")
     lines.append(f"📇 Contacts: {len(target.contacts)}")
@@ -2025,6 +2139,811 @@ async def process_report(context, reporter_id: int) -> tuple[str, bool]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  🎁 DAILY CHECK-IN · 🏆 LEADERBOARD · 🎮 GAMES · 🎨 THEMES
+#  🟢 AVAILABILITY · 🛡️ PRIVACY · 👤 PROFILE EXTRAS
+# ═══════════════════════════════════════════════════════════════════
+
+CHECKIN_TEXT = (
+    "🎁 **Daily Check-in**\n\n"
+    "Tap the button below to claim **{coins} 🪙** — once per calendar day.\n"
+    "💰 Your balance: **{balance} 🪙**\n\n"
+    "💡 Come back every day to keep your coin stash growing!"
+)
+
+CHECKIN_CLAIMED_TEXT = (
+    "✅ **Check-in claimed!**\n\n"
+    "🪙 +{earned} coins\n"
+    "💰 Balance: **{balance} 🪙**\n\n"
+    "Come back tomorrow for another reward!"
+)
+
+CHECKIN_ALREADY_TEXT = (
+    "⏳ **Already checked in today!**\n\n"
+    "You've claimed your {coins} 🪙 for today.\n"
+    "💰 Balance: **{balance} 🪙**\n"
+    "Come back tomorrow for more!"
+)
+
+LEADERBOARD_TEXT = (
+    "🏆 **Weekly Leaderboard** ({week})\n\n"
+    "{top_block}\n"
+    "🪙 Your points: **{mine}**\n\n"
+    "🎁 **Weekly rewards** (top 3 only):\n"
+    "🥇 1st — {r1} 🪙\n"
+    "🥈 2nd — {r2} 🪙\n"
+    "🥉 3rd — {r3} 🪙\n"
+    "Everyone else: 0 coins.\n\n"
+    "Resets every week — good luck!"
+)
+
+LB_HOW_TEXT = (
+    "❓ **How leaderboard points work**\n\n"
+    "You earn points from real activity (daily caps stop farming):\n"
+    f"• 💬 Completed chats: +2 per chat (cap {POINT_CAPS['chat']}/day)\n"
+    f"• 💬 Messages in chats: +1 per 5 messages (cap {POINT_CAPS['message']}/day)\n"
+    f"• 🎮 Mini-games played: +1 per game (cap {POINT_CAPS['game']}/day)\n"
+    f"• 🎁 Daily check-ins: +1 (cap {POINT_CAPS['checkin']}/day)\n"
+    f"• ❤️ Unique likes received: +1 (cap {POINT_CAPS['like']}/day)\n\n"
+    "🚫 Spam, fake accounts and exploits earn nothing — points are capped "
+    "per category per day, and only legitimate activity counts.\n\n"
+    "🏆 Only the **top 3** each week get coins (6 / 4 / 2)."
+)
+
+SAFETY_TEXT = (
+    "🛡️ **Privacy & Safety**\n\n"
+    "• 🚫 **Block** anyone from their profile — you'll never be matched again\n"
+    "• 🚩 **Report** bad behaviour — 5 unique reports restrict an account\n"
+    "• 🔒 **Secure Chat** toggles forwarding protection mid-chat\n"
+    "• 🎂 Age safety: Direct Messages require both people to be 16+, and "
+    "adults can't DM minors\n"
+    "• 🔐 Your @username is NEVER shown to other users\n"
+    "• ⚫ **Invisible** hides you from lists & matching (auto-resets after "
+    f"{AVAILABILITY_TTL // 3600}h)\n"
+    "• 🗑 Delete your chat messages within 30 minutes after a chat ends"
+)
+
+
+def _available_label(user) -> str:
+    return {
+        Availability.READY: "🟢",
+        Availability.BUSY: "🟡",
+        Availability.INVISIBLE: "⚫",
+    }.get(getattr(user, "availability", Availability.READY), "🟢")
+
+
+async def handle_checkin(update, context, query, user) -> None:
+    """🎁 Daily login reward — 1 coin per calendar day, spam-proof."""
+    today = bot_today()
+    if user.last_checkin == today:
+        await safe_edit(
+            query,
+            CHECKIN_ALREADY_TEXT.format(
+                coins=DAILY_CHECKIN_COINS, balance=user.coins
+            ),
+            parse_mode="Markdown",
+            reply_markup=checkin_keyboard(claimed_today=True),
+        )
+        return
+    await safe_edit(
+        query,
+        CHECKIN_TEXT.format(coins=DAILY_CHECKIN_COINS, balance=user.coins),
+        parse_mode="Markdown",
+        reply_markup=checkin_keyboard(claimed_today=False),
+    )
+
+
+async def handle_checkin_claim(update, context, query, user) -> None:
+    """Atomic claim — Database guards against double-claims per day."""
+    claimed, earned, balance = db.claim_daily_checkin(user.user_id)
+    tomorrow = bot_now().strftime("%d %b")
+    if claimed:
+        await safe_edit(
+            query,
+            CHECKIN_CLAIMED_TEXT.format(
+                earned=earned, balance=balance, tomorrow=tomorrow
+            ),
+            parse_mode="Markdown",
+            reply_markup=checkin_keyboard(claimed_today=True),
+        )
+    else:
+        await safe_edit(
+            query,
+            CHECKIN_ALREADY_TEXT.format(
+                coins=DAILY_CHECKIN_COINS, balance=balance
+            ),
+            parse_mode="Markdown",
+            reply_markup=checkin_keyboard(claimed_today=True),
+        )
+
+
+def _lb_top_block(entries) -> str:
+    if not entries:
+        return "_No points scored yet this week — be the first!_"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (u, pts) in enumerate(entries):
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} {md_escape(display_name(u))} — **{pts}** pts")
+    return "\n".join(lines)
+
+
+async def handle_leaderboard(update, context, query, user) -> None:
+    db.expire_stale_availability()
+    entries = db.leaderboard_top(10)
+    r1 = WEEKLY_REWARD_COINS.get(1, 6)
+    r2 = WEEKLY_REWARD_COINS.get(2, 4)
+    r3 = WEEKLY_REWARD_COINS.get(3, 2)
+    await safe_edit(
+        query,
+        LEADERBOARD_TEXT.format(
+            week=current_week_id(),
+            top_block=_lb_top_block(entries),
+            mine=db.weekly_points_of(user.user_id),
+            r1=r1, r2=r2, r3=r3,
+        ),
+        parse_mode="Markdown",
+        reply_markup=leaderboard_keyboard(),
+    )
+
+
+async def handle_lb_history(update, context, query, user) -> None:
+    history = db.weekly_history(3)
+    if not history:
+        await safe_edit(
+            query,
+            "📜 **Previous weeks**\n\nNo completed weeks yet — the first "
+            "rewards land after the current week ends.",
+            parse_mode="Markdown",
+            reply_markup=leaderboard_keyboard(),
+        )
+        return
+    lines = ["📜 **Previous weeks**", ""]
+    medals = ["🥇", "🥈", "🥉"]
+    for entry in history:
+        lines.append(f"**{entry['week']}**")
+        for res in entry.get("results", []):
+            medal = medals[res["rank"] - 1] if res["rank"] <= 3 else f"{res['rank']}."
+            who = db.get_user(res["user_id"])
+            name = md_escape(display_name(who)) if who else f"ID {res['user_id']}"
+            lines.append(
+                f"{medal} {name} — {res['points']} pts → +{res['coins']} 🪙"
+            )
+        lines.append("")
+    await safe_edit(
+        query,
+        "\n".join(lines)[:3500],
+        parse_mode="Markdown",
+        reply_markup=leaderboard_keyboard(),
+    )
+
+
+# ── 🎮 Mini-games ────────────────────────────────────────────────
+
+def _game_session(context) -> dict:
+    return context.user_data.get("game") or {}
+
+
+def _store_game(context, session: dict) -> None:
+    context.user_data["game"] = session
+
+
+async def _render_game_card(query, context, user, session: dict, footer: str = "") -> None:
+    """Draw the current game state as one message with Skip/Replay/Exit."""
+    game_id = session.get("game", "")
+    spec = games_mod.GAME_DEFS.get(game_id, {})
+    title = spec.get("title", "🎮 Game")
+    kind = session.get("kind")
+
+    if session.get("done") and kind != "truthdare":
+        text = (
+            f"{title}\n\n"
+            f"🏁 **Game over!**\n{games_mod.score_line(session)}\n\n"
+            f"Tap 🔁 Replay to play again or ❌ Exit to leave."
+        )
+        await safe_edit(query, text, parse_mode="Markdown",
+                        reply_markup=game_controls_keyboard())
+        return
+
+    extra = []
+    if kind == "choice2":
+        q = games_mod.current_question(session)
+        if q is None:
+            session["done"] = True
+            await _render_game_card(query, context, user, session, footer)
+            return
+        text = (
+            f"{title}\n\n"
+            f"**{q['a']}**\n"
+            f"     — or —    \n"
+            f"**{q['b']}**\n\n"
+            f"{games_mod.score_line(session)}"
+        )
+        extra = [
+            [
+                InlineKeyboardButton("🅰 A", callback_data="gopt_0"),
+                InlineKeyboardButton("🅱 B", callback_data="gopt_1"),
+            ]
+        ]
+    elif kind == "truthdare":
+        prompt = session.get("prompt")
+        if not prompt:
+            text = f"{title}\n\nPick **Truth** or **Dare** to begin! 🎭"
+        else:
+            text = f"{title}\n\n{prompt}\n\n{games_mod.score_line(session)}"
+        extra = [
+            [
+                InlineKeyboardButton("🤫 Truth", callback_data="gopt_truth"),
+                InlineKeyboardButton("⚡ Dare", callback_data="gopt_dare"),
+            ]
+        ]
+    elif kind in ("quiz", "emoji"):
+        q = games_mod.current_question(session)
+        if q is None:
+            session["done"] = True
+            await _render_game_card(query, context, user, session, footer)
+            return
+        emojis = games_mod._q_get(q, "emojis")
+        question_line = (
+            f"{emojis}\n\nWhat does this mean? 😅"
+            if emojis
+            else str(games_mod._q_get(q, "q", ""))
+        )
+        options = games_mod._q_get(q, "options", [])
+        text = (
+            f"{title}\n\n"
+            f"Q{session['round'] + 1}/{session.get('total', '?')}\n\n"
+            f"{question_line}\n\n"
+            f"{games_mod.score_line(session)}"
+        )
+        rows = [
+            [InlineKeyboardButton(
+                f"{chr(65 + i)}️⃣ {str(opt)[:40]}",
+                callback_data=f"gopt_{i}",
+            )]
+            for i, opt in enumerate(options)
+        ]
+        extra = rows
+    elif kind == "yesno":
+        q = games_mod.current_question(session)
+        if q is None:
+            session["done"] = True
+            await _render_game_card(query, context, user, session, footer)
+            return
+        text = (
+            f"{title}\n\n"
+            f"Q{session['round'] + 1}/{session.get('total', '?')}\n\n"
+            f"{q}\n\n{games_mod.score_line(session)}"
+        )
+        extra = [
+            [
+                InlineKeyboardButton("✅ Yes", callback_data="gopt_1"),
+                InlineKeyboardButton("❌ No", callback_data="gopt_0"),
+            ]
+        ]
+    elif kind == "number":
+        hint = session.get("feedback") or "I'm thinking of a number… 🤔"
+        text = (
+            f"{title}\n\n"
+            f"{hint}\n\n"
+            f"Range: {session.get('low', 1)}–{session.get('high', 100)}\n"
+            f"{games_mod.score_line(session)}\n\n"
+            f"Send your guess as a number, or use the quick buttons."
+        )
+        last = session.get("last_guess") or 50
+        extra = [
+            [
+                InlineKeyboardButton("⬇️ Lower", callback_data="gnum_lo"),
+                InlineKeyboardButton("🎯 It's this!", callback_data="gnum_hit"),
+                InlineKeyboardButton("⬆️ Higher", callback_data="gnum_hi"),
+            ]
+        ]
+        quick = []
+        for delta in (-10, -5, 5, 10):
+            g = max(1, min(100, last + delta))
+            quick.append(InlineKeyboardButton(f"Try {g}", callback_data=f"gnum_{g}"))
+        extra.append(quick)
+    else:
+        text = f"{title}\n\nComing soon!"
+
+    if footer:
+        text += f"\n\n{footer}"
+    await safe_edit(query, text, parse_mode="Markdown",
+                    reply_markup=game_controls_keyboard(extra))
+
+
+async def handle_game_start(update, context, query, user, game_id: str) -> None:
+    session = games_mod.new_game(game_id)
+    if not session:
+        await query.answer("Unknown game.", show_alert=True)
+        return
+    _store_game(context, session)
+    await _render_game_card(query, context, user, session)
+
+
+async def handle_game_option(update, context, query, user, choice: str) -> None:
+    session = _game_session(context)
+    if not session or session.get("done"):
+        await query.answer("Start a game first 🎮", show_alert=True)
+        return
+    kind = session.get("kind")
+
+    if kind == "truthdare":
+        session["prompt"] = games_mod.pick_truth_or_dare(session, choice == "truth")
+    elif kind in ("quiz", "emoji"):
+        correct, fact = games_mod.answer_quiz(session, int(choice))
+        footer = ("✅ Correct! " if correct else "❌ Not quite! ") + fact
+        _store_game(context, session)
+        if session.get("done"):
+            db.add_weekly_points(user.user_id, 1, "game")
+        await _render_game_card(query, context, user, session, footer=footer[:250])
+        return
+    elif kind == "yesno":
+        games_mod.answer_yesno(session, choice == "1")
+    elif kind == "choice2":
+        session["round"] += 1
+        session["score"] += 1
+        total = len(session.get("questions", []))
+        if session["round"] >= total:
+            session["done"] = True
+            db.add_weekly_points(user.user_id, 1, "game")
+        _store_game(context, session)
+        await _render_game_card(query, context, user, session, footer="Fun pick! 🎉")
+        return
+
+    _store_game(context, session)
+    await _render_game_card(query, context, user, session)
+
+
+async def handle_game_number(update, context, query, user, action: str) -> None:
+    session = _game_session(context)
+    if not session or session.get("kind") != "number":
+        await query.answer("Start Guess the Number first 🔢", show_alert=True)
+        return
+    if session.get("done"):
+        await query.answer("Game over — tap 🔁 Replay.", show_alert=True)
+        return
+    last = session.get("last_guess") or 50
+    if action == "hit":
+        guess = last
+    elif action == "hi":
+        guess = min(100, last + 5)
+    elif action == "lo":
+        guess = max(1, last - 5)
+    else:
+        try:
+            guess = int(action)
+        except ValueError:
+            return
+        guess = max(1, min(100, guess))
+    feedback = games_mod.number_feedback(session, guess)
+    session["feedback"] = feedback
+    _store_game(context, session)
+    if session.get("done"):
+        db.add_weekly_points(user.user_id, 1, "game")
+    await _render_game_card(query, context, user, session)
+
+
+async def handle_game_skip(update, context, query, user) -> None:
+    session = _game_session(context)
+    if not session:
+        await query.answer("No game running.", show_alert=True)
+        return
+    if session.get("kind") == "truthdare":
+        session["prompt"] = None
+    games_mod.skip_round(session)
+    _store_game(context, session)
+    await _render_game_card(query, context, user, session, footer="⏭ Skipped.")
+
+
+async def handle_game_replay(update, context, query, user) -> None:
+    session = _game_session(context)
+    game_id = session.get("game") if session else None
+    if not game_id:
+        await query.answer("No game to replay.", show_alert=True)
+        return
+    await handle_game_start(update, context, query, user, game_id)
+
+
+async def handle_game_exit(update, context, query, user) -> None:
+    context.user_data.pop("game", None)
+    await safe_edit(query, "👋 Game closed.", reply_markup=games_menu_keyboard())
+
+
+# ── 🎨 Themes ────────────────────────────────────────────────────
+
+async def handle_theme_menu(update, context, query, user) -> None:
+    unlocked = set(user.unlocked_themes or []) | {"default"}
+    await safe_edit(
+        query,
+        f"🎨 **Customize Theme**\n\n"
+        f"💰 Your coins: **{user.coins} 🪙**\n"
+        f"🎭 Active: **{get_theme(user.theme).name}**\n\n"
+        f"Unlock cosmetic themes with coins — they decorate your cards "
+        f"and menus. Tap one to equip or buy it.",
+        parse_mode="Markdown",
+        reply_markup=theme_keyboard(
+            list(THEMES.values()), user.theme, unlocked
+        ),
+    )
+
+
+async def handle_theme_buy(update, context, query, user, theme_id: str) -> None:
+    theme = THEMES.get(theme_id)
+    if not theme:
+        await query.answer("Unknown theme.", show_alert=True)
+        return
+    ok, msg = db.unlock_theme(user.user_id, theme_id, theme.cost)
+    if ok:
+        await query.answer(f"🎨 {theme.name} unlocked & equipped!")
+        await handle_theme_menu(update, context, query, db.get_user(user.user_id))
+        return
+    if msg == "not_enough":
+        await query.answer(
+            f"🪙 Not enough coins! {theme.name} costs {theme.cost} 🪙.",
+            show_alert=True,
+        )
+        return
+    await query.answer(msg, show_alert=True)
+
+
+async def handle_theme_equip(update, context, query, user, theme_id: str) -> None:
+    if db.equip_theme(user.user_id, theme_id):
+        await query.answer(f"🎨 {get_theme(theme_id).name} equipped!")
+        await handle_theme_menu(update, context, query, db.get_user(user.user_id))
+    else:
+        await query.answer("Buy that theme first.", show_alert=True)
+
+
+# ── 🟢 Availability ──────────────────────────────────────────────
+
+AVAILABILITY_SET_TEXT = {
+    Availability.READY: "🟢 Ready to Chat",
+    Availability.BUSY: "🟡 Busy",
+    Availability.INVISIBLE: "⚫ Invisible",
+}
+
+
+async def handle_availability_menu(update, context, query, user) -> None:
+    current = getattr(user, "availability", Availability.READY)
+    await safe_edit(
+        query,
+        f"🟢 **Your availability**\n\n"
+        f"Current: {_available_label(user)} **{current.value.title()}**\n\n"
+        f"• 🟢 **Ready to Chat** — shown first in matching & the Ready list\n"
+        f"• 🟡 **Busy** — deprioritised until you're free\n"
+        f"• ⚫ **Invisible** — hidden from lists & random matching\n\n"
+        f"⏳ Stale statuses automatically expire back to 🟢 Ready after "
+        f"{AVAILABILITY_TTL // 3600} hours.",
+        parse_mode="Markdown",
+        reply_markup=availability_keyboard(current.value),
+    )
+
+
+async def handle_availability_set(update, context, query, user, value: str) -> None:
+    try:
+        avail = Availability(value)
+    except ValueError:
+        return
+    db.set_availability(user.user_id, avail)
+    await query.answer(AVAILABILITY_SET_TEXT[avail])
+    await handle_availability_menu(
+        update, context, query, db.get_user(user.user_id)
+    )
+
+
+# ── 🧠 Quiz Battle (2-player) ────────────────────────────────────
+
+async def handle_battle_challenge(update, context, query, user) -> None:
+    """Challenge your current chat partner to a Quiz Battle."""
+    if user.state != ChatState.CHATTING or not user.partner_id:
+        await query.answer(
+            "Join a chat first, then challenge your partner! 💬",
+            show_alert=True,
+        )
+        return
+    partner_id = user.partner_id
+    try:
+        await context.bot.send_message(
+            chat_id=partner_id,
+            text=(
+                "⚔️ **Quiz Battle challenge!**\n\n"
+                "Your partner challenged you to a 5-question quiz duel.\n"
+                "Whoever answers more correctly wins! 🧠"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "⚔️ Accept Battle", callback_data=f"gqb_acc_{user.user_id}"
+                )],
+                [InlineKeyboardButton(
+                    "❌ Decline", callback_data="games_menu"
+                )],
+            ]),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to deliver battle challenge: {e}")
+        await query.answer("Couldn't reach your partner.", show_alert=True)
+        return
+    await query.answer("⚔️ Challenge sent!")
+    await safe_edit(
+        query,
+        "⚔️ **Battle challenge sent!**\n\nWaiting for your partner to "
+        "accept…",
+        parse_mode="Markdown",
+        reply_markup=games_menu_keyboard(),
+    )
+
+
+async def handle_battle_accept(update, context, query, user, challenger_id: int) -> None:
+    challenger = db.get_user(challenger_id)
+    if (
+        not challenger
+        or user.state != ChatState.CHATTING
+        or user.partner_id != challenger_id
+    ):
+        await query.answer("That battle is no longer available.", show_alert=True)
+        return
+    if user.banned or challenger.banned:
+        await query.answer("Restricted accounts can't battle.", show_alert=True)
+        return
+    questions = games_mod.battle_questions()
+    session = db.create_battle(challenger_id, user.user_id, questions)
+    await safe_edit(
+        query,
+        "⚔️ **Battle started!**\n\n"
+        f"{md_escape(display_name(challenger))} goes first. Answer the "
+        "questions as they arrive — good luck! 🧠",
+        parse_mode="Markdown",
+        reply_markup=games_menu_keyboard(),
+    )
+    await _send_battle_question(context, session)
+
+
+async def _send_battle_question(context, session: dict) -> None:
+    if session.get("done"):
+        await _finish_battle(context, session)
+        return
+    qi = session["qi"]
+    if qi >= len(session.get("questions", [])):
+        session["done"] = True
+        db._write_battles()
+        await _finish_battle(context, session)
+        return
+    q = session["questions"][qi]
+    turn = session["turn"]
+    rows = [
+        [InlineKeyboardButton(
+            f"{chr(65 + i)}️⃣ {opt[:40]}", callback_data=f"gqb_ans_{i}"
+        )]
+        for i, opt in enumerate(q["options"])
+    ]
+    rows.append([InlineKeyboardButton("❌ Forfeit", callback_data="gqb_quit")])
+    await _safe_send(
+        context, turn,
+        f"⚔️ **Quiz Battle** — Q{qi + 1}/{len(session['questions'])}\n\n"
+        f"{md_escape(q['q'])}\n\n"
+        f"Your score: {session.get('score', {}).get(str(turn), 0)}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_battle_answer(update, context, query, user, option: int) -> None:
+    session = None
+    for _key, s in db.game_battles.items():
+        if not s.get("done") and user.user_id in (s.get("a"), s.get("b")):
+            session = s
+            break
+    if not session:
+        await query.answer("No active battle.", show_alert=True)
+        return
+    if session.get("turn") != user.user_id:
+        await query.answer("It's not your turn!", show_alert=True)
+        return
+    correct, finished = games_mod.battle_answer(session, user.user_id, option)
+    db._write_battles()
+    db.add_weekly_points(user.user_id, 1, "game")
+    await query.answer("✅ Correct!" if correct else "❌ Wrong answer!")
+    if finished:
+        await _finish_battle(context, session)
+        return
+    await _send_battle_question(context, session)
+
+
+async def _finish_battle(context, session: dict) -> None:
+    result = games_mod.battle_result(session)
+    a, b = result["a"], result["b"]
+    winner = result["winner_id"]
+    if winner:
+        line_a = "🏆 Winner!" if winner == a else "😅 Better luck next time!"
+        line_b = "🏆 Winner!" if winner == b else "😅 Better luck next time!"
+    else:
+        line_a = line_b = "🤝 It's a draw!"
+    await _safe_send(
+        context, a,
+        f"⚔️ **Battle finished!**\n\n"
+        f"You: {result['a_score']} • Opponent: {result['b_score']}\n{line_a}",
+        parse_mode="Markdown",
+        reply_markup=games_menu_keyboard(),
+    )
+    await _safe_send(
+        context, b,
+        f"⚔️ **Battle finished!**\n\n"
+        f"You: {result['b_score']} • Opponent: {result['a_score']}\n{line_b}",
+        parse_mode="Markdown",
+        reply_markup=games_menu_keyboard(),
+    )
+    db.drop_battle(a, b)
+
+
+async def handle_battle_quit(update, context, query, user) -> None:
+    for _key, s in list(db.game_battles.items()):
+        if user.user_id in (s.get("a"), s.get("b")):
+            other = s["a"] if s["b"] == user.user_id else s["b"]
+            db.drop_battle(s["a"], s["b"])
+            await _safe_send(
+                context, other,
+                "⚔️ Your opponent forfeited the Quiz Battle.",
+                reply_markup=games_menu_keyboard(),
+            )
+            await query.answer("You forfeited the battle.")
+            return
+    await query.answer("No active battle.", show_alert=True)
+
+
+# ── Callback routing for every new feature ──────────────────────
+
+async def features_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle the new-feature callbacks. Returns True when consumed."""
+    query = update.callback_query
+    data = query.data or ""
+    user = db.get_user(query.from_user.id)
+    if not user:
+        return False
+
+    if data == "checkin":
+        await handle_checkin(update, context, query, user)
+        return True
+    if data == "checkin_claim":
+        await handle_checkin_claim(update, context, query, user)
+        return True
+
+    if data == "leaderboard":
+        await handle_leaderboard(update, context, query, user)
+        return True
+    if data == "lb_top":
+        await handle_leaderboard(update, context, query, user)
+        return True
+    if data == "lb_history":
+        await handle_lb_history(update, context, query, user)
+        return True
+    if data == "lb_how":
+        await safe_edit(query, LB_HOW_TEXT, parse_mode="Markdown",
+                        reply_markup=leaderboard_keyboard())
+        return True
+
+    if data == "games_menu":
+        in_chat = user.state == ChatState.CHATTING and bool(user.partner_id)
+        await safe_edit(
+            query,
+            "🎮 **Mini-Games**\n\n"
+            "Pick a game to play — every game has ⏭ Skip, 🔁 Replay and "
+            "❌ Exit. Games also earn you leaderboard points!\n"
+            + ("⚔️ In a chat? Challenge your partner to a Quiz Battle below!"
+               if in_chat else ""),
+            parse_mode="Markdown",
+            reply_markup=games_menu_keyboard(battle_challenge=in_chat),
+        )
+        return True
+    if data.startswith("game_"):
+        await handle_game_start(update, context, query, user, data[5:])
+        return True
+    if data in ("gopt_truth", "gopt_dare"):
+        await handle_game_option(
+            update, context, query, user,
+            "truth" if data.endswith("truth") else "dare",
+        )
+        return True
+    if data.startswith("gopt_"):
+        await handle_game_option(update, context, query, user, data[5:])
+        return True
+    if data.startswith("gnum_"):
+        await handle_game_number(update, context, query, user, data[5:])
+        return True
+    if data == "gskip":
+        await handle_game_skip(update, context, query, user)
+        return True
+    if data == "greplay":
+        await handle_game_replay(update, context, query, user)
+        return True
+    if data == "gexit":
+        await handle_game_exit(update, context, query, user)
+        return True
+    if data.startswith("gqb_acc_"):
+        await handle_battle_accept(update, context, query, user, int(data[8:]))
+        return True
+    if data.startswith("gqb_ans_"):
+        await handle_battle_answer(update, context, query, user, int(data[8:]))
+        return True
+    if data == "gqb_quit":
+        await handle_battle_quit(update, context, query, user)
+        return True
+    if data == "gqb_chal":
+        await handle_battle_challenge(update, context, query, user)
+        return True
+
+    if data == "theme_menu":
+        await handle_theme_menu(update, context, query, user)
+        return True
+    if data.startswith("theme_buy_"):
+        await handle_theme_buy(update, context, query, user, data[10:])
+        return True
+    if data.startswith("theme_eq_"):
+        await handle_theme_equip(update, context, query, user, data[9:])
+        return True
+
+    if data == "avail_menu":
+        await handle_availability_menu(update, context, query, user)
+        return True
+    if data.startswith("avail_"):
+        await handle_availability_set(update, context, query, user, data[6:])
+        return True
+
+    if data == "privacy":
+        await safe_edit(
+            query,
+            "🛡️ **Privacy & Safety**\n\nManage how you appear and who can "
+            "reach you.",
+            parse_mode="Markdown",
+            reply_markup=privacy_keyboard(user.daily_reminder),
+        )
+        return True
+    if data == "safety_tips":
+        await safe_edit(query, SAFETY_TEXT, parse_mode="Markdown",
+                        reply_markup=privacy_keyboard(user.daily_reminder))
+        return True
+
+    if data == "discover":
+        await safe_edit(
+            query,
+            "🌍 **Discover People**\n\nHow would you like to find someone?",
+            parse_mode="Markdown",
+            reply_markup=discover_keyboard(),
+        )
+        return True
+
+    if data == "edit_bio":
+        context.user_data["awaiting_bio"] = True
+        await safe_edit(
+            query,
+            "📝 **Send your bio**\n\nUp to 160 characters — shown on your "
+            "profile card. Send /skip or an empty line to clear it.",
+            parse_mode="Markdown",
+        )
+        return True
+    if data == "edit_interests":
+        context.user_data["awaiting_interests"] = True
+        await safe_edit(
+            query,
+            "🎯 **Send your interests**\n\nComma-separated, e.g. "
+            "`music, travel, memes` (max 8). Send /skip to clear.",
+            parse_mode="Markdown",
+        )
+        return True
+    if data == "edit_langs":
+        context.user_data["awaiting_langs"] = True
+        await safe_edit(
+            query,
+            "🗣 **Send your preferred languages**\n\nComma-separated, e.g. "
+            "`English, বাংলা` (max 6). Send /skip to clear.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2339,6 +3258,7 @@ BROWSE_MENU_TEXT = (
 BROWSE_KIND_TITLES = {
     "myage": "⭐ People My Age",
     "ready": "💕 Ready to Chat",
+    "available": "🟢 Ready to Chat",
     "new": "🙋 New Members 🙋",
     "recent": "👀 Recent Chats 👀",
     "popular": "Popular People ❤️",
@@ -2389,6 +3309,108 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         vip_text(user), parse_mode="Markdown", reply_markup=vip_keyboard()
+    )
+
+
+async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎁 /checkin — daily login reward."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
+        return
+    claimed, earned, balance = db.claim_daily_checkin(user.user_id)
+    if claimed:
+        await update.message.reply_text(
+            CHECKIN_CLAIMED_TEXT.format(
+                earned=earned, balance=balance,
+                tomorrow=bot_now().strftime("%d %b"),
+            ),
+            parse_mode="Markdown",
+            reply_markup=checkin_keyboard(claimed_today=True),
+        )
+    else:
+        await update.message.reply_text(
+            CHECKIN_ALREADY_TEXT.format(coins=DAILY_CHECKIN_COINS, balance=balance),
+            parse_mode="Markdown",
+            reply_markup=checkin_keyboard(claimed_today=True),
+        )
+
+
+async def games_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎮 /games — mini-game menu."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
+        return
+    in_chat = user.state == ChatState.CHATTING and bool(user.partner_id)
+    await update.message.reply_text(
+        "🎮 **Mini-Games**\n\nPick a game below 👇",
+        parse_mode="Markdown",
+        reply_markup=games_menu_keyboard(battle_challenge=in_chat),
+    )
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🏆 /leaderboard — weekly leaderboard."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
+        return
+    entries = db.leaderboard_top(10)
+    await update.message.reply_text(
+        LEADERBOARD_TEXT.format(
+            week=current_week_id(),
+            top_block=_lb_top_block(entries),
+            mine=db.weekly_points_of(user.user_id),
+            r1=WEEKLY_REWARD_COINS.get(1, 6),
+            r2=WEEKLY_REWARD_COINS.get(2, 4),
+            r3=WEEKLY_REWARD_COINS.get(3, 2),
+        ),
+        parse_mode="Markdown",
+        reply_markup=leaderboard_keyboard(),
+    )
+
+
+async def themes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎨 /themes — customize theme."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
+        return
+    unlocked = set(user.unlocked_themes or []) | {"default"}
+    await update.message.reply_text(
+        f"🎨 **Customize Theme**\n\n"
+        f"💰 Your coins: **{user.coins} 🪙**\n"
+        f"🎭 Active: **{get_theme(user.theme).name}**",
+        parse_mode="Markdown",
+        reply_markup=theme_keyboard(list(THEMES.values()), user.theme, unlocked),
+    )
+
+
+async def avail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🟢 /avail — set availability status."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first.")
+        return
+    if not await enforce_channel(update, context):
+        return
+    current = getattr(user, "availability", Availability.READY)
+    await update.message.reply_text(
+        f"🟢 **Your availability:** {_available_label(user)} "
+        f"**{current.value.title()}**\n\n"
+        f"Pick a new status below (stale statuses auto-expire after "
+        f"{AVAILABILITY_TTL // 3600}h).",
+        parse_mode="Markdown",
+        reply_markup=availability_keyboard(current.value),
     )
 
 
@@ -2618,6 +3640,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
+
+    # ── New features (check-in, leaderboard, games, themes, …) ──
+    if data.startswith((
+        "checkin", "lb_", "leaderboard", "games_menu", "game_",
+        "gopt_", "gskip", "greplay", "gexit", "gnum_", "gqb_",
+        "theme_", "avail_", "privacy", "safety_tips", "discover",
+        "edit_bio", "edit_interests", "edit_langs",
+    )):
+        if await features_handler(update, context):
+            return
 
     # ── Gender selection ────────────────────────────────────
     if data.startswith("gender_"):
@@ -3201,6 +4233,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🚫 Restricted accounts can't start a chat.", show_alert=True
             )
             return
+        dm_ok, dm_reason = db.can_direct_message(user_id, target.user_id)
+        if not dm_ok:
+            await query.answer(dm_reason, show_alert=True)
+            return
         if target.state != ChatState.IDLE:
             await query.answer(
                 "They're busy right now — send a Chat Request instead.",
@@ -3554,6 +4590,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = db.get_user(int(data[len("req_chat_"):]))
         if not target:
             await query.answer("That account no longer exists.", show_alert=True)
+            return
+
+        req_ok, req_reason = db.can_direct_message(user_id, target.user_id)
+        if not req_ok:
+            await query.answer(req_reason, show_alert=True)
             return
 
         ok, reason = db.create_request(user_id, target.user_id)
@@ -3953,6 +4994,26 @@ async def handle_chat_bar(update: Update, context, user) -> bool:
     return False
 
 
+_MSG_POINT_BUCKET: dict[int, tuple] = {}  # user_id -> (week, count, awarded)
+
+
+def _bump_message_points(user_id: int) -> None:
+    """+1 leaderboard point per 5 chat messages (daily-capped in the DB)."""
+    week = current_week_id()
+    week_n, count, awarded = _MSG_POINT_BUCKET.get(user_id, (week, 0, 0))
+    if week_n != week:
+        count, awarded = 0, 0
+    count += 1
+    if count - awarded >= 5:
+        db.add_weekly_points(user_id, 1, "message")
+        awarded = count
+    _MSG_POINT_BUCKET[user_id] = (week, count, awarded)
+    # keep the map small
+    if len(_MSG_POINT_BUCKET) > 4096:
+        for k in list(_MSG_POINT_BUCKET)[:1024]:
+            _MSG_POINT_BUCKET.pop(k, None)
+
+
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward any message to the chat partner."""
     user_id = update.effective_user.id
@@ -3986,6 +5047,91 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ That wasn't a photo — photo setting cancelled.",
                 reply_markup=settings_keyboard(user.daily_reminder),
             )
+        return
+
+    # ── 👤 Bio / Interests / Languages editors ──────────────────
+    if context.user_data.get("awaiting_bio"):
+        context.user_data["awaiting_bio"] = False
+        raw = (update.message.text or "").strip()
+        if raw.lower() in ("/skip", "/cancel", "skip", "cancel", "/clear"):
+            db.set_bio(user_id, None)
+            await update.message.reply_text(
+                "✅ Bio cleared.",
+                reply_markup=settings_keyboard(user.daily_reminder),
+            )
+            return
+        db.set_bio(user_id, raw)
+        await update.message.reply_text(
+            f"✅ **Bio saved:**\n{md_escape((db.get_user(user_id).bio or '')[:160])}",
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(user.daily_reminder),
+        )
+        return
+
+    if context.user_data.get("awaiting_interests"):
+        context.user_data["awaiting_interests"] = False
+        raw = (update.message.text or "").strip()
+        if raw.lower() in ("/skip", "/cancel", "skip", "cancel", "/clear"):
+            db.set_interests(user_id, [])
+            await update.message.reply_text(
+                "✅ Interests cleared.",
+                reply_markup=settings_keyboard(user.daily_reminder),
+            )
+            return
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+        db.set_interests(user_id, items)
+        saved = ", ".join(db.get_user(user_id).interests) or "—"
+        await update.message.reply_text(
+            f"✅ **Interests saved:** {md_escape(saved)}",
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(user.daily_reminder),
+        )
+        return
+
+    if context.user_data.get("awaiting_langs"):
+        context.user_data["awaiting_langs"] = False
+        raw = (update.message.text or "").strip()
+        if raw.lower() in ("/skip", "/cancel", "skip", "cancel", "/clear"):
+            db.set_languages(user_id, [])
+            await update.message.reply_text(
+                "✅ Languages cleared.",
+                reply_markup=settings_keyboard(user.daily_reminder),
+            )
+            return
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+        db.set_languages(user_id, items)
+        saved = ", ".join(db.get_user(user_id).languages) or "—"
+        await update.message.reply_text(
+            f"✅ **Languages saved:** {md_escape(saved)}",
+            parse_mode="Markdown",
+            reply_markup=settings_keyboard(user.daily_reminder),
+        )
+        return
+
+    # ── 🔢 Guess the Number: text input for the guess ───────────
+    game_state = context.user_data.get("game") or {}
+    if (
+        game_state.get("kind") == "number"
+        and not game_state.get("done")
+        and (update.message.text or "").strip().isdigit()
+    ):
+        guess = int((update.message.text or "").strip())
+        feedback = games_mod.number_feedback(game_state, guess)
+        game_state["feedback"] = feedback
+        context.user_data["game"] = game_state
+        if game_state.get("done"):
+            db.add_weekly_points(user_id, 1, "game")
+        await update.message.reply_text(
+            f"🔢 {feedback}\n\n"
+            f"{games_mod.score_line(game_state)}\n\n"
+            + (
+                "🏁 Game over! Tap 🔁 Replay in the game menu to play again."
+                if game_state.get("done")
+                else "Send another number between "
+                f"{game_state.get('low', 1)}–{game_state.get('high', 100)}."
+            ),
+            reply_markup=game_controls_keyboard(),
+        )
         return
 
     # Handle location sharing (Nearby search)
@@ -4213,6 +5359,9 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Secure Chat: block forwarding/saving of the relayed message.
     secure = user.secure_chat
 
+    # 🏆 +1 point per 5 relayed messages (daily-capped inside the DB)
+    _bump_message_points(user_id)
+
     async def _to_partner(kind: str, **kwargs):
         """Send to the partner and remember it for 🗑 Delete Messages."""
         sent = await getattr(context.bot, f"send_{kind}")(
@@ -4386,6 +5535,7 @@ async def on_startup(application):
         logger.warning(f"Could not cache bot username at startup: {e}")
     await set_bot_commands(application)
     application.create_task(_reminder_loop(application.bot))
+    application.create_task(_weekly_sweep_loop(application.bot))
     backup_bot = await _get_backup_bot(application.bot)
     await restore_db_from_backup(backup_bot)
     await _startup_checks(application)
@@ -4460,6 +5610,11 @@ def main():
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("credit", credit_command))
     app.add_handler(CommandHandler("vip", vip_command))
+    app.add_handler(CommandHandler("checkin", checkin_command))
+    app.add_handler(CommandHandler("games", games_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("themes", themes_command))
+    app.add_handler(CommandHandler("avail", avail_command))
     app.add_handler(CommandHandler("link", link_command))
     app.add_handler(CommandHandler("link_anon", link_anon_command))
     app.add_handler(CommandHandler("report", report_command))

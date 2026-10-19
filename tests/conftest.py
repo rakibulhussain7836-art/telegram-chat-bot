@@ -34,11 +34,15 @@ def fresh_db():
         bot.db.requests.clear()
         bot.db.pending_verifications.clear()
         bot.db.pending_dms.clear()
+        bot.db.game_battles.clear()
+        bot.db.meta.clear()
         bot.db._by_public_id.clear()
         # Force-join answers must never leak between tests
         bot._MEMBER_CACHE.clear()
         # 🗑 chat logs are keyed by user id — they must not survive a reset
         bot._CHAT_LOGS.clear()
+        # 🏆 per-user message-point buckets must not survive a reset
+        bot._MSG_POINT_BUCKET.clear()
 
     clear()
     yield bot.db

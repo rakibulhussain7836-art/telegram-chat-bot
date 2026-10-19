@@ -398,9 +398,13 @@ def test_animated_search_rewrites_the_frame_when_the_user_cancels(
     assert len(edits) == 1
     assert "Search cancelled." in edits[0]
     assert "-2" in edits[0]  # the Girl-search charge is still shown
-    # back to the reference bot's four-door menu
+    # back to the nine-door menu (upgrade spec #6)
     labels = [b.callback_data for b in _buttons(markups[-1])]
-    assert {"contacts", "blocked_list", "settings", "my_profile"} <= set(labels)
+    expected = {
+        "find_partner", "discover", "games_menu", "checkin", "credit_menu",
+        "leaderboard", "theme_menu", "my_profile", "privacy",
+    }
+    assert expected <= set(labels), set(labels)
 
 
 # ── Photo/caption card animation helpers ────────────────────────
@@ -1780,10 +1784,15 @@ def test_bar_matches_the_reference_layout():
 def test_idle_menu_matches_the_reference_doors():
     labels = [b.text for row in bot.main_menu_keyboard().inline_keyboard for b in row]
     assert labels == [
-        "📇 Contact List",
-        "🚫 Blocked Users",
-        "⚙️ Advanced Settings ⚙️",
-        "📝 Edit Profile Information",
+        "💬 Start Chatting",
+        "🌍 Discover People",
+        "🎮 Play Games",
+        "🎁 Daily Check-in",
+        "💰 My Coins",
+        "🏆 Weekly Leaderboard",
+        "🎨 Customize Theme",
+        "👤 My Profile",
+        "🛡️ Privacy & Safety",
     ]
 
 

@@ -20,6 +20,12 @@ import random
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - zoneinfo is stdlib on 3.9+
+    ZoneInfo = None
 
 try:
     from dotenv import load_dotenv
@@ -41,6 +47,75 @@ class ChatState(Enum):
     CHATTING = "chatting"      # actively paired with someone
 
 
+class Availability(Enum):
+    """User-controlled availability status (🟢 Ready / 🟡 Busy / ⚫ Invisible)."""
+    READY = "ready"
+    BUSY = "busy"
+    INVISIBLE = "invisible"
+
+
+# ── Timezone: one consistent clock for daily & weekly resets ─────
+# BOT_TIMEZONE (IANA name, e.g. "UTC", "Asia/Dhaka") — set it in .env.
+# Everything (daily check-in, weekly leaderboard, reminders) uses this
+# clock so resets never depend on the host machine's local time.
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "UTC").strip() or "UTC"
+
+
+def _tz():
+    if ZoneInfo is None:
+        try:
+            from dateutil.tz import gettz  # optional fallback
+
+            tz = gettz(BOT_TIMEZONE)
+            if tz is not None:
+                return tz
+        except Exception:
+            pass
+        return None
+    try:
+        return ZoneInfo(BOT_TIMEZONE)
+    except Exception:
+        return None
+
+
+_TZOBJ = _tz()
+
+
+def bot_now() -> datetime:
+    """Current time in the bot's configured timezone."""
+    if _TZOBJ is not None:
+        return datetime.now(_TZOBJ)
+    return datetime.now()
+
+
+def bot_today() -> str:
+    """Calendar date (YYYY-MM-DD) in the bot's timezone."""
+    return bot_now().strftime("%Y-%m-%d")
+
+
+def current_week_id() -> str:
+    """ISO week id like 2026-W42 — stable, sortable, timezone-consistent."""
+    now = bot_now()
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def previous_week_id(week: Optional[str] = None) -> Optional[str]:
+    """The ISO week immediately before `week` (defaults to the current one)."""
+    week = week or current_week_id()
+    try:
+        year_s, week_s = week.split("-W")
+        year, week_n = int(year_s), int(week_s)
+    except (ValueError, AttributeError):
+        return None
+    if week_n > 1:
+        return f"{year}-W{week_n - 1:02d}"
+    # First ISO week of the year belongs partly to December of prev year
+    prev = datetime(year, 1, 1) - timedelta(days=7)
+    py, pw, _ = prev.isocalendar()
+    return f"{py}-W{pw:02d}"
+
+
 # ── Economy / moderation settings ────────────────────────────────
 STARTING_COINS = 4         # free coins for every new user
 REFERRAL_REWARD = 8        # coins earned by the referrer per friend
@@ -52,7 +127,7 @@ CHAT_REQUEST_COST = 2      # coins to send a chat request from Nearby / by ID
 DIRECT_MESSAGE_COST = 1    # coins to start a Direct Message from a profile card
 LIST_MESSAGE_COST = 2      # flat fee for "📋 Send Message to List" broadcasts
 NOTIFY_COST = 1            # coins to enable 🔔 "notify me" alerts (VIP: free)
-REMINDER_HOUR_START = 9    # daily reminder window (local bot time)
+REMINDER_HOUR_START = 9    # daily reminder window (BOT timezone)
 REMINDER_HOUR_END = 22
 CHAT_REQUEST_TTL = 120     # seconds the receiver has to answer a request
 NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
@@ -63,6 +138,29 @@ RECENT_PARTNER_LIMIT = 20  # chat partners remembered per user
 DAILY_REWARD_COINS = 1     # coins per match (MeChat-style free coin)
 DAILY_REWARD_MAX = 10      # matches rewarded per day
 DM_TTL = 7 * 86400         # unread direct messages kept for 7 days
+
+# ── 🎁 Daily login reward ────────────────────────────────────────
+DAILY_CHECKIN_COINS = 1    # exactly 1 coin per calendar-day check-in
+
+# ── 🟢 Availability ──────────────────────────────────────────────
+AVAILABILITY_TTL = 12 * 3600  # stale statuses auto-expire back to Ready
+
+# ── 🏆 Weekly leaderboard ────────────────────────────────────────
+# ONLY the top three users are paid each week. Everyone else gets 0.
+WEEKLY_REWARD_COINS = {1: 6, 2: 4, 3: 2}
+WEEKLY_HISTORY_KEEP = 20   # previous rankings kept for review
+# Daily point caps per activity — kills spam/farming (category -> max/day).
+POINT_CAPS = {
+    "chat": 20,      # +2 per completed chat session
+    "message": 15,   # +1 per 5 relayed messages
+    "game": 10,      # +1 per mini-game finished
+    "checkin": 7,    # +1 per daily check-in
+    "like": 10,      # +1 per UNIQUE like received
+}
+
+# ── 🛡️ Age safety ────────────────────────────────────────────────
+MIN_AGE_DM = 16       # Direct Messages / chat requests need both sides 16+
+MIN_AGE_ADULT = 18    # adults (18+) may not DM minors (<18)
 
 # ── Short public-ID slugs (display: /user_xxx, base36) ───────────
 _B36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -148,6 +246,23 @@ class UserProfile:
     # ── Daily reminder (one nudge a day to come back and chat) ──
     daily_reminder: bool = False
     reminder_date: str = ""
+    # ── 🟢 Availability status (Ready / Busy / Invisible) ──
+    availability: Availability = Availability.READY
+    availability_set_at: float = 0.0
+    # ── 🎁 Daily login reward (1 coin per calendar day) ──
+    last_checkin: str = ""
+    # ── 🏆 Weekly leaderboard ──
+    week_id: str = ""           # ISO week the current points belong to
+    week_points: int = 0
+    week_point_log: dict = field(default_factory=dict)  # date -> {cat: used}
+    transactions: list = field(default_factory=list)    # coin ledger (newest first)
+    # ── 🎨 Cosmetic themes ──
+    theme: str = "default"
+    unlocked_themes: list = field(default_factory=list)
+    # ── 👤 Optional profile extras ──
+    bio: Optional[str] = None
+    interests: list = field(default_factory=list)
+    languages: list = field(default_factory=list)
 
 
 def _user_to_json(user: UserProfile) -> str:
@@ -194,6 +309,18 @@ def _user_to_json(user: UserProfile) -> str:
             "reward_count": user.reward_count,
             "daily_reminder": user.daily_reminder,
             "reminder_date": user.reminder_date,
+            "availability": user.availability.value,
+            "availability_set_at": user.availability_set_at,
+            "last_checkin": user.last_checkin,
+            "week_id": user.week_id,
+            "week_points": user.week_points,
+            "week_point_log": user.week_point_log,
+            "transactions": user.transactions[:100],
+            "theme": user.theme,
+            "unlocked_themes": list(user.unlocked_themes),
+            "bio": user.bio,
+            "interests": list(user.interests),
+            "languages": list(user.languages),
         }
     )
 
@@ -258,6 +385,18 @@ def _user_from_json(data: str) -> UserProfile:
         reward_count=d.get("reward_count", 0),
         daily_reminder=bool(d.get("daily_reminder", False)),
         reminder_date=d.get("reminder_date", ""),
+        availability=_enum_or_none(Availability, d.get("availability"), Availability.READY),
+        availability_set_at=d.get("availability_set_at", 0.0),
+        last_checkin=d.get("last_checkin", ""),
+        week_id=d.get("week_id", ""),
+        week_points=d.get("week_points", 0),
+        week_point_log=dict(d.get("week_point_log") or {}),
+        transactions=list(d.get("transactions") or []),
+        theme=d.get("theme", "default"),
+        unlocked_themes=list(d.get("unlocked_themes") or []),
+        bio=d.get("bio"),
+        interests=list(d.get("interests") or []),
+        languages=list(d.get("languages") or []),
     )
 
 
@@ -274,12 +413,18 @@ class Database:
         self.pending_verifications: dict[int, dict] = {}
         # Unread direct messages: to_id -> {from_id, text, at}
         self.pending_dms: dict[int, dict] = {}
+        # 🧠 Quiz Battles in progress: "a:b" -> battle session dict
+        self.game_battles: dict[str, dict] = {}
+        # Generic key/value metadata (weekly reward bookkeeping etc.)
+        self.meta: dict = {}
         # O(1) public-ID lookup index (public_id -> user_id)
         self._by_public_id: dict[int, int] = {}
 
         # SQLite persistence ("" or None disables it — memory only)
         self.path = os.getenv("DB_PATH", "bot.db") if path is None else path
-        self._lock = threading.Lock()
+        # Reentrant lock: spend_coins/finalize_weekly hold it across helper
+        # writes (_write_user also acquires it) without deadlocking.
+        self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         if self.path:
             self._connect()
@@ -353,6 +498,14 @@ class Database:
             }
         except ValueError:
             self.pending_dms = {}
+        try:
+            self.game_battles = json.loads(state.get("game_battles", "{}"))
+        except ValueError:
+            self.game_battles = {}
+        try:
+            self.meta = json.loads(state.get("meta", "{}"))
+        except ValueError:
+            self.meta = {}
         # Older accounts (created before public IDs existed) get one now.
         assigned = False
         self._by_public_id.clear()
@@ -390,6 +543,8 @@ class Database:
                 ("requests", json.dumps(self.requests)),
                 ("verifications", json.dumps(self.pending_verifications)),
                 ("dms", json.dumps(self.pending_dms)),
+                ("game_battles", json.dumps(self.game_battles)),
+                ("meta", json.dumps(self.meta)),
             ):
                 self._conn.execute(
                     "INSERT INTO state(key, value) VALUES (?, ?) "
@@ -463,6 +618,12 @@ class Database:
     def _write_dms(self):
         self._write_state("dms", json.dumps(self.pending_dms))
 
+    def _write_meta(self):
+        self._write_state("meta", json.dumps(self.meta))
+
+    def _write_battles(self):
+        self._write_state("game_battles", json.dumps(self.game_battles))
+
     def flush(self):
         """Persist the full snapshot right now (used before a backup upload)."""
         self._save()
@@ -495,6 +656,8 @@ class Database:
                     "requests": self.requests,
                     "verifications": self.pending_verifications,
                     "dms": self.pending_dms,
+                    "game_battles": self.game_battles,
+                    "meta": self.meta,
                 },
                 sort_keys=True,
             )
@@ -518,6 +681,8 @@ class Database:
         self.requests.clear()
         self.pending_verifications.clear()
         self.pending_dms.clear()
+        self.game_battles.clear()
+        self.meta.clear()
         self._by_public_id.clear()
         self._connect()
         self._load()
@@ -761,28 +926,34 @@ class Database:
     ) -> tuple[list["UserProfile"], int]:
         """
         Browse categories (MeChat-style "Who do you want to see?"):
-          all     — everyone except me
-          myage   — people within ±2 years of my age
-          ready   — complete profiles, not banned, not busy
-          new     — joined in the last 7 days
-          recent  — people I recently chatted with
-          popular — most liked first
+          all       — everyone except me (invisible users hidden)
+          myage     — people within ±2 years of my age
+          ready     — complete profiles, not banned, Ready to Chat
+          available — users currently 🟢 Ready to Chat (not chatting)
+          new       — joined in the last 7 days
+          recent    — people I recently chatted with
+          popular   — most liked first
         """
         me = self.users.get(user_id)
         now = time.time()
+        self.expire_stale_availability()
 
         if kind == "recent":
             found = [
                 self.users[uid]
                 for uid in (me.recent_partners if me else [])
-                if uid in self.users and not self.users[uid].banned
+                if uid in self.users
+                and not self.users[uid].banned
+                and self.users[uid].availability != Availability.INVISIBLE
             ]
             return found[offset : offset + limit], len(found)
 
         found = [
             u
             for u in self.users.values()
-            if u.user_id != user_id and not u.banned
+            if u.user_id != user_id
+            and not u.banned
+            and u.availability != Availability.INVISIBLE
         ]
 
         if kind == "myage" and me and me.age:
@@ -792,9 +963,21 @@ class Database:
             found = [
                 u
                 for u in found
-                if u.gender and u.country and u.state != ChatState.CHATTING
+                if u.gender
+                and u.country
+                and u.state != ChatState.CHATTING
+                and u.availability == Availability.READY
             ]
             found.sort(key=lambda u: u.state == ChatState.SEARCHING, reverse=True)
+        elif kind == "available":
+            found = [
+                u
+                for u in found
+                if u.availability == Availability.READY
+                and u.state != ChatState.CHATTING
+                and u.state != ChatState.SEARCHING
+            ]
+            found.sort(key=lambda u: u.registered_at, reverse=True)
         elif kind == "new":
             found = [u for u in found if now - u.registered_at <= 7 * 86400]
             found.sort(key=lambda u: u.registered_at, reverse=True)
@@ -1044,23 +1227,49 @@ class Database:
 
     # ── Coins ─────────────────────────────────────────────────────
 
-    def add_coins(self, user_id: int, amount: int) -> int:
-        """Add coins to a user and return the new balance."""
+    @staticmethod
+    def _log_transaction(user: UserProfile, kind: str, amount: int, reason: str):
+        """Append a coin ledger entry (newest first, capped at 100)."""
+        user.transactions.insert(
+            0,
+            {
+                "t": kind,            # "earn" | "spend"
+                "a": int(amount),
+                "r": (reason or "adjust")[:40],
+                "d": bot_now().isoformat(timespec="seconds"),
+            },
+        )
+        del user.transactions[100:]
+
+    def add_coins(self, user_id: int, amount: int, reason: str = "adjust") -> int:
+        """Add coins to a user and return the new balance. Never negative."""
         user = self.users.get(user_id)
-        if not user:
-            return 0
+        if not user or amount == 0:
+            return user.coins if user else 0
+        amount = int(amount)
         user.coins = max(0, user.coins + amount)
+        if amount > 0:
+            self._log_transaction(user, "earn", amount, reason)
         self._write_user(user)
         return user.coins
 
-    def spend_coins(self, user_id: int, amount: int) -> bool:
-        """Deduct coins if the balance allows it. Returns success."""
-        user = self.users.get(user_id)
-        if not user or user.coins < amount:
+    def spend_coins(self, user_id: int, amount: int, reason: str = "spend") -> bool:
+        """Deduct coins if the balance allows it. Returns success.
+
+        Uses a single locked read-modify-write so two concurrent spends can
+        never drive the balance negative or double-charge.
+        """
+        amount = int(amount)
+        if amount <= 0:
             return False
-        user.coins -= amount
-        self._write_user(user)
-        return True
+        with self._lock:
+            user = self.users.get(user_id)
+            if not user or user.coins < amount:
+                return False
+            user.coins -= amount
+            self._log_transaction(user, "spend", amount, reason)
+            self._write_user(user)
+            return True
 
     def add_charge(self, charge_id: str) -> bool:
         """Record a processed Telegram payment. Returns False if already seen."""
@@ -1078,7 +1287,7 @@ class Database:
         user = self.users.get(user_id)
         if not user or user.gender != Gender.FEMALE:
             return 0
-        today = time.strftime("%Y-%m-%d")
+        today = bot_today()
         if user.reward_date != today:
             user.reward_date = today
             user.reward_count = 0
@@ -1124,6 +1333,8 @@ class Database:
             return False, target.likes
         target.liked_by.add(from_id)
         target.likes += 1
+        # 🏆 Unique likes received are legitimate engagement points
+        self.add_weekly_points(to_id, 1, "like")
         self._write_user(target)
         return True, target.likes
 
@@ -1205,20 +1416,26 @@ class Database:
           • Prefer different country (cross-border chat)
           • Respect the active search filter of both users
           • Skip banned users and mutually blocked pairs
+          • ⚫ Invisible users are never matched; 🟡 Busy users are only
+            matched when no 🟢 Ready candidate is waiting
           • Never match with self
         """
         user = self.users.get(user_id)
         if not user or user.banned:
             return None
+        self.expire_stale_availability()
 
         best_match: Optional[int] = None
         best_is_cross_country = False
+        best_is_ready = False
 
         for candidate_id in self.queue:
             if candidate_id == user_id:
                 continue
             candidate = self.users.get(candidate_id)
             if not candidate or candidate.banned:
+                continue
+            if candidate.availability == Availability.INVISIBLE:
                 continue
             if candidate_id in user.blocked or user_id in candidate.blocked:
                 continue
@@ -1231,11 +1448,21 @@ class Database:
                 user.country and candidate.country
                 and user.country.lower() != candidate.country.lower()
             )
+            is_ready = candidate.availability == Availability.READY
 
-            # Prefer cross-country matches
-            if best_match is None or (is_cross and not best_is_cross_country):
+            # Prefer 🟢 Ready partners, then cross-country matches
+            better = False
+            if best_match is None:
+                better = True
+            elif is_ready and not best_is_ready:
+                better = True
+            elif is_ready == best_is_ready and is_cross and not best_is_cross_country:
+                better = True
+
+            if better:
                 best_match = candidate_id
                 best_is_cross_country = is_cross
+                best_is_ready = is_ready
 
         return best_match
 
@@ -1276,6 +1503,9 @@ class Database:
 
         a.partner_id = user_b
         b.partner_id = user_a
+        # 🏆 Legitimate engagement: a completed chat session is worth points
+        self.add_weekly_points(user_a, 2, "chat")
+        self.add_weekly_points(user_b, 2, "chat")
         self._write_users(a, b)
 
     def end_chat(self, user_id: int) -> Optional[int]:
@@ -1318,6 +1548,339 @@ class Database:
             changed.append(partner)
         self._write_users(*changed)
         return user.partner_id
+
+    # ── 🟢 Availability status ────────────────────────────────────
+
+    def set_availability(self, user_id: int, value: Availability) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        user.availability = value
+        user.availability_set_at = time.time()
+        self._write_user(user)
+        return True
+
+    def expire_stale_availability(self) -> int:
+        """Reset Busy/Invisible statuses older than AVAILABILITY_TTL to Ready.
+
+        Prevents users from silently staying ⚫ Invisible (or 🟡 Busy) forever
+        after closing the app. Returns how many statuses were expired.
+        """
+        cutoff = time.time() - AVAILABILITY_TTL
+        expired = 0
+        changed = []
+        for user in self.users.values():
+            if user.availability == Availability.READY:
+                continue
+            if user.availability_set_at and user.availability_set_at > cutoff:
+                continue
+            user.availability = Availability.READY
+            user.availability_set_at = time.time()
+            changed.append(user)
+            expired += 1
+        if changed:
+            self._write_users(*changed)
+        return expired
+
+    def available_users(
+        self, user_id: int, offset: int = 0, limit: int = BROWSE_PAGE_SIZE
+    ) -> tuple[list["UserProfile"], int]:
+        """🟢 Ready-to-Chat users (not chatting, not invisible, not banned)."""
+        return self.browse_filtered(user_id, "available", offset, limit)
+
+    # ── 🎁 Daily login reward ─────────────────────────────────────
+
+    def can_claim_checkin(self, user_id: int) -> bool:
+        user = self.users.get(user_id)
+        return bool(user) and user.last_checkin != bot_today()
+
+    def claim_daily_checkin(self, user_id: int) -> tuple[bool, int, int]:
+        """
+        Claim the daily login reward: exactly DAILY_CHECKIN_COINS once per
+        calendar day (bot timezone). Returns (claimed, coins_earned, balance).
+
+        Guarded by a reentrant lock + the last_checkin date stamp so button
+        spam or concurrent taps can never pay twice for the same day.
+        """
+        with self._lock:
+            user = self.users.get(user_id)
+            if not user or user.banned:
+                return False, 0, user.coins if user else 0
+            today = bot_today()
+            if user.last_checkin == today:
+                return False, 0, user.coins
+            user.last_checkin = today
+            user.coins = max(0, user.coins + DAILY_CHECKIN_COINS)
+            self._log_transaction(
+                user, "earn", DAILY_CHECKIN_COINS, "daily_checkin"
+            )
+            self.add_weekly_points(user_id, 1, "checkin")
+            self._write_user(user)
+            return True, DAILY_CHECKIN_COINS, user.coins
+
+    # ── 🏆 Weekly leaderboard ─────────────────────────────────────
+
+    def add_weekly_points(
+        self, user_id: int, amount: int, category: str
+    ) -> int:
+        """
+        Award leaderboard points for legitimate activity. Each category has
+        a hard daily cap (POINT_CAPS) so spam, fake activity and exploits
+        cannot farm an unbounded score. Returns points actually granted.
+        """
+        amount = int(amount)
+        if amount <= 0:
+            return 0
+        cap = POINT_CAPS.get(category, 0)
+        if cap <= 0:
+            return 0
+        week = current_week_id()
+        today = bot_today()
+        with self._lock:
+            user = self.users.get(user_id)
+            if not user or user.banned:
+                return 0
+            if user.week_id != week:
+                user.week_id = week
+                user.week_points = 0
+                user.week_point_log = {}
+            day_log = user.week_point_log.setdefault(today, {})
+            used = int(day_log.get(category, 0))
+            allowed = max(0, min(amount, cap - used))
+            if allowed <= 0:
+                return 0
+            day_log[category] = used + allowed
+            user.week_points += allowed
+            self._write_user(user)
+            return allowed
+
+    def leaderboard_top(
+        self, limit: int = 10, week: Optional[str] = None
+    ) -> list[tuple["UserProfile", int]]:
+        """[(user, points)] for `week` (default: current), highest first."""
+        week = week or current_week_id()
+        ranked = [
+            (u, u.week_points)
+            for u in self.users.values()
+            if u.week_id == week and u.week_points > 0 and not u.banned
+        ]
+        ranked.sort(key=lambda pair: (-pair[1], pair[0].user_id))
+        return ranked[:limit]
+
+    def _finalize_week_locked(self, week: str) -> Optional[dict]:
+        """Pay the top-3 of `week`. Caller must hold self._lock."""
+        ranked = sorted(
+            (
+                u
+                for u in self.users.values()
+                if u.week_id == week and not u.banned
+            ),
+            key=lambda u: (-u.week_points, u.user_id),
+        )
+        results = []
+        for rank, u in enumerate(ranked[:3], start=1):
+            coins = WEEKLY_REWARD_COINS.get(rank, 0)
+            if coins > 0:
+                u.coins = max(0, u.coins + coins)
+                self._log_transaction(
+                    u, "earn", coins, f"weekly_rank_{rank}"
+                )
+                self._write_user(u)
+            results.append(
+                {
+                    "rank": rank,
+                    "user_id": u.user_id,
+                    "points": u.week_points,
+                    "coins": coins,
+                }
+            )
+        # Reset the finished week so the next one starts clean
+        for u in ranked:
+            u.week_id = ""
+            u.week_points = 0
+            u.week_point_log = {}
+            self._write_user(u)
+        history = self.meta.setdefault("weekly_history", [])
+        history.insert(0, {"week": week, "results": results})
+        del history[WEEKLY_HISTORY_KEEP:]
+        self.meta["weekly_rewarded_week"] = week
+        self._write_meta()
+        return {"week": week, "results": results}
+
+    def finalize_weekly_rewards(self, week: Optional[str] = None) -> Optional[dict]:
+        """
+        Distribute weekly leaderboard rewards for `week` (or the week
+        before the current one). ONLY the top three users are paid
+        (6 / 4 / 2 coins); everyone else gets 0. Idempotent: calling twice
+        for the same week pays nothing the second time (meta guard + lock).
+        """
+        week = week or previous_week_id() or current_week_id()
+        with self._lock:
+            if self.meta.get("weekly_rewarded_week") == week:
+                return None
+            # Any OTHER un-rewarded past week is finalized first
+            pending = sorted(
+                {
+                    u.week_id
+                    for u in self.users.values()
+                    if u.week_id and u.week_id < current_week_id() and u.week_id != week
+                }
+            )
+            out = []
+            for w in pending:
+                if self.meta.get("weekly_rewarded_week") == w:
+                    continue
+                res = self._finalize_week_locked(w)
+                if res:
+                    out.append(res)
+            res = self._finalize_week_locked(week)
+            if res:
+                out.append(res)
+            return out[-1] if out else None
+
+    def sweep_weekly_rewards(self) -> Optional[dict]:
+        """Called by the bot loop: finalize whenever a new week begins."""
+        week = current_week_id()
+        if self.meta.get("weekly_rewarded_week") == week:
+            return None
+        has_leftover = any(
+            u.week_id and u.week_id < week for u in self.users.values()
+        )
+        if not has_leftover and self.meta.get("weekly_rewarded_week"):
+            # New week, nothing to pay — just mark it so we don't re-check
+            self.meta["weekly_rewarded_week"] = week
+            self._write_meta()
+            return None
+        if not has_leftover:
+            self.meta["weekly_rewarded_week"] = week
+            self._write_meta()
+            return None
+        return self.finalize_weekly_rewards()
+
+    def weekly_history(self, limit: int = 3) -> list[dict]:
+        return list(self.meta.get("weekly_history", [])[:limit])
+
+    def weekly_points_of(self, user_id: int) -> int:
+        user = self.users.get(user_id)
+        if not user:
+            return 0
+        if user.week_id != current_week_id():
+            return 0
+        return user.week_points
+
+    # ── 🎨 Cosmetic themes ────────────────────────────────────────
+
+    def unlock_theme(self, user_id: int, theme_id: str, cost: int) -> tuple[bool, str]:
+        """Buy a theme with coins (once). Returns (ok, message)."""
+        user = self.users.get(user_id)
+        if not user:
+            return False, "Please /start first."
+        if theme_id in user.unlocked_themes:
+            return False, "You already own that theme."
+        if cost > 0 and not self.spend_coins(
+            user_id, cost, reason=f"theme_{theme_id}"
+        ):
+            return False, "not_enough"
+        if theme_id not in user.unlocked_themes:
+            user.unlocked_themes.append(theme_id)
+        user.theme = theme_id
+        self._write_user(user)
+        return True, "ok"
+
+    def equip_theme(self, user_id: int, theme_id: str) -> bool:
+        user = self.users.get(user_id)
+        if not user or theme_id not in user.unlocked_themes:
+            return False
+        user.theme = theme_id
+        self._write_user(user)
+        return True
+
+    # ── 👤 Optional profile extras (bio / interests / languages) ──
+
+    def set_bio(self, user_id: int, bio: Optional[str]) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        cleaned = (bio or "").strip()[:160] or None
+        user.bio = cleaned
+        self._write_user(user)
+        return True
+
+    def set_interests(self, user_id: int, items: list[str]) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        cleaned = [i.strip()[:24] for i in items if i and i.strip()][:8]
+        user.interests = cleaned
+        self._write_user(user)
+        return True
+
+    def set_languages(self, user_id: int, items: list[str]) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        cleaned = [i.strip()[:24] for i in items if i and i.strip()][:6]
+        user.languages = cleaned
+        self._write_user(user)
+        return True
+
+    # ── 🛡️ Age safety ─────────────────────────────────────────────
+
+    def can_direct_message(self, from_id: int, to_id: int) -> tuple[bool, str]:
+        """
+        Age-safety gate for Direct Messages and chat requests:
+          • both sides need an age of at least MIN_AGE_DM
+          • adults (18+) may never DM minors (<18), and vice versa for
+            the adult→minor direction
+        """
+        a, b = self.users.get(from_id), self.users.get(to_id)
+        if not a or not b:
+            return False, "That user no longer exists."
+        age_a = a.age or 0
+        age_b = b.age or 0
+        if age_a < MIN_AGE_DM or age_b < MIN_AGE_DM:
+            return False, (
+                f"🛡️ Direct messages require both people to be at least "
+                f"{MIN_AGE_DM} years old."
+            )
+        if (age_a >= MIN_AGE_ADULT) != (age_b >= MIN_AGE_ADULT):
+            return False, (
+                "🛡️ For everyone's safety, adults and minors can't start "
+                "private conversations here."
+            )
+        return True, "ok"
+
+    # ── 🧠 Quiz battles (2-player) ────────────────────────────────
+
+    @staticmethod
+    def _battle_key(a: int, b: int) -> str:
+        return f"{min(a, b)}:{max(a, b)}"
+
+    def create_battle(self, a: int, b: int, questions: list) -> dict:
+        key = self._battle_key(a, b)
+        session = {
+            "a": a,
+            "b": b,
+            "questions": questions,   # list of question dicts
+            "answers": {},            # "qi:uid" -> option index
+            "qi": 0,
+            "turn": a,
+            "score": {str(a): 0, str(b): 0},
+            "created_at": time.time(),
+            "done": False,
+        }
+        self.game_battles[key] = session
+        self._write_battles()
+        return session
+
+    def get_battle(self, a: int, b: int) -> Optional[dict]:
+        return self.game_battles.get(self._battle_key(a, b))
+
+    def drop_battle(self, a: int, b: int) -> None:
+        key = self._battle_key(a, b)
+        if key in self.game_battles:
+            del self.game_battles[key]
+            self._write_battles()
 
     # ── Stats ────────────────────────────────────────────────────
 

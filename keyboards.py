@@ -78,17 +78,145 @@ def country_keyboard() -> InlineKeyboardMarkup:
 # ── Main menu ────────────────────────────────────────────────────
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """The reference bot's idle menu — everything else lives behind these
-    four doors: the profile card carries Credits/Stats/Find by ID-adjacent
-    actions, Advanced Settings carries the editors."""
+    """Organised 9-door main menu (feature 6).
+
+    💬 Start Chatting · 🌍 Discover People · 🎮 Play Games ·
+    🎁 Daily Check-in · 💰 My Coins · 🏆 Weekly Leaderboard ·
+    🎨 Customize Theme · 👤 My Profile · 🛡️ Privacy & Safety
+    """
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Start Chatting", callback_data="find_partner")],
+        [InlineKeyboardButton("🌍 Discover People", callback_data="discover")],
+        [InlineKeyboardButton("🎮 Play Games", callback_data="games_menu")],
         [
-            InlineKeyboardButton("📇 Contact List", callback_data="contacts"),
-            InlineKeyboardButton("🚫 Blocked Users", callback_data="blocked_list"),
+            InlineKeyboardButton("🎁 Daily Check-in", callback_data="checkin"),
+            InlineKeyboardButton("💰 My Coins", callback_data="credit_menu"),
         ],
-        [InlineKeyboardButton("⚙️ Advanced Settings ⚙️", callback_data="settings")],
-        [InlineKeyboardButton("📝 Edit Profile Information", callback_data="my_profile")],
+        [InlineKeyboardButton("🏆 Weekly Leaderboard", callback_data="leaderboard")],
+        [InlineKeyboardButton("🎨 Customize Theme", callback_data="theme_menu")],
+        [
+            InlineKeyboardButton("👤 My Profile", callback_data="my_profile"),
+            InlineKeyboardButton("🛡️ Privacy & Safety", callback_data="privacy"),
+        ],
     ])
+
+
+# ── 🌍 Discover People ───────────────────────────────────────────
+
+def discover_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎉 Browse People", callback_data="browse_menu")],
+        [InlineKeyboardButton("🟢 Ready to Chat", callback_data="brw_available")],
+        [InlineKeyboardButton("🧭 Nearby People", callback_data="nearby")],
+        [InlineKeyboardButton("🔎 Find by ID", callback_data="find_id")],
+        [InlineKeyboardButton("📇 My Contacts", callback_data="contacts")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+    ])
+
+
+# ── 🛡️ Privacy & Safety ─────────────────────────────────────────
+
+def privacy_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
+    reminder_label = (
+        "⏰ Daily Reminder: ON ✅" if reminder_on else "⏰ Daily Reminder: OFF"
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 My Availability", callback_data="avail_menu")],
+        [InlineKeyboardButton("🚫 Blocked Users", callback_data="blocked_list")],
+        [InlineKeyboardButton("⚙️ Advanced Settings", callback_data="settings")],
+        [InlineKeyboardButton(reminder_label, callback_data="reminder_toggle")],
+        [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
+        [InlineKeyboardButton("📖 Safety Tips", callback_data="safety_tips")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+    ])
+
+
+# ── 🟢 Availability status ───────────────────────────────────────
+
+def availability_keyboard(current: str = "ready") -> InlineKeyboardMarkup:
+    def mark(label: str, value: str) -> str:
+        return f"{label} ✅" if current == value else label
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mark("🟢 Ready to Chat", "ready"), callback_data="avail_ready")],
+        [InlineKeyboardButton(mark("🟡 Busy", "busy"), callback_data="avail_busy")],
+        [InlineKeyboardButton(mark("⚫ Invisible", "invisible"), callback_data="avail_invisible")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="privacy")],
+    ])
+
+
+# ── 🎮 Mini-games ────────────────────────────────────────────────
+
+def games_menu_keyboard(*, battle_challenge: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("💗 Would You Rather", callback_data="game_wyr")],
+        [InlineKeyboardButton("🎭 Truth or Dare", callback_data="game_tod")],
+        [InlineKeyboardButton("🧠 Quiz Battle", callback_data="game_quiz")],
+        [InlineKeyboardButton("😂 Emoji Guess", callback_data="game_emoji")],
+        [InlineKeyboardButton("⚡ Rapid-Fire Questions", callback_data="game_rapid")],
+        [InlineKeyboardButton("🔢 Guess the Number", callback_data="game_num")],
+        [InlineKeyboardButton("💞 Friendship Quiz", callback_data="game_friend")],
+    ]
+    if battle_challenge:
+        rows.append([InlineKeyboardButton(
+            "⚔️ Challenge Partner", callback_data="gqb_chal"
+        )])
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def game_controls_keyboard(extra_rows=()) -> InlineKeyboardMarkup:
+    """Skip / Replay / Exit strip attached to every game card."""
+    rows = [
+        [
+            InlineKeyboardButton("⏭ Skip", callback_data="gskip"),
+            InlineKeyboardButton("🔁 Replay", callback_data="greplay"),
+            InlineKeyboardButton("❌ Exit", callback_data="gexit"),
+        ]
+    ]
+    rows.extend(extra_rows)
+    rows.append([InlineKeyboardButton("🎮 Game Menu", callback_data="games_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── 🎁 Daily check-in ────────────────────────────────────────────
+
+def checkin_keyboard(claimed_today: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if not claimed_today:
+        rows.append([InlineKeyboardButton("🎁 Claim +1 🪙", callback_data="checkin_claim")])
+    rows.append([InlineKeyboardButton("💰 My Coins", callback_data="credit_menu")])
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── 🏆 Weekly leaderboard ────────────────────────────────────────
+
+def leaderboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏆 Top 10 This Week", callback_data="lb_top")],
+        [InlineKeyboardButton("📜 Previous Weeks", callback_data="lb_history")],
+        [InlineKeyboardButton("❓ How points work", callback_data="lb_how")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+    ])
+
+
+# ── 🎨 Themes ────────────────────────────────────────────────────
+
+def theme_keyboard(themes, active_theme: str, unlocked: set) -> InlineKeyboardMarkup:
+    """List of themes — equip owned ones, buy the rest with coins."""
+    rows = []
+    for theme in themes:
+        if theme.id in unlocked:
+            label = f"{theme.emoji} {theme.name}" + (
+                " ✅" if theme.id == active_theme else ""
+            )
+            data = f"theme_eq_{theme.id}"
+        else:
+            label = f"{theme.emoji} {theme.name} — {theme.cost} 🪙"
+            data = f"theme_buy_{theme.id}"
+        rows.append([InlineKeyboardButton(label, callback_data=data)])
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ── Persistent bottom bar (stays on screen until removed) ───────
@@ -179,6 +307,7 @@ def blocked_users_keyboard(users) -> InlineKeyboardMarkup:
 def browse_menu_keyboard() -> InlineKeyboardMarkup:
     """🌟 'Who do you want to see?' — MeChat-style browse categories."""
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Ready to Chat", callback_data="brw_available")],
         [InlineKeyboardButton("⭐ People My Age", callback_data="brw_myage")],
         [
             InlineKeyboardButton("💕 Ready to Chat", callback_data="brw_ready"),
@@ -244,6 +373,9 @@ def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
         [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
         [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
+        [InlineKeyboardButton("📝 Edit Bio", callback_data="edit_bio")],
+        [InlineKeyboardButton("🎯 Edit Interests", callback_data="edit_interests")],
+        [InlineKeyboardButton("🗣 Edit Languages", callback_data="edit_langs")],
         [InlineKeyboardButton("🔎 Find by ID", callback_data="find_id")],
         [InlineKeyboardButton(reminder_label, callback_data="reminder_toggle")],
         [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
@@ -256,8 +388,9 @@ def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
 def chat_keyboard(secure: bool = False) -> InlineKeyboardMarkup:
     """
     MeChat-style in-chat bar: Secure Chat / Contact Profile,
-    End Chat / Report. `secure` reflects the Secure Chat toggle so the
-    button shows its current state.
+    End Chat / Report, plus 🎮 Play Games (Quiz Battle vs partner).
+    `secure` reflects the Secure Chat toggle so the button shows its
+    current state.
     """
     secure_label = "🔓 Secure Chat ON" if secure else "🔐 Secure Chat"
     return InlineKeyboardMarkup([
@@ -269,6 +402,7 @@ def chat_keyboard(secure: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛑 End Chat", callback_data="end_chat"),
             InlineKeyboardButton("🚩 Report", callback_data="report_partner"),
         ],
+        [InlineKeyboardButton("🎮 Play Games", callback_data="games_menu")],
     ])
 
 
