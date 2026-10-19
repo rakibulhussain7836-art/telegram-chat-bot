@@ -1254,12 +1254,42 @@ class Database:
         )
         del user.transactions[100:]
 
+    def has_checked_in_today(self, user_id: int) -> bool:
+        """🎁 True when the user claimed the daily check-in today."""
+        user = self.users.get(user_id)
+        return bool(user) and user.last_checkin == bot_today()
+
+    def coin_gate_reason(self, user_id: int) -> Optional[str]:
+        """
+        🎁 MANDATORY daily check-in: earn nothing until it's claimed.
+        Returns None when earning is allowed, or a short human-readable
+        reason explaining why coins are withheld.
+        """
+        user = self.users.get(user_id)
+        if not user:
+            return "You don't have an account yet — send /start first."
+        if user.last_checkin != bot_today():
+            return (
+                "🎁 Claim your **Daily Check-in** first — it's required "
+                "before you can earn coins. Open 🎁 Daily Check-in in the "
+                "main menu and tap Claim."
+            )
+        return None
+
     def add_coins(self, user_id: int, amount: int, reason: str = "adjust") -> int:
-        """Add coins to a user and return the new balance. Never negative."""
+        """
+        Add coins to a user and return the new balance. Never negative.
+
+        🎁 MANDATORY: positive earnings are withheld until the daily
+        check-in is claimed today. Refunds/adjustments (amount <= 0) are
+        never gated, so a failed purchase can always be given back.
+        """
         user = self.users.get(user_id)
         if not user or amount == 0:
             return user.coins if user else 0
         amount = int(amount)
+        if amount > 0 and user.last_checkin != bot_today():
+            return user.coins  # 🎁 daily check-in required to earn coins
         user.coins = max(0, user.coins + amount)
         if amount > 0:
             self._log_transaction(user, "earn", amount, reason)
@@ -1296,9 +1326,14 @@ class Database:
         """
         MeChat-style free coin — girls only: +DAILY_REWARD_COINS per match,
         up to DAILY_REWARD_MAX matches per day. Boys never get the reward.
+
+        🎁 MANDATORY: the daily check-in must already be claimed today,
+        otherwise the match reward is withheld.
         """
         user = self.users.get(user_id)
         if not user or user.gender != Gender.FEMALE:
+            return 0
+        if user.last_checkin != bot_today():
             return 0
         today = bot_today()
         if user.reward_date != today:
@@ -1308,6 +1343,9 @@ class Database:
             return 0
         user.reward_count += 1
         user.coins = max(0, user.coins + DAILY_REWARD_COINS)
+        self._log_transaction(
+            user, "earn", DAILY_REWARD_COINS, "match_reward"
+        )
         self._write_user(user)
         return DAILY_REWARD_COINS
 
@@ -1329,9 +1367,20 @@ class Database:
 
         new_user.referred_by = referrer_id
         referrer.referral_count += 1
-        referrer.referral_earned += REFERRAL_REWARD
-        referrer.coins = max(0, referrer.coins + REFERRAL_REWARD)
-        new_user.coins = max(0, new_user.coins + REFERRED_BONUS)
+        today = bot_today()
+        # 🎁 MANDATORY: coins pay only after the referrer's daily check-in
+        # (the referral itself is always recorded).
+        if referrer.last_checkin == today:
+            referrer.referral_earned += REFERRAL_REWARD
+            referrer.coins = max(0, referrer.coins + REFERRAL_REWARD)
+            self._log_transaction(
+                referrer, "earn", REFERRAL_REWARD, "referral"
+            )
+        if new_user.last_checkin == today:
+            new_user.coins = max(0, new_user.coins + REFERRED_BONUS)
+            self._log_transaction(
+                new_user, "earn", REFERRED_BONUS, "referred_bonus"
+            )
         self._write_users(referrer, new_user)
         return REFERRAL_REWARD, REFERRED_BONUS
 
@@ -1640,6 +1689,9 @@ class Database:
         Award leaderboard points for legitimate activity. Each category has
         a hard daily cap (POINT_CAPS) so spam, fake activity and exploits
         cannot farm an unbounded score. Returns points actually granted.
+
+        🎁 MANDATORY: the daily check-in must already be claimed today,
+        otherwise no points are earned.
         """
         amount = int(amount)
         if amount <= 0:
@@ -1653,6 +1705,8 @@ class Database:
             user = self.users.get(user_id)
             if not user or user.banned:
                 return 0
+            if user.last_checkin != today:
+                return 0  # 🎁 daily check-in required to earn points
             if user.week_id != week:
                 user.week_id = week
                 user.week_points = 0

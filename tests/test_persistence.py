@@ -11,11 +11,21 @@ from database import (
     GIRL_SEARCH_COST,
     REFERRAL_REWARD,
     STARTING_COINS,
+    bot_today,
 )
+
+
+def claim_checkin(db, uid):
+    """🎁 The daily check-in is mandatory — claim it so this user can earn."""
+    user = db.get_user(uid)
+    if user:
+        user.last_checkin = bot_today()
+    return user
 
 
 def register(db, uid, gender=Gender.MALE, country="US", pref=Gender.ANY):
     user = db.register_user(uid)
+    claim_checkin(db, uid)
     db.update_gender(uid, gender)
     db.update_country(uid, country)
     db.update_preferred_gender(uid, pref)

@@ -14,6 +14,8 @@ from database import (
     DAILY_CHECKIN_COINS,
     WEEKLY_REWARD_COINS,
     POINT_CAPS,
+    REFERRED_BONUS,
+    REFERRAL_REWARD,
     AVAILABILITY_TTL,
     MIN_AGE_DM,
     current_week_id,
@@ -29,6 +31,8 @@ def run(coro):
 
 
 def make(db, uid, gender=Gender.MALE, age=25):
+    """Register a user. The autouse fixture claims today's check-in for
+    gate-off tests; gate tests use ``_fresh_user`` instead."""
     user = db.register_user(uid, name=f"U{uid}")
     db.update_gender(uid, gender)
     db.update_country(uid, "US")
@@ -109,6 +113,7 @@ def test_ready_users_preferred_in_matching():
 def test_daily_checkin_grants_one_coin():
     db = Database()
     make(db, 1)
+    db.get_user(1).last_checkin = ""  # 🎁 not yet claimed today
     before = db.get_user(1).coins
     claimed, earned, balance = db.claim_daily_checkin(1)
     assert claimed is True
@@ -119,6 +124,7 @@ def test_daily_checkin_grants_one_coin():
 def test_daily_checkin_only_once_per_day():
     db = Database()
     make(db, 1)
+    db.get_user(1).last_checkin = ""
     claimed1, _, bal1 = db.claim_daily_checkin(1)
     claimed2, earned2, bal2 = db.claim_daily_checkin(1)
     assert claimed1 is True
@@ -147,16 +153,19 @@ def test_daily_checkin_resets_next_day():
 def test_checkin_updates_ledger_and_lb_points():
     db = Database()
     make(db, 1)
+    user = db.get_user(1)
+    user.last_checkin = ""
     before_pts = db.weekly_points_of(1)
     db.claim_daily_checkin(1)
     assert db.weekly_points_of(1) == before_pts + 1
-    tx = db.get_user(1).transactions
+    tx = user.transactions
     assert any(t["r"] == "daily_checkin" and t["a"] == 1 for t in tx)
 
 
 def test_can_claim_checkin_flag():
     db = Database()
     make(db, 1)
+    db.get_user(1).last_checkin = ""
     assert db.can_claim_checkin(1) is True
     db.claim_daily_checkin(1)
     assert db.can_claim_checkin(1) is False
@@ -630,3 +639,115 @@ def test_games_menu_shows_battle_challenge_only_in_chat():
 
     assert "gqb_chal" not in cbds(games_menu_keyboard(battle_challenge=False))
     assert "gqb_chal" in cbds(games_menu_keyboard(battle_challenge=True))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  🎁 Mandatory daily check-in gate
+#  Until the check-in is claimed, the user earns NO coins and NO points.
+# ═══════════════════════════════════════════════════════════════════
+
+gate = pytest.mark.no_auto_checkin
+
+
+def _fresh_user(db, uid, gender=Gender.MALE, age=25):
+    """Register a user WITHOUT the autouse check-in claim (gate tests)."""
+    user = db.register_user(uid, name=f"U{uid}")
+    db.update_gender(uid, gender)
+    db.update_country(uid, "US")
+    db.update_age(uid, age)
+    db.update_city(uid, "Springfield")
+    user.last_checkin = ""  # 🎁 not checked in today
+    return user
+
+
+@gate
+def test_no_coins_until_checkin_claimed():
+    db = Database()
+    _fresh_user(db, 1)
+    before = db.get_user(1).coins
+    assert db.add_coins(1, 50) == before
+    assert db.get_user(1).coins == before
+    # After the check-in, earning works again.
+    db.claim_daily_checkin(1)
+    after_checkin = db.get_user(1).coins
+    assert db.add_coins(1, 50) == after_checkin + 50
+
+
+@gate
+def test_match_reward_needs_checkin():
+    db = Database()
+    _fresh_user(db, 1, gender=Gender.FEMALE)
+    assert db.award_match_reward(1) == 0
+    db.claim_daily_checkin(1)
+    assert db.award_match_reward(1) == DAILY_CHECKIN_COINS
+
+
+@gate
+def test_referral_coins_need_checkin_but_link_is_recorded():
+    db = Database()
+    _fresh_user(db, 1)  # referrer — not checked in
+    _fresh_user(db, 2)  # new user — not checked in
+    referrer_before = db.get_user(1).coins
+    new_before = db.get_user(2).coins
+
+    gains = db.apply_referral(1, 2)
+    assert gains == (REFERRAL_REWARD, REFERRED_BONUS)
+    # link + counter always recorded
+    assert db.get_user(1).referral_count == 1
+    assert db.get_user(2).referred_by == 1
+    # both sides' coins withheld because neither had checked in
+    assert db.get_user(1).coins == referrer_before
+    assert db.get_user(2).coins == new_before
+
+    # checking in later does not retroactively pay the missed referral
+    db.claim_daily_checkin(1)
+    db.claim_daily_checkin(2)
+    assert db.get_user(1).coins == referrer_before + DAILY_CHECKIN_COINS
+    assert db.get_user(2).coins == new_before + DAILY_CHECKIN_COINS
+
+    # a referral made AFTER check-in pays the referrer; the new user's
+    # bonus still waits for their own check-in
+    _fresh_user(db, 3)
+    referrer_before = db.get_user(1).coins
+    new_before = db.get_user(3).coins
+    assert db.apply_referral(1, 3) == (REFERRAL_REWARD, REFERRED_BONUS)
+    assert db.get_user(1).coins == referrer_before + REFERRAL_REWARD
+    assert db.get_user(3).coins == new_before  # 3 has not checked in yet
+
+    # claiming later does not retroactively credit the withheld bonus
+    db.claim_daily_checkin(3)
+    assert db.get_user(3).coins == new_before + DAILY_CHECKIN_COINS
+
+
+@gate
+def test_leaderboard_points_need_checkin():
+    db = Database()
+    _fresh_user(db, 1)
+    assert db.add_weekly_points(1, 2, "chat") == 0
+    assert db.weekly_points_of(1) == 0
+    db.claim_daily_checkin(1)
+    before = db.weekly_points_of(1)
+    assert db.add_weekly_points(1, 2, "chat") == 2
+    assert db.weekly_points_of(1) == before + 2
+
+
+@gate
+def test_coin_gate_reason_explains_the_rule():
+    db = Database()
+    _fresh_user(db, 1)
+    reason = db.coin_gate_reason(1)
+    assert reason and "check-in" in reason.lower()
+    db.claim_daily_checkin(1)
+    assert db.coin_gate_reason(1) is None
+
+
+@gate
+def test_refunds_are_never_gated():
+    db = Database()
+    _fresh_user(db, 1)
+    # a negative adjust (a refund/penalty) must apply even without the
+    # check-in — only POSITIVE earnings are gated.
+    start = db.get_user(1).coins
+    assert db.add_coins(1, -1) == start - 1
+    assert db.get_user(1).coins == start - 1
+

@@ -2078,6 +2078,18 @@ async def begin_search(
     if pending:
         return pending
 
+    # 🎁 MANDATORY daily check-in — a friendly nudge before anything else.
+    if user.last_checkin != bot_today():
+        return (
+            "🎁 **Daily Check-in required**\n\n"
+            "You must claim your Daily Check-in first — it's how you earn "
+            f"**{DAILY_CHECKIN_COINS} 🪙** and it unlocks today's coins, "
+            "points and match rewards.\n\n"
+            "Tap 🎁 Daily Check-in in the main menu, then **Claim**.",
+            checkin_keyboard(claimed_today=False),
+            "Markdown",
+        )
+
     if user.state == ChatState.CHATTING:
         # A stale 🎲 Choose-menu tap while talking: leave the chat first,
         # then hand back the choice — never the "already in a chat" wall.
@@ -2251,6 +2263,8 @@ LEADERBOARD_TEXT = (
 
 LB_HOW_TEXT = (
     "❓ **How leaderboard points work**\n\n"
+    "🎁 **Daily Check-in is required first** — until you claim it, you "
+    f"earn **no points and no coins** today. It also pays **{DAILY_CHECKIN_COINS} 🪙**.\n\n"
     "You earn points from real activity (daily caps stop farming):\n"
     f"• 💬 Completed chats: +2 per chat (cap {POINT_CAPS['chat']}/day)\n"
     f"• 💬 Messages in chats: +1 per 5 messages (cap {POINT_CAPS['message']}/day)\n"

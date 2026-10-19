@@ -13,11 +13,21 @@ from database import (
     REFERRED_BONUS,
     REFERRAL_REWARD,
     STARTING_COINS,
+    bot_today,
 )
+
+
+def claim_checkin(db, uid):
+    """🎁 The daily check-in is mandatory — claim it so this user can earn."""
+    user = db.get_user(uid)
+    if user:
+        user.last_checkin = bot_today()
+    return user
 
 
 def make_user(db, uid, gender=None, country=None, pref=Gender.ANY):
     user = db.register_user(uid)
+    claim_checkin(db, uid)
     if gender:
         db.update_gender(uid, gender)
     if country:
@@ -53,6 +63,7 @@ def test_get_user_returns_none_for_unknown():
 def test_add_and_spend_coins():
     db = Database()
     db.register_user(1)
+    claim_checkin(db, 1)
     assert db.add_coins(1, 50) == STARTING_COINS + 50
     assert db.spend_coins(1, 5) is True
     assert db.get_user(1).coins == STARTING_COINS + 45
