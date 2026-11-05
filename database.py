@@ -117,7 +117,7 @@ def previous_week_id(week: Optional[str] = None) -> Optional[str]:
 
 
 # ── Economy / moderation settings ────────────────────────────────
-STARTING_COINS = 4         # free coins for every new user
+STARTING_COINS = 2         # free coins for every new user
 REFERRAL_REWARD = 8        # coins earned by the referrer per friend
 REFERRED_BONUS = 5         # extra coins for the newly referred friend
 GIRL_SEARCH_COST = 2       # coins per "Chat With Girl" search
@@ -144,6 +144,9 @@ DAILY_CHECKIN_COINS = 1    # exactly 1 coin per calendar-day check-in
 
 # ── 🟢 Availability ──────────────────────────────────────────────
 AVAILABILITY_TTL = 12 * 3600  # stale statuses auto-expire back to Ready
+
+# ── 🔍 Matchmaking queue ─────────────────────────────────────────
+SEARCH_TIMEOUT = 120  # seconds before an abandoned search expires
 
 # ── 🏆 Weekly leaderboard ────────────────────────────────────────
 # ONLY the top three users are paid each week. Everyone else gets 0.
@@ -224,6 +227,8 @@ class UserProfile:
     banned: bool = False
     # ── Active search filter (chosen per search) ──
     search_pref: Optional[Gender] = None
+    # ── Queue: when the current search started (0.0 = not searching) ──
+    search_started_at: float = 0.0
     # ── Profile photo (Telegram file_id, sent to partner on match) ──
     photo_file_id: Optional[str] = None
     # ── Discovery: short shareable ID, location, contacts ──
@@ -253,6 +258,8 @@ class UserProfile:
     availability_set_at: float = 0.0
     # ── 🎁 Daily login reward (1 coin per calendar day) ──
     last_checkin: str = ""
+    # ── 🟢 Live presence: last time this ID was seen interacting ──
+    last_seen: float = 0.0
     # ── 🏆 Weekly leaderboard ──
     week_id: str = ""           # ISO week the current points belong to
     week_points: int = 0
@@ -294,6 +301,7 @@ def _user_to_json(user: UserProfile) -> str:
             "blocked": sorted(user.blocked),
             "banned": user.banned,
             "search_pref": user.search_pref.value if user.search_pref else None,
+            "search_started_at": user.search_started_at,
             "photo_file_id": user.photo_file_id,
             "public_id": user.public_id,
             "lat": user.lat,
@@ -315,6 +323,7 @@ def _user_to_json(user: UserProfile) -> str:
             "availability": user.availability.value,
             "availability_set_at": user.availability_set_at,
             "last_checkin": user.last_checkin,
+            "last_seen": user.last_seen,
             "week_id": user.week_id,
             "week_points": user.week_points,
             "week_point_log": user.week_point_log,
@@ -373,6 +382,7 @@ def _user_from_json(data: str) -> UserProfile:
         blocked=set(d.get("blocked") or []),
         banned=bool(d.get("banned", False)),
         search_pref=_enum_or_none(Gender, d.get("search_pref")),
+        search_started_at=float(d.get("search_started_at") or 0.0),
         photo_file_id=d.get("photo_file_id"),
         public_id=d.get("public_id", 0),
         lat=d.get("lat"),
@@ -392,6 +402,7 @@ def _user_from_json(data: str) -> UserProfile:
         availability=_enum_or_none(Availability, d.get("availability"), Availability.READY),
         availability_set_at=d.get("availability_set_at", 0.0),
         last_checkin=d.get("last_checkin", ""),
+        last_seen=float(d.get("last_seen") or 0.0),
         week_id=d.get("week_id", ""),
         week_points=d.get("week_points", 0),
         week_point_log=dict(d.get("week_point_log") or {}),
@@ -423,6 +434,8 @@ class Database:
         self.meta: dict = {}
         # O(1) public-ID lookup index (public_id -> user_id)
         self._by_public_id: dict[int, int] = {}
+        # user_id -> time.time() of the last persisted presence heartbeat
+        self._last_seen_flush: dict[int, float] = {}
 
         # SQLite persistence ("" or None disables it — memory only)
         self.path = os.getenv("DB_PATH", "bot.db") if path is None else path
@@ -746,6 +759,7 @@ class Database:
         if user_id not in self.users:
             user = UserProfile(user_id=user_id, username=username, name=name)
             user.public_id = self._next_public_id()
+            user.last_seen = time.time()
             self.users[user_id] = user
             self._by_public_id[user.public_id] = user_id
             self._write_user(user)
@@ -761,6 +775,21 @@ class Database:
             if changed:
                 self._write_user(user)
         return self.users[user_id]
+
+    def touch_last_seen(self, user_id: int) -> None:
+        """Heartbeat: this ID just interacted with the bot (marks it online).
+
+        The in-memory stamp updates on every call; the SQLite row is only
+        rewritten once a minute so a chatty user can't hammer the disk.
+        """
+        user = self.users.get(user_id)
+        if not user:
+            return
+        now = time.time()
+        user.last_seen = now
+        if now - self._last_seen_flush.get(user_id, 0.0) >= 60:
+            self._last_seen_flush[user_id] = now
+            self._write_user(user)
 
     def _next_public_id(self) -> int:
         """Short 6-digit ID other people can use to find this account."""
@@ -1447,18 +1476,35 @@ class Database:
 
     def add_to_queue(self, user_id: int, search_pref: Optional[Gender] = None):
         user = self.users.get(user_id)
-        if user and user_id not in self.queue and not user.banned:
-            user.state = ChatState.SEARCHING
-            user.search_pref = search_pref
-            self.queue.append(user_id)
-            self._write_user(user)
-            self._write_queue_entry(user_id, len(self.queue) - 1)
+        if not user or user.banned or user_id in self.queue:
+            return
+        # Never queue someone who is already paired — a duplicate entry
+        # would let one account be matched twice.
+        if user.partner_id is not None or user.state == ChatState.CHATTING:
+            return
+        user.state = ChatState.SEARCHING
+        user.search_pref = search_pref
+        user.search_started_at = time.time()
+        self.queue.append(user_id)
+        self._write_user(user)
+        self._write_queue_entry(user_id, len(self.queue) - 1)
+
+    def _renumber_queue(self):
+        """Rewrite every pos so the persisted FIFO order stays exact.
+
+        Without this, a removal leaves holes: the next append lands on a
+        pos that ties an older row and the longest-waiting user can load
+        *after* a newcomer following a restart.
+        """
+        for pos, uid in enumerate(self.queue):
+            self._write_queue_entry(uid, pos)
 
     def remove_from_queue(self, user_id: int):
         changed = user_id in self.queue
         if changed:
             self.queue.remove(user_id)
             self._delete_queue_entry(user_id)
+            self._renumber_queue()
         user = self.users.get(user_id)
         if not user:
             return
@@ -1468,8 +1514,75 @@ class Database:
         if user.search_pref is not None:
             user.search_pref = None
             changed = True
+        if user.search_started_at:
+            user.search_started_at = 0.0
+            changed = True
         if changed:
             self._write_user(user)
+
+    def sweep_stale_searches(self, timeout: float = SEARCH_TIMEOUT) -> list[int]:
+        """Drop abandoned and broken queue entries.
+
+        Removes rows whose user is gone, banned, already paired or no
+        longer searching, plus searches older than `timeout` seconds — so
+        a ghost can never be handed out as a match. Returns the ids that
+        expired by timeout; their `search_started_at` is left stamped so
+        the UI can tell "timed out" apart from "cancelled".
+        """
+        cutoff = time.time() - timeout
+        dropped: list[int] = []
+        expired: list[int] = []
+        for uid in list(self.queue):
+            user = self.users.get(uid)
+            if (
+                user is None
+                or user.banned
+                or user.partner_id is not None
+                or user.state != ChatState.SEARCHING
+            ):
+                dropped.append(uid)
+                continue
+            if not user.search_started_at:
+                # Row written by an older bot version — start its clock now.
+                user.search_started_at = time.time()
+                self._write_user(user)
+            elif user.search_started_at <= cutoff:
+                expired.append(uid)
+                dropped.append(uid)
+        for uid in dropped:
+            stamp = 0.0
+            user = self.users.get(uid)
+            if uid in expired and user:
+                stamp = user.search_started_at
+            self.remove_from_queue(uid)
+            if stamp and user:
+                user.search_started_at = stamp  # breadcrumb: timed out
+                self._write_user(user)
+        return expired
+
+    def recover_searches(self) -> int:
+        """Re-arm every queued searcher after a restart.
+
+        Positions are kept (the longest-waiting user still wins) with a
+        fresh timeout window; rows whose user is gone, banned or already
+        paired are dropped. Returns how many searches were kept.
+        """
+        now = time.time()
+        kept = 0
+        for uid in list(self.queue):
+            user = self.users.get(uid)
+            if (
+                user is None
+                or user.banned
+                or user.partner_id is not None
+                or user.state != ChatState.SEARCHING
+            ):
+                self.remove_from_queue(uid)
+                continue
+            user.search_started_at = now
+            self._write_user(user)
+            kept += 1
+        return kept
 
     def find_match(self, user_id: int) -> Optional[int]:
         """
@@ -1486,6 +1599,7 @@ class Database:
         if not user or user.banned:
             return None
         self.expire_stale_availability()
+        self.sweep_stale_searches()
 
         best_match: Optional[int] = None
         best_is_cross_country = False
@@ -1496,6 +1610,13 @@ class Database:
                 continue
             candidate = self.users.get(candidate_id)
             if not candidate or candidate.banned:
+                continue
+            # Stale rows never match: someone already paired (or no longer
+            # searching) is invisible to the matchmaker.
+            if (
+                candidate.partner_id is not None
+                or candidate.state != ChatState.SEARCHING
+            ):
                 continue
             if candidate.availability == Availability.INVISIBLE:
                 continue
@@ -1543,19 +1664,34 @@ class Database:
 
     # ── Chat session management ──────────────────────────────────
 
-    def pair_users(self, user_a: int, user_b: int):
-        for uid in (user_a, user_b):
+    def pair_users(self, user_a: int, user_b: int) -> bool:
+        """Pair two users into a chat.
+
+        Race protection: refuses self-pairs, unknown users and anyone who
+        already has a partner, so a match can never be created twice.
+        Returns True when the chat was actually created.
+        """
+        if user_a == user_b:
+            return False
+        a, b = self.users.get(user_a), self.users.get(user_b)
+        if a is None or b is None:
+            return False
+        if a.partner_id is not None or b.partner_id is not None:
+            return False
+
+        for user in (a, b):
+            uid = user.user_id
             if uid in self.queue:
                 self.queue.remove(uid)
                 self._delete_queue_entry(uid)
-            user = self.users[uid]
             user.state = ChatState.CHATTING
             user.search_pref = None
+            user.search_started_at = 0.0
             user.secure_chat = False
             user.total_chats += 1
+        self._renumber_queue()
 
         # Remember each other in chat history (newest first, capped)
-        a, b = self.users[user_a], self.users[user_b]
         a.recent_partners = [user_b] + [
             uid for uid in a.recent_partners if uid != user_b
         ][: RECENT_PARTNER_LIMIT - 1]
@@ -1569,6 +1705,7 @@ class Database:
         self.add_weekly_points(user_a, 2, "chat")
         self.add_weekly_points(user_b, 2, "chat")
         self._write_users(a, b)
+        return True
 
     def end_chat(self, user_id: int) -> Optional[int]:
         """End the chat for user_id and return the partner's id."""
@@ -1957,7 +2094,22 @@ class Database:
 
     @property
     def searching_count(self) -> int:
-        return len(self.queue)
+        """Live searchers only — stale or broken rows never inflate the number."""
+        cutoff = time.time() - SEARCH_TIMEOUT
+        live = 0
+        for uid in self.queue:
+            u = self.users.get(uid)
+            if (
+                u is None
+                or u.banned
+                or u.partner_id is not None
+                or u.state != ChatState.SEARCHING
+            ):
+                continue
+            if u.search_started_at and u.search_started_at <= cutoff:
+                continue
+            live += 1
+        return live
 
     @property
     def chatting_count(self) -> int:

@@ -234,31 +234,37 @@ DELETE_LABEL = "🗑 Delete Messages"
 SECURE_LABELS = (SECURE_LABEL, SECURE_ON_LABEL)
 
 
-def main_reply_keyboard(secure: bool = False) -> ReplyKeyboardMarkup:
-    """The always-visible bar under the message field (MeChat layout):
-    chat controls on top, discovery buttons underneath."""
+def main_reply_keyboard(
+    secure: bool = False, in_chat: bool = False
+) -> ReplyKeyboardMarkup:
+    """The always-visible bar under the message field (MeChat layout).
+
+    While a chat is active the chat controls show; otherwise the three
+    discovery buttons show — never all seven at once.
+    """
     secure_label = SECURE_ON_LABEL if secure else SECURE_LABEL
-    return ReplyKeyboardMarkup(
-        [
+    if in_chat:
+        rows = [
             [KeyboardButton(secure_label), KeyboardButton(CONTACT_PROFILE_LABEL)],
             [KeyboardButton(END_CHAT_LABEL), KeyboardButton(DELETE_LABEL)],
+        ]
+    else:
+        rows = [
             [KeyboardButton(NEW_CHAT_LABEL)],
             [KeyboardButton(BROWSE_LABEL), KeyboardButton(NEARBY_LABEL)],
-        ],
+        ]
+    return ReplyKeyboardMarkup(
+        rows,
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-# ── Per-search partner choice (Random / Guy / Girl) ─────────────
+# ── Per-search partner choice (Random only — gender search is off) ─
 
 def search_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎲 Random(Free)", callback_data="search_random")],
-        [
-            InlineKeyboardButton("🐒 Chat With Guy", callback_data="search_guy"),
-            InlineKeyboardButton("💃 Chat With Girl", callback_data="search_girl"),
-        ],
     ])
 
 
@@ -361,17 +367,27 @@ def back_to_credit_keyboard() -> InlineKeyboardMarkup:
 
 # ── Settings ─────────────────────────────────────────────────────
 
-def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
+def settings_keyboard(
+    reminder_on: bool = False, vip: bool = False
+) -> InlineKeyboardMarkup:
     reminder_label = (
         "⏰ Daily Reminder: ON ✅" if reminder_on else "⏰ Daily Reminder: OFF"
     )
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("✏️ Change Name", callback_data="change_name")],
         [InlineKeyboardButton("🎂 Change Age", callback_data="change_age")],
         [InlineKeyboardButton("🏙 Change City", callback_data="change_city")],
         [InlineKeyboardButton("🔄 Change Gender", callback_data="change_gender")],
         [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
-        [InlineKeyboardButton("💕 Change Partner Preference", callback_data="change_pref")],
+    ]
+    if vip:
+        # 👑 choosing who to chat with is a VIP-only option
+        rows.append(
+            [InlineKeyboardButton(
+                "💕 Change Partner Preference", callback_data="change_pref"
+            )]
+        )
+    rows += [
         [InlineKeyboardButton("📷 Set Profile Photo", callback_data="set_photo")],
         [InlineKeyboardButton("📝 Edit Bio", callback_data="edit_bio")],
         [InlineKeyboardButton("🎯 Edit Interests", callback_data="edit_interests")],
@@ -380,7 +396,8 @@ def settings_keyboard(reminder_on: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(reminder_label, callback_data="reminder_toggle")],
         [InlineKeyboardButton("🪩 Get Verified", callback_data="verify_start")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 # ── In-chat controls ────────────────────────────────────────────

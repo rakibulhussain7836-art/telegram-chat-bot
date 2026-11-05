@@ -4,7 +4,7 @@ Telegram Random Chat Bot — Main Bot Logic
 Commands:
   /start      — Register & show main menu (supports referral codes)
   /newchat    — Start a random anonymous chat
-  /search     — Choose who to search for (Random / Guy / Girl)
+  /search     — Start a search (Random)
   /stop       — End current chat
   /profile    — View your profile
   /credit     — Coin balance, referral link & coin shop
@@ -14,8 +14,9 @@ Commands:
   /report     — Report your current chat partner
   /help       — Show help
 
-Coins: chatting with anyone is free, searching for a Guy or a Girl costs
-2 coins, a chat request costs 2 coins. Every new user starts with 10 coins.
+Coins: chatting with anyone is free, searching for a Guy or a Girl is
+turned off for now (only the free Random search is offered), a chat
+request costs 2 coins. Every new user starts with 2 coins.
 Supports: text, photos, stickers, voice, video, documents, GIFs
 """
 
@@ -27,6 +28,7 @@ import logging
 import sqlite3
 import time
 from datetime import datetime
+from typing import Optional
 from dotenv import load_dotenv
 
 from telegram import (
@@ -36,6 +38,7 @@ from telegram import (
     Bot,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -271,9 +274,8 @@ HELP_MSG = """
 • 🎁 **Daily Check-in** — claim **{checkin} 🪙** once per day
 • 🏆 **Weekly Leaderboard** — top 3 earn 6 / 4 / 2 coins every week
 • Chatting with anyone is **free**
-• Searching for a 🕺 **Guy** or a 👩 **Girl** costs **{cost} 🪙 per search**
-  (🎲 Random search is free)
-• 👑 **VIP** members search for free
+• 🎲 Random search is **free** for everyone — searching for a 🕺 **Guy**
+  or a 👩 **Girl** is turned off for now
 • Earn Coins by inviting friends with /link
 • Buy Coins with Telegram Stars via /credit
 
@@ -285,7 +287,6 @@ HELP_MSG = """
 """
 
 HELP_KWARGS = dict(
-    cost=GIRL_SEARCH_COST,
     request_cost=CHAT_REQUEST_COST,
     dm_cost=DIRECT_MESSAGE_COST,
     notify_cost=NOTIFY_COST,
@@ -370,6 +371,7 @@ SEARCHING_TEXT = """
 
 ⏳ Please wait up to 2 minutes.
 👥 {count} people searching right now
+❌ Tap **Cancel Search** to stop anytime.
 """
 
 PROMO_TEXT = (
@@ -606,8 +608,8 @@ def credit_text(user) -> str:
         f"**{REFERRAL_REWARD} Coin** for each referral.\n\n"
         f"2️⃣ **Buy Coin**\n"
         f"Choose one of the plans below 👇\n\n"
-        f"💡 *Chatting with anyone is free — a 🕺 Guy or 👩 Girl search costs "
-        f"{GIRL_SEARCH_COST} 🪙 each, a 📨 Chat Request {CHAT_REQUEST_COST} 🪙 "
+        f"💡 *Chatting with anyone is free — a 📨 Chat Request "
+        f"{CHAT_REQUEST_COST} 🪙 "
         f"and a 📨 Direct Message from a profile {DIRECT_MESSAGE_COST} 🪙.*\n"
         f"🎁 New accounts start with **{STARTING_COINS} free Coins**."
     )
@@ -622,8 +624,8 @@ def vip_text(user) -> str:
     return (
         f"{status}\n\n"
         f"👑 **VIP benefits**\n"
-        f"• 👩 Girl searches are **free** — and so are 🕺 Guy searches "
-        f"(everyone else pays {GIRL_SEARCH_COST} 🪙 each)\n"
+        f"• 👑 **Partner preference** — choose 👨 Males or 👩 Females to "
+        f"chat with (free members always match 🌍 Anyone)\n"
         f"• 🔔 Chat-end alerts are **free** (everyone else pays "
         f"{NOTIFY_COST} 🪙 to switch them on)\n"
         f"• 👑 VIP badge on your profile card and in every match\n"
@@ -661,9 +663,22 @@ def format_state(s):
     }.get(s, "Unknown")
 
 
+ONLINE_WINDOW = 300  # seconds a user counts as Online after their last activity
+
+
 def format_online(user) -> str:
-    """👁 Online status line shown on profile cards (availability-aware)."""
+    """👁 Online status line shown on profile cards.
+
+    Presence comes from the user's own last-seen heartbeat (updated on
+    every message/tap) — never from the stored chat state, so a stale
+    IDLE row can't claim to be online forever.
+    """
     avail = getattr(user, "availability", Availability.READY)
+    if avail == Availability.INVISIBLE:
+        return "⚫ Invisible"
+    last_seen = getattr(user, "last_seen", 0.0) or 0.0
+    if time.time() - last_seen > ONLINE_WINDOW:
+        return "⚫ Offline"
     if user.state == ChatState.CHATTING:
         base = "👁 Online (Chatting🗣)"
     elif user.state == ChatState.SEARCHING:
@@ -672,9 +687,16 @@ def format_online(user) -> str:
         base = "👁 Online"
     if avail == Availability.BUSY:
         return f"{base} • 🟡 Busy"
-    if avail == Availability.INVISIBLE:
-        return "⚫ Invisible"
     return f"{base} • 🟢 Ready"
+
+
+def _bar(user, secure: Optional[bool] = None) -> ReplyKeyboardMarkup:
+    """Bottom bar for THIS user: chat controls while chatting, the three
+    discovery buttons otherwise."""
+    if secure is None:
+        secure = bool(getattr(user, "secure_chat", False))
+    in_chat = user.state == ChatState.CHATTING and bool(user.partner_id)
+    return main_reply_keyboard(secure=secure, in_chat=in_chat)
 
 
 def md_escape(text: str) -> str:
@@ -808,7 +830,7 @@ async def _next_setup_step(update, context, user_id: int, done_line: str) -> Non
             return
     context.user_data.pop("setup_flow", None)
     await update.message.reply_text(
-        done_line, parse_mode="Markdown", reply_markup=main_reply_keyboard()
+        done_line, parse_mode="Markdown", reply_markup=_bar(user)
     )
     await animated_reply(
         update.message,
@@ -1525,7 +1547,7 @@ async def notify_partner_found(context, user_id, partner_id):
             u.user_id,
             open_photo(profile_photo_of(p)),
             match_photo_frames(partner_info),
-            reply_markup=main_reply_keyboard(secure=u.secure_chat),
+            reply_markup=main_reply_keyboard(secure=u.secure_chat, in_chat=True),
             parse_mode="Markdown",
             interval=0.5,
         )
@@ -1537,7 +1559,7 @@ async def notify_partner_found(context, user_id, partner_id):
                 chat_id=u.user_id,
                 text=partner_info,
                 parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(secure=u.secure_chat),
+                reply_markup=main_reply_keyboard(secure=u.secure_chat, in_chat=True),
             )
         except Exception as e:
             logger.warning(f"Failed to send match card to {u.user_id}: {e}")
@@ -1998,14 +2020,18 @@ async def _send_end_block(context, uid, *, notice, offer_choice: bool) -> None:
 
     With a choice on the way the two preceding messages stay clean (the
     persistent bar under the message field is all the navigation needed).
+    The chat is over now, so one of the messages carries the bar flipped
+    back to the discovery buttons — a reply keyboard only changes when a
+    message carries it.
     """
     quiet = None if offer_choice else main_menu_keyboard()
     me = db.get_user(uid)
-    await _safe_send(context, uid, notice, reply_markup=quiet)
+    bar = _bar(me) if me else None
+    await _safe_send(context, uid, notice, reply_markup=quiet or bar)
     if me:
         await _safe_send(
             context, uid, DELETE_HINT_TEXT.format(slug=_delete_slug(me)),
-            reply_markup=quiet,
+            reply_markup=bar if quiet else None,
         )
     if offer_choice:
         await _safe_send(
@@ -2128,8 +2154,7 @@ async def begin_search(
     db.add_to_queue(user_id, search_pref=search_pref)
     match_id = await asyncio.to_thread(db.find_match, user_id)
 
-    if match_id:
-        db.pair_users(user_id, match_id)
+    if match_id and db.pair_users(user_id, match_id):
         await notify_partner_found(context, user_id, match_id)
         # Resolve whatever "Searching…" message the caller is holding —
         # otherwise a stale search frame keeps claiming a search is running.
@@ -2139,9 +2164,9 @@ async def begin_search(
     if target is not None and ANIMATIONS_ENABLED:
         def _check():
             found = db.find_match(user_id)
-            if found:
-                db.pair_users(user_id, found)
-            return found
+            if found and db.pair_users(user_id, found):
+                return found
+            return None
 
         def _cancelled():
             me = db.get_user(user_id)
@@ -2167,7 +2192,13 @@ async def begin_search(
         me = db.get_user(user_id)
         final_text = None
         if me is not None and me.state == ChatState.IDLE:
-            final_text = "❌ Search cancelled." + _charge_line()
+            if me.search_started_at:
+                # The queue sweep expired this search — distinct from a
+                # user-initiated cancel (which clears the stamp).
+                final_text = "⌛ Search timed out — no partner found yet."
+            else:
+                final_text = "❌ Search cancelled."
+            final_text += _charge_line()
         elif me is not None and me.state == ChatState.CHATTING:
             final_text = "🎉 Partner found! Check your latest message."
         if final_text:
@@ -3104,7 +3135,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             "👇 Use the buttons below anytime.",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_bar(user),
         )
         await send_promo(context, user_id)
         return
@@ -3660,7 +3691,7 @@ async def verifyno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚙️ Settings → 🪩 Get Verified."
             ),
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(target.daily_reminder),
+            reply_markup=settings_keyboard(target.daily_reminder, vip=target.vip),
         )
     except Exception as e:
         logger.warning(f"Failed to notify rejected user {target.user_id}: {e}")
@@ -3681,6 +3712,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         db.register_user(user_id, query.from_user.username)
         user = db.get_user(user_id)
+    db.touch_last_seen(user_id)
 
     # ── Force-join: "✅ I've Joined" re-check ───────────────
     if data == "joined_check":
@@ -3766,22 +3798,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             db.update_country(user_id, country_code)
-            await animate_edit(
-                query,
-                [
-                    "✅",
-                    f"✅ Country set to **{country_code}**\n\n"
-                    "Who would you like to chat with?",
-                ],
-                interval=0.35,
-                parse_mode="Markdown",
-                reply_markup=preference_keyboard(),
-            )
+            if user.vip:
+                await animate_edit(
+                    query,
+                    [
+                        "✅",
+                        f"✅ Country set to **{country_code}**\n\n"
+                        "Who would you like to chat with?",
+                    ],
+                    interval=0.35,
+                    parse_mode="Markdown",
+                    reply_markup=preference_keyboard(),
+                )
+            else:
+                # 👑 Partner preference is VIP-only — free users match anyone.
+                db.update_preferred_gender(user_id, Gender.ANY)
+                context.user_data["setup_flow"] = True
+                context.user_data["awaiting_name"] = True
+                await animate_edit(
+                    query,
+                    [
+                        "✅",
+                        f"✅ Country set to **{country_code}**\n\n"
+                        + NAME_ASK_TEXT.strip(),
+                    ],
+                    interval=0.35,
+                    parse_mode="Markdown",
+                )
 
     # ── Gender preference ───────────────────────────────────
     elif data.startswith("pref_"):
         pref_map = {"pref_male": Gender.MALE, "pref_female": Gender.FEMALE, "pref_any": Gender.ANY}
         pref = pref_map.get(data, Gender.ANY)
+        if not user.vip:
+            # Stale button from an old message — the choice is VIP-only.
+            pref = Gender.ANY
         db.update_preferred_gender(user_id, pref)
         label = format_gender(pref) if pref != Gender.ANY else "🌍 Anyone"
         context.user_data["setup_flow"] = True
@@ -3838,13 +3889,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Per-search partner choice ───────────────────────────
     elif data in ("search_random", "search_guy", "search_girl"):
-        pref_map = {
-            "search_random": Gender.ANY,
-            "search_guy": Gender.MALE,
-            "search_girl": Gender.FEMALE,
-        }
+        # 🕺/💃 gender searches are turned off for now — every search is a
+        # normal, free Random search (stale Guy/Girl buttons included).
         text, markup, parse_mode = await begin_search(
-            context, user_id, pref_map[data], target=query
+            context, user_id, Gender.ANY, target=query
         )
         if text:
             await safe_edit(query, text, parse_mode=parse_mode, reply_markup=markup)
@@ -3927,7 +3975,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query,
             "⚙️ **Settings**\n\nWhat would you like to change?",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
 
     elif data == "reminder_toggle":
@@ -3951,7 +3999,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "What would you like to change?"
             ),
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(enabled),
+            reply_markup=settings_keyboard(enabled, vip=user.vip),
         )
 
     elif data == "back_menu":
@@ -4070,6 +4118,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "change_pref":
+        if not user.vip:
+            await query.answer(
+                "👑 Choosing who to chat with is a VIP feature.", show_alert=True
+            )
+            return
         await safe_edit(
             query,
             "Who would you like to chat with?",
@@ -4102,7 +4155,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a photo now — it will be sent to your partner when you get "
             "matched. Send any other message to cancel.",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
 
     # ── Verification ────────────────────────────────────────
@@ -4131,7 +4184,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a photo showing your face now. An admin will review it.\n"
             "Send any other message to cancel.",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
 
     # ── Discovery: Nearby / ID search / Contacts ────────────
@@ -4354,7 +4407,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if user.state == ChatState.SEARCHING:
             db.remove_from_queue(user_id)
-        db.pair_users(user_id, target.user_id)
+        if not db.pair_users(user_id, target.user_id):
+            # Race: they got paired while this tap was in flight — the
+            # match failed, so the coins must not stay spent.
+            db.add_coins(user_id, DIRECT_MESSAGE_COST)
+            await query.answer(
+                "That chat couldn't start — please try again.", show_alert=True
+            )
+            return
         balance = db.get_user(user_id).coins
         await safe_edit(
             query,
@@ -4763,7 +4823,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if requester.state == ChatState.SEARCHING:
             db.remove_from_queue(requester_id)
 
-        db.pair_users(requester_id, user_id)
+        if not db.pair_users(requester_id, user_id):
+            # Race: one side got paired meanwhile — refund, never charge
+            # for a match that didn't happen.
+            db.add_coins(requester_id, CHAT_REQUEST_COST)
+            await query.answer(
+                "This request is no longer valid.", show_alert=True
+            )
+            return
         await safe_edit(
             query, "✅ **Request accepted! Say hi 👋**",
             parse_mode="Markdown", reply_markup=chat_keyboard(secure=me.secure_chat),
@@ -4817,14 +4884,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, user_id,
             SECURE_ON_SELF if enabled else SECURE_OFF_SELF,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(secure=enabled),
+            reply_markup=main_reply_keyboard(secure=enabled, in_chat=True),
         )
         if partner_id:
             await _safe_send(
                 context, partner_id,
                 SECURE_ON_PARTNER if enabled else SECURE_OFF_PARTNER,
                 parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(secure=enabled),
+                reply_markup=main_reply_keyboard(secure=enabled, in_chat=True),
             )
 
     elif data == "end_chat":
@@ -4900,14 +4967,14 @@ async def _apply_secure_chat(context, user, enabled: bool) -> None:
         context, user.user_id,
         SECURE_ON_SELF if enabled else SECURE_OFF_SELF,
         parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(secure=enabled),
+        reply_markup=main_reply_keyboard(secure=enabled, in_chat=True),
     )
     if partner_id:
         await _safe_send(
             context, partner_id,
             SECURE_ON_PARTNER if enabled else SECURE_OFF_PARTNER,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(secure=enabled),
+            reply_markup=main_reply_keyboard(secure=enabled, in_chat=True),
         )
 
 
@@ -4916,7 +4983,7 @@ async def _send_contact_profile(update: Update, context, user) -> None:
     target = db.get_user(user.partner_id) if user.partner_id else None
     if not target:
         await update.message.reply_text(
-            _BAR_NO_CHAT, reply_markup=main_reply_keyboard(secure=user.secure_chat)
+            _BAR_NO_CHAT, reply_markup=_bar(user)
         )
         return
     await update.message.reply_text(
@@ -4938,7 +5005,7 @@ async def _delete_messages_action(update: Update, context, user) -> None:
     what you sent live in the partner's chat — so that's the log we go
     after, but only for messages you originally sent.
     """
-    bar = main_reply_keyboard(secure=user.secure_chat)
+    bar = _bar(user)
     partner_id = user.partner_id or _chat_log(user.user_id).get("partner")
     if not partner_id:
         await update.message.reply_text(_BAR_NO_CHAT, reply_markup=bar)
@@ -5010,7 +5077,7 @@ async def handle_chat_bar(update: Update, context, user) -> bool:
     if not text:
         return False
 
-    bar = lambda: main_reply_keyboard(secure=user.secure_chat)
+    bar = lambda: _bar(user)
     in_chat = user.state == ChatState.CHATTING and user.partner_id
 
     if text in SECURE_LABELS:
@@ -5101,6 +5168,14 @@ def _bump_message_points(user_id: int) -> None:
             _MSG_POINT_BUCKET.pop(k, None)
 
 
+async def presence_heartbeat(update: Update, context) -> None:
+    """Stamp the sender's last-seen on EVERY interaction (group -1 runs
+    before the real handlers), so Online/Offline reflects live activity."""
+    who = update.effective_user
+    if who:
+        db.touch_last_seen(who.id)
+
+
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward any message to the chat partner."""
     user_id = update.effective_user.id
@@ -5109,6 +5184,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Please /start first.")
         return
+
+    db.touch_last_seen(user_id)
 
     if user.banned:
         await update.message.reply_text("🚫 Your account is restricted.")
@@ -5132,7 +5209,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❌ That wasn't a photo — photo setting cancelled.",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         return
 
@@ -5144,14 +5221,14 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.set_bio(user_id, None)
             await update.message.reply_text(
                 "✅ Bio cleared.",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
             return
         db.set_bio(user_id, raw)
         await update.message.reply_text(
             f"✅ **Bio saved:**\n{md_escape((db.get_user(user_id).bio or '')[:160])}",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
         return
 
@@ -5162,7 +5239,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.set_interests(user_id, [])
             await update.message.reply_text(
                 "✅ Interests cleared.",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
             return
         items = [p.strip() for p in raw.split(",") if p.strip()]
@@ -5171,7 +5248,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ **Interests saved:** {md_escape(saved)}",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
         return
 
@@ -5182,7 +5259,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.set_languages(user_id, [])
             await update.message.reply_text(
                 "✅ Languages cleared.",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
             return
         items = [p.strip() for p in raw.split(",") if p.strip()]
@@ -5191,7 +5268,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ **Languages saved:** {md_escape(saved)}",
             parse_mode="Markdown",
-            reply_markup=settings_keyboard(user.daily_reminder),
+            reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
         )
         return
 
@@ -5275,13 +5352,13 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "An admin will review your photo — you'll get a message when "
                 "it's approved.",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         else:
             await update.message.reply_text(
                 "❌ Verification cancelled — pick your gender first, then send "
                 "a photo.",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         return
 
@@ -5290,12 +5367,22 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         country = update.message.text.strip()
         db.update_country(user_id, country)
         context.user_data["awaiting_country"] = False
-        await update.message.reply_text(
-            f"✅ Country set to **{country}**\n\n"
-            "Who would you like to chat with?",
-            parse_mode="Markdown",
-            reply_markup=preference_keyboard(),
-        )
+        if user.vip:
+            await update.message.reply_text(
+                f"✅ Country set to **{country}**\n\n"
+                "Who would you like to chat with?",
+                parse_mode="Markdown",
+                reply_markup=preference_keyboard(),
+            )
+        else:
+            # 👑 Partner preference is VIP-only — free users match anyone.
+            db.update_preferred_gender(user_id, Gender.ANY)
+            context.user_data["setup_flow"] = True
+            context.user_data["awaiting_name"] = True
+            await update.message.reply_text(
+                f"✅ Country set to **{country}**\n\n" + NAME_ASK_TEXT.strip(),
+                parse_mode="Markdown",
+            )
         return
 
     # Handle age text input (onboarding + Settings)
@@ -5304,7 +5391,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (raw.isdigit() and 10 <= int(raw) <= 99):
             await update.message.reply_text(
                 "⚠️ Please send your age as a number between 10 and 99.",
-                reply_markup=main_reply_keyboard(),
+                reply_markup=_bar(user),
             )
             return
         db.update_age(user_id, int(raw))
@@ -5317,7 +5404,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ Age set to **{raw}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         return
 
@@ -5326,7 +5413,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         city = (update.message.text or "").strip()
         if not city:
             await update.message.reply_text(
-                "⚠️ Please send a city name.", reply_markup=main_reply_keyboard()
+                "⚠️ Please send a city name.", reply_markup=_bar(user)
             )
             return
         db.update_city(user_id, city)
@@ -5340,7 +5427,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ City set to **{city}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         return
 
@@ -5349,7 +5436,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = (update.message.text or "").strip()
         if not name:
             await update.message.reply_text(
-                "⚠️ Please send a name.", reply_markup=settings_keyboard(user.daily_reminder)
+                "⚠️ Please send a name.", reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip)
             )
             return
         db.update_name(user_id, name)
@@ -5362,7 +5449,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ Name set to **{md_escape(name)}**",
                 parse_mode="Markdown",
-                reply_markup=settings_keyboard(user.daily_reminder),
+                reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
             )
         return
 
@@ -5372,7 +5459,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (update.message.text or "").strip()
         if not text:
             await update.message.reply_text(
-                "❌ Empty message cancelled.", reply_markup=main_reply_keyboard()
+                "❌ Empty message cancelled.", reply_markup=_bar(user)
             )
             return
         recipients = [
@@ -5382,7 +5469,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if not recipients:
             await update.message.reply_text(
-                "No one to send to right now.", reply_markup=main_reply_keyboard()
+                "No one to send to right now.", reply_markup=_bar(user)
             )
             return
         if user.coins < LIST_MESSAGE_COST:
@@ -5417,7 +5504,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Message sent to {sent} {'person' if sent == 1 else 'people'} "
             f"(-{LIST_MESSAGE_COST} 🪙).",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_bar(user),
         )
         return
 
@@ -5626,6 +5713,9 @@ async def on_startup(application):
     application.create_task(_broadcast_loop(application.bot))
     backup_bot = await _get_backup_bot(application.bot)
     await restore_db_from_backup(backup_bot)
+    # Re-arm every queued searcher (fresh timeout window, FIFO order kept)
+    # and drop broken rows — after a restore the queue may be brand new.
+    await asyncio.to_thread(db.recover_searches)
     await _startup_checks(application)
     if _backup_enabled() or _github_enabled():
         await upload_db_backup(backup_bot)
@@ -5686,6 +5776,10 @@ def main():
         .post_shutdown(on_shutdown)
         .build()
     )
+
+    # Presence heartbeat — runs before every other handler
+    app.add_handler(MessageHandler(filters.ALL, presence_heartbeat), group=-1)
+    app.add_handler(CallbackQueryHandler(presence_heartbeat), group=-1)
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))

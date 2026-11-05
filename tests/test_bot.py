@@ -1,6 +1,7 @@
 """Tests for bot.py: helpers, search/coin logic, payments, referrals and reports."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import bot
@@ -14,6 +15,7 @@ from database import (
     CHAT_REQUEST_COST,
     DIRECT_MESSAGE_COST,
     NOTIFY_COST,
+    SEARCH_TIMEOUT,
     STARTING_COINS,
 )
 
@@ -157,13 +159,29 @@ def test_format_gender_and_state():
     assert bot.format_state(None) == "Unknown"
 
 
+def test_format_online_follows_last_seen_heartbeat(fresh_db):
+    user = fresh_db.register_user(1)
+    # just registered → really active → Online
+    assert "Online" in bot.format_online(user)
+    # stale heartbeat → Offline, regardless of the stored IDLE state
+    user.last_seen = time.time() - (bot.ONLINE_WINDOW + 1)
+    assert bot.format_online(user) == "⚫ Offline"
+    # a fresh heartbeat brings it back
+    fresh_db.touch_last_seen(1)
+    assert "Online" in bot.format_online(user)
+    # Invisible stays Invisible either way
+    from database import Availability
+    user.availability = Availability.INVISIBLE
+    assert bot.format_online(user) == "⚫ Invisible"
+
+
 def test_help_text_has_search_cost_filled_in():
     text = bot.HELP_MSG.format(**bot.HELP_KWARGS)
-    assert str(GIRL_SEARCH_COST) in text
     assert str(CHAT_REQUEST_COST) in text
     assert str(DIRECT_MESSAGE_COST) in text
     assert str(bot.HELP_KWARGS["notify_cost"]) in text
     assert str(STARTING_COINS) in text
+    assert "turned off for now" in text  # gender search is disabled
     for placeholder in (
         "{cost}", "{request_cost}", "{dm_cost}", "{notify_cost}", "{free}"
     ):
@@ -241,10 +259,10 @@ def test_guy_search_without_coins_is_refused(fresh_db):
     assert user.coins == 1
 
 
-def test_new_users_start_with_4_tokens(fresh_db):
+def test_new_users_start_with_2_tokens(fresh_db):
     user = fresh_db.register_user(42)
-    assert user.coins == 4
-    assert STARTING_COINS == 4
+    assert user.coins == 2
+    assert STARTING_COINS == 2
 
 
 def test_search_requires_complete_profile(fresh_db):
@@ -405,6 +423,82 @@ def test_animated_search_rewrites_the_frame_when_the_user_cancels(
         "leaderboard", "theme_menu", "my_profile", "privacy",
     }
     assert expected <= set(labels), set(labels)
+
+
+def test_animated_search_reports_timeout_when_the_sweep_expires_it(
+    fresh_db, monkeypatch
+):
+    """An abandoned search ends as 'timed out', not as a silent ghost."""
+    register(fresh_db, 1)
+    edits, markups = [], []
+
+    async def fake_search(context, user_id, check, **kwargs):
+        # The queue sweep fires while the frames are running: this user's
+        # window elapsed, so their entry is dropped from the pool.
+        user = fresh_db.get_user(user_id)
+        user.search_started_at -= SEARCH_TIMEOUT + 1
+        fresh_db.sweep_stale_searches()
+        return None
+
+    monkeypatch.setattr(bot, "ANIMATIONS_ENABLED", True)
+    monkeypatch.setattr(bot, "animate_search", fake_search)
+
+    text, markup, mode = asyncio.run(
+        bot.begin_search(
+            FakeContext(), 1, Gender.ANY, target=_recording_target(edits, markups)
+        )
+    )
+
+    assert (text, markup, mode) == (None, None, None)
+    assert "timed out" in edits[0]
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert fresh_db.searching_count == 0
+    labels = [b.callback_data for b in _buttons(markups[-1])]
+    assert "find_partner" in labels   # back to the menu, ready to retry
+
+
+def test_instant_match_falls_back_when_pairing_is_refused(
+    fresh_db, monkeypatch
+):
+    """Race: the candidate got paired meanwhile → no fake 'Partner found'."""
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(2, search_pref=None)
+    monkeypatch.setattr(fresh_db, "pair_users", lambda a, b: False)
+
+    text, _, _ = asyncio.run(bot.begin_search(FakeContext(), 1, Gender.ANY))
+
+    assert "Partner found" not in text
+    assert fresh_db.get_user(1).state == ChatState.SEARCHING
+    assert fresh_db.searching_count == 2
+
+
+def test_cancel_search_button_clears_the_queue(fresh_db):
+    register(fresh_db, 1)
+    asyncio.run(bot.begin_search(FakeContext(), 1, Gender.ANY))
+    assert fresh_db.searching_count == 1
+
+    query, _ = press(1, "cancel_search")
+
+    assert "Search cancelled" in query.edits[-1]["text"]
+    assert fresh_db.searching_count == 0
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    # a cancel is a cancel — never a timeout breadcrumb
+    assert fresh_db.get_user(1).search_started_at == 0.0
+
+
+def test_direct_message_refunds_when_pairing_is_refused(fresh_db, monkeypatch):
+    """Never charge for a match that didn't happen."""
+    register(fresh_db, 1)
+    register(fresh_db, 2, gender=Gender.FEMALE)
+    before = fresh_db.get_user(1).coins
+    monkeypatch.setattr(fresh_db, "pair_users", lambda a, b: False)
+
+    query, _ = press(1, f"dm_{2}")
+
+    assert query.answers[-1]["show_alert"] is True
+    assert fresh_db.get_user(1).coins == before      # refunded in full
+    assert fresh_db.get_user(1).state == ChatState.IDLE
 
 
 # ── Photo/caption card animation helpers ────────────────────────
@@ -1256,6 +1350,34 @@ def test_onboarding_collects_name_age_and_city(fresh_db):
     assert "all set" in update.message.replies[-1]["text"].lower()
 
 
+def test_gender_preference_menu_is_vip_only(fresh_db):
+    # Free user: the country step skips Males/Females/Anyone entirely and
+    # goes straight to the name ask with preference locked to Anyone.
+    register(fresh_db, 1, complete=False)
+    query, context = press(1, "country_India")
+    assert context.user_data["awaiting_name"] is True
+    assert fresh_db.get_user(1).preferred_gender == Gender.ANY
+    assert query.edits[-1]["reply_markup"] is None
+
+    # VIP user: the preference menu still appears.
+    register(fresh_db, 2, complete=False)
+    fresh_db.set_vip(2, True)
+    query2, _ = press(2, "country_India")
+    labels = [b.text for b in _buttons(query2.edits[-1]["reply_markup"])]
+    assert "👨 Males" in labels and "👩 Females" in labels
+
+    # Settings entry point is hidden for free users, shown for VIP.
+    free_labels = [
+        b.text for row in bot.settings_keyboard().inline_keyboard for b in row
+    ]
+    vip_labels = [
+        b.text for row in bot.settings_keyboard(vip=True).inline_keyboard
+        for b in row
+    ]
+    assert "💕 Change Partner Preference" not in free_labels
+    assert "💕 Change Partner Preference" in vip_labels
+
+
 def test_invalid_age_is_reasked(fresh_db):
     register(fresh_db, 1, complete=False)
     context = FakeContext()
@@ -1863,16 +1985,39 @@ def tap_bar(user_id, text, context=None):
 
 
 def test_bar_matches_the_reference_layout():
+    # Not in a chat: only the three discovery buttons
     assert _rows(bot.main_reply_keyboard()) == [
-        [SECURE_LABEL, bot.CONTACT_PROFILE_LABEL],
-        [bot.END_CHAT_LABEL, bot.DELETE_LABEL],
         [bot.NEW_CHAT_LABEL],
         [bot.BROWSE_LABEL, bot.NEARBY_LABEL],
     ]
-    on = bot.main_reply_keyboard(secure=True)
+    # In a chat: only the four chat controls
+    chat = bot.main_reply_keyboard(in_chat=True)
+    assert _rows(chat) == [
+        [SECURE_LABEL, bot.CONTACT_PROFILE_LABEL],
+        [bot.END_CHAT_LABEL, bot.DELETE_LABEL],
+    ]
+    on = bot.main_reply_keyboard(secure=True, in_chat=True)
     assert _rows(on)[0] == [SECURE_ON_LABEL, bot.CONTACT_PROFILE_LABEL]
     assert on.is_persistent is True
     assert on.resize_keyboard is True
+
+
+def test_bar_follows_chat_state(fresh_db):
+    user = register(fresh_db, 1)
+    other = register(fresh_db, 2)
+    assert _rows(bot._bar(user)) == [
+        [bot.NEW_CHAT_LABEL],
+        [bot.BROWSE_LABEL, bot.NEARBY_LABEL],
+    ]
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    fresh_db.pair_users(1, 2)
+    assert _rows(bot._bar(user)) == [
+        [SECURE_LABEL, bot.CONTACT_PROFILE_LABEL],
+        [bot.END_CHAT_LABEL, bot.DELETE_LABEL],
+    ]
+    assert bot._bar(user).is_persistent is True
+    assert other.user_id == 2
 
 
 def test_idle_menu_matches_the_reference_doors():
@@ -1894,10 +2039,8 @@ def test_choose_menu_matches_the_reference():
     rows = [
         [b.text for b in row] for row in bot.search_choice_keyboard().inline_keyboard
     ]
-    assert rows == [
-        ["🎲 Random(Free)"],
-        ["🐒 Chat With Guy", "💃 Chat With Girl"],
-    ]
+    # 🕺/💃 gender searches are turned off for now — Random is the only door.
+    assert rows == [["🎲 Random(Free)"]]
 
 
 def test_settings_menu_keeps_every_editor_reachable():
@@ -1947,7 +2090,7 @@ def test_end_chat_bar_leaves_both_sides_with_the_reference_notice(fresh_db):
         if m["chat_id"] == 1 and "Choose who you want to chat with" in m["text"]
     )
     assert [b.callback_data for b in _buttons(choice["reply_markup"])] == [
-        "search_random", "search_guy", "search_girl"
+        "search_random",
     ]
 
 
@@ -1968,7 +2111,7 @@ def test_new_chat_bar_while_chatting_ends_the_chat_and_offers_a_choice(fresh_db)
         if m["chat_id"] == 1 and "Choose who you want to chat with" in m["text"]
     )
     assert [b.callback_data for b in _buttons(choice["reply_markup"])] == [
-        "search_random", "search_guy", "search_girl"
+        "search_random",
     ]
 
 
@@ -2006,7 +2149,7 @@ def test_begin_search_while_chatting_ends_the_chat_and_returns_the_choice(fresh_
     assert fresh_db.get_user(2).state == ChatState.IDLE
     assert "Choose who you want to chat with" in text
     assert [b.callback_data for b in _buttons(markup)] == [
-        "search_random", "search_guy", "search_girl"
+        "search_random",
     ]
     # the 🗑 delete hint still went out to both sides underneath
     assert any("/delet_messages_" in m["text"] for m in context.bot.sent)
@@ -2019,7 +2162,7 @@ def test_find_partner_callback_while_chatting_ends_the_chat(fresh_db):
     assert fresh_db.get_user(1).state == ChatState.IDLE
     assert "Choose who you want to chat with" in query.edits[-1]["text"]
     assert [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])] == [
-        "search_random", "search_guy", "search_girl"
+        "search_random",
     ]
 
 
@@ -2271,9 +2414,9 @@ def test_vip_payment_sets_the_flag(fresh_db):
     assert fresh_db.get_user(1).vip is True
 
 
-def test_vip_text_mentions_free_girl_search(fresh_db):
+def test_vip_text_mentions_partner_preference(fresh_db):
     user = register(fresh_db, 1)
-    assert "Girl searches" in bot.vip_text(user)
+    assert "Partner preference" in bot.vip_text(user)
 
 
 # ── Chat request TTL ───────────────────────────────────────────

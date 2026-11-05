@@ -1,5 +1,7 @@
 """Unit tests for the in-memory database: economy, referrals, likes, moderation, matchmaking."""
 
+import time
+
 from database import (
     BAN_REPORT_THRESHOLD,
     ChatState,
@@ -12,6 +14,7 @@ from database import (
     NEARBY_RADIUS_KM,
     REFERRED_BONUS,
     REFERRAL_REWARD,
+    SEARCH_TIMEOUT,
     STARTING_COINS,
     bot_today,
 )
@@ -230,6 +233,143 @@ def test_no_match_when_alone_in_queue():
     assert db.find_match(1) is None
 
 
+# ── Queue integrity (cleanup / race / FIFO / timeout) ─────────────
+
+def test_add_to_queue_refuses_already_paired_users():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.pair_users(1, 2)
+    db.add_to_queue(1)
+    db.add_to_queue(2)
+    assert db.queue == []
+
+
+def test_pair_users_refuses_double_pairing():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    make_user(db, 3)
+
+    assert db.pair_users(1, 2) is True
+    # Race protection: both sides are taken now.
+    assert db.pair_users(1, 3) is False
+    assert db.pair_users(3, 2) is False
+    assert db.pair_users(1, 1) is False
+    assert db.pair_users(1, 999) is False
+    assert db.get_user(1).partner_id == 2
+    assert db.get_user(1).total_chats == 1   # no double-counted chat
+
+
+def test_find_match_never_hands_out_a_paired_candidate():
+    db = Database()
+    make_user(db, 1, gender=Gender.MALE, pref=Gender.ANY)
+    make_user(db, 2, gender=Gender.FEMALE, pref=Gender.ANY)
+    make_user(db, 3, gender=Gender.FEMALE, pref=Gender.ANY)
+    db.add_to_queue(2)
+    # Stale row: 2 got paired off-band but is still sitting in the queue.
+    db.pair_users(2, 3)
+    db.queue.append(2)
+
+    assert db.find_match(1) is None
+    assert 2 not in db.queue      # the sweep cleaned the ghost out
+
+
+def test_sweep_expires_abandoned_searches():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.add_to_queue(1)
+    db.add_to_queue(2)
+    db.get_user(1).search_started_at -= SEARCH_TIMEOUT + 1  # walked away
+
+    expired = db.sweep_stale_searches()
+
+    assert expired == [1]
+    assert db.queue == [2]
+    assert db.get_user(1).state == ChatState.IDLE
+    # breadcrumb: the stamp survives so the UI can say
+    # "timed out" instead of "cancelled"
+    assert db.get_user(1).search_started_at != 0.0
+
+
+def test_sweep_drops_broken_queue_rows():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.add_to_queue(1)
+    db.add_to_queue(2)
+    db.queue.append(404)                       # user row vanished
+    db.get_user(2).state = ChatState.CHATTING  # stale: already chatting
+    db.get_user(2).partner_id = 1
+
+    db.sweep_stale_searches()
+
+    assert db.queue == [1]
+    assert db.get_user(1).state == ChatState.SEARCHING
+
+
+def test_sweep_gives_unstamped_rows_a_fresh_window():
+    db = Database()
+    make_user(db, 1)
+    db.add_to_queue(1)
+    db.get_user(1).search_started_at = 0.0  # row from an older bot version
+
+    assert db.sweep_stale_searches() == []
+    assert db.queue == [1]
+    assert db.get_user(1).search_started_at > 0.0
+
+
+def test_searching_count_ignores_stale_and_broken_rows():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    make_user(db, 3)
+    db.add_to_queue(1)
+    db.add_to_queue(2)
+    db.add_to_queue(3)
+    db.get_user(1).search_started_at -= SEARCH_TIMEOUT + 1
+    db.get_user(2).state = ChatState.CHATTING
+    db.queue.append(404)
+
+    assert db.searching_count == 1   # only 3 is genuinely searching
+
+
+def test_recover_searches_rearms_valid_rows_and_drops_dead_ones():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    db.add_to_queue(1)
+    db.add_to_queue(2)
+    db.queue.append(404)
+    db.get_user(2).partner_id = 1        # stale: already paired
+    db.get_user(1).search_started_at -= SEARCH_TIMEOUT * 10  # old window
+
+    kept = db.recover_searches()
+
+    assert kept == 1
+    assert db.queue == [1]               # FIFO position kept
+    assert db.get_user(1).search_started_at > time.time() - 5
+
+
+def test_queue_fifo_order_survives_restart_after_removal(tmp_path):
+    """The longest-waiting user must still be first after a restart."""
+    path = str(tmp_path / "bot.db")
+    db = Database(path=path)
+    for uid in (1, 2, 3):
+        make_user(db, uid)
+        db.add_to_queue(uid)
+    db.remove_from_queue(1)
+    db.remove_from_queue(2)      # only the longest-waiting (3) remains
+    make_user(db, 4)
+    db.add_to_queue(4)           # newcomer must wait BEHIND 3
+    db.close()
+
+    db2 = Database(path=path)
+    assert db2.queue == [3, 4]
+    db2.close()
+
+
 def test_gender_filter_is_respected_both_ways():
     db = Database()
     make_user(db, 1, gender=Gender.MALE, pref=Gender.FEMALE)   # only wants women
@@ -341,9 +481,9 @@ def test_girl_search_is_not_free():
 
 
 def test_price_list_matches_the_release_notes():
-    """New users get 4 tokens; guy/girl search and chat requests cost 2,
+    """New users get 2 tokens; guy/girl search and chat requests cost 2,
     switching on the 🔔 notify alert costs 1."""
-    assert STARTING_COINS == 4
+    assert STARTING_COINS == 2
     assert GIRL_SEARCH_COST == 2
     assert GUY_SEARCH_COST == 2
     assert CHAT_REQUEST_COST == 2
