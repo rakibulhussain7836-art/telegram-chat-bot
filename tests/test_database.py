@@ -3,6 +3,7 @@
 import time
 
 from database import (
+    Availability,
     BAN_REPORT_THRESHOLD,
     ChatState,
     Database,
@@ -275,22 +276,21 @@ def test_find_match_never_hands_out_a_paired_candidate():
     assert 2 not in db.queue      # the sweep cleaned the ghost out
 
 
-def test_sweep_expires_abandoned_searches():
+def test_sweep_rearms_expired_searches_instead_of_dropping_them():
     db = Database()
     make_user(db, 1)
     make_user(db, 2)
     db.add_to_queue(1)
     db.add_to_queue(2)
-    db.get_user(1).search_started_at -= SEARCH_TIMEOUT + 1  # walked away
+    db.get_user(1).search_started_at -= SEARCH_TIMEOUT + 1  # still waiting
 
-    expired = db.sweep_stale_searches()
+    refreshed = db.sweep_stale_searches()
 
-    assert expired == [1]
-    assert db.queue == [2]
-    assert db.get_user(1).state == ChatState.IDLE
-    # breadcrumb: the stamp survives so the UI can say
-    # "timed out" instead of "cancelled"
-    assert db.get_user(1).search_started_at != 0.0
+    assert refreshed == [1]
+    # nobody is kicked out: both stay queued and searching
+    assert db.queue == [1, 2]
+    assert db.get_user(1).state == ChatState.SEARCHING
+    assert db.get_user(1).search_started_at > time.time() - 5
 
 
 def test_sweep_drops_broken_queue_rows():
@@ -553,6 +553,19 @@ def test_nearby_without_own_location_is_empty():
     db.set_location(2, 0.0, 0.0)
     assert db.nearby_users(1) == []
     assert db.has_location(1) is False
+
+
+def test_nearby_hides_invisible_and_blocked_people():
+    db = Database()
+    make_user(db, 1)
+    make_user(db, 2)
+    make_user(db, 3)
+    for uid in (1, 2, 3):
+        db.set_location(uid, 0.0, 0.1 * uid)
+    db.get_user(2).availability = Availability.INVISIBLE
+    db.block_user(1, 3)
+
+    assert [u.user_id for u, _ in db.nearby_users(1)] == []
 
 
 # ── Contacts ────────────────────────────────────────────────────

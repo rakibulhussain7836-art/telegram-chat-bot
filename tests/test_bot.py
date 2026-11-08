@@ -33,12 +33,13 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self, text=None, photo=None, caption=None, location=None):
+    def __init__(self, text=None, photo=None, caption=None, location=None, venue=None):
         self.replies = []
         self.text = text
         self.photo = photo
         self.caption = caption
         self.location = location
+        self.venue = venue
 
     async def reply_text(self, text, **kwargs):
         self.replies.append({"text": text, **kwargs})
@@ -163,9 +164,9 @@ def test_format_online_follows_last_seen_heartbeat(fresh_db):
     user = fresh_db.register_user(1)
     # just registered → really active → Online
     assert "Online" in bot.format_online(user)
-    # stale heartbeat → Offline, regardless of the stored IDLE state
+    # stale heartbeat → last-seen line, regardless of the stored IDLE state
     user.last_seen = time.time() - (bot.ONLINE_WINDOW + 1)
-    assert bot.format_online(user) == "⚫ Offline"
+    assert "Was online" in bot.format_online(user)
     # a fresh heartbeat brings it back
     fresh_db.touch_last_seen(1)
     assert "Online" in bot.format_online(user)
@@ -173,6 +174,25 @@ def test_format_online_follows_last_seen_heartbeat(fresh_db):
     from database import Availability
     user.availability = Availability.INVISIBLE
     assert bot.format_online(user) == "⚫ Invisible"
+
+
+def test_activity_line_shows_last_seen_and_chat_state(fresh_db):
+    user = fresh_db.register_user(1)
+
+    user.last_seen = time.time() - 40 * 60
+    assert bot.activity_line(user) == "⌛ Was online 40 minutes ago"
+
+    user.state = ChatState.CHATTING
+    assert bot.activity_line(user) == "⌛ Was online 40 minutes ago (In chat💬)"
+
+    user.last_seen = time.time()
+    assert bot.activity_line(user) == "👁 Online now (In chat💬)"
+
+    # no heartbeat yet → registration time, never "50 years ago"
+    user.last_seen = 0.0
+    user.registered_at = time.time() - 2 * 24 * 3600
+    user.state = ChatState.IDLE
+    assert bot.activity_line(user) == "⌛ Was online 2 days ago"
 
 
 def test_help_text_has_search_cost_filled_in():
@@ -425,16 +445,14 @@ def test_animated_search_rewrites_the_frame_when_the_user_cancels(
     assert expected <= set(labels), set(labels)
 
 
-def test_animated_search_reports_timeout_when_the_sweep_expires_it(
-    fresh_db, monkeypatch
-):
-    """An abandoned search ends as 'timed out', not as a silent ghost."""
+def test_animated_search_survives_the_sweep_window(fresh_db, monkeypatch):
+    """An elapsed search window refreshes — it never empties the queue."""
     register(fresh_db, 1)
     edits, markups = [], []
 
     async def fake_search(context, user_id, check, **kwargs):
         # The queue sweep fires while the frames are running: this user's
-        # window elapsed, so their entry is dropped from the pool.
+        # window elapsed, but they must stay queued and searching.
         user = fresh_db.get_user(user_id)
         user.search_started_at -= SEARCH_TIMEOUT + 1
         fresh_db.sweep_stale_searches()
@@ -450,11 +468,10 @@ def test_animated_search_reports_timeout_when_the_sweep_expires_it(
     )
 
     assert (text, markup, mode) == (None, None, None)
-    assert "timed out" in edits[0]
-    assert fresh_db.get_user(1).state == ChatState.IDLE
-    assert fresh_db.searching_count == 0
-    labels = [b.callback_data for b in _buttons(markups[-1])]
-    assert "find_partner" in labels   # back to the menu, ready to retry
+    assert fresh_db.get_user(1).state == ChatState.SEARCHING
+    assert 1 in fresh_db.queue
+    assert fresh_db.searching_count == 1
+    assert not any("timed out" in e for e in edits)  # never kicked out
 
 
 def test_instant_match_falls_back_when_pairing_is_refused(
@@ -981,6 +998,137 @@ def test_non_location_message_cancels_location_flow(fresh_db):
 
     assert not fresh_db.has_location(1)
     assert "wasn't a location" in update.message.replies[0]["text"]
+
+
+def test_nearby_accepts_a_shared_place_venue(fresh_db):
+    register(fresh_db, 1)
+    near = register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.set_location(2, 10.0, 20.0)
+    context = FakeContext()
+    context.user_data["awaiting_location"] = True
+    venue = SimpleNamespace(
+        location=SimpleNamespace(latitude=10.0, longitude=20.05)
+    )
+
+    update = FakeUpdate(1, message=FakeMessage(venue=venue))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.has_location(1)
+    assert "Location saved" in update.message.replies[0]["text"]
+    assert f"view_{near.user_id}" in [
+        b.callback_data for b in _buttons(update.message.replies[0]["reply_markup"])
+    ]
+
+
+def test_nearby_accepts_pasted_coordinates(fresh_db):
+    register(fresh_db, 1)
+    near = register(fresh_db, 2, gender=Gender.FEMALE)
+    fresh_db.set_location(2, 10.0, 20.0)
+    context = FakeContext()
+    context.user_data["awaiting_location"] = True
+
+    update = FakeUpdate(1, message=FakeMessage(text="here: 10.01, 20.01"))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.has_location(1)
+    assert "Location saved" in update.message.replies[0]["text"]
+    assert f"view_{near.user_id}" in [
+        b.callback_data for b in _buttons(update.message.replies[0]["reply_markup"])
+    ]
+
+
+def test_unsolicited_location_still_opens_nearby(fresh_db):
+    """A pin dropped while idle runs Nearby instead of the 'not in a chat' wall."""
+    register(fresh_db, 1)
+    other = register(fresh_db, 2)
+    fresh_db.set_location(2, 10.0, 20.0)
+    context = FakeContext()
+    message = FakeMessage(location=SimpleNamespace(latitude=10.0, longitude=20.05))
+
+    update = FakeUpdate(1, message=message)
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.has_location(1)
+    reply = update.message.replies[0]
+    assert "People near you" in reply["text"]
+    assert f"view_{other.user_id}" in [
+        b.callback_data for b in _buttons(reply["reply_markup"])
+    ]
+
+
+def test_nearby_widens_the_radius_when_no_one_is_close(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_location(1, 0.0, 0.0)
+    far = register(fresh_db, 2)
+    fresh_db.set_location(far.user_id, 0.0, 2.0)  # ~222 km: past 50, inside 500
+
+    query, _ = press(1, "nearby")
+
+    text = query.edits[-1]["text"]
+    assert "500 km" in text
+    assert f"view_{far.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
+    ]
+
+
+def test_nearby_falls_back_to_nearest_anywhere(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_location(1, 0.0, 0.0)
+    far = register(fresh_db, 2)
+    fresh_db.set_location(far.user_id, 0.0, 10.0)  # ~1111 km: past 500 too
+
+    query, _ = press(1, "nearby")
+
+    assert "nearest members anywhere" in query.edits[-1]["text"]
+    assert f"view_{far.user_id}" in [
+        b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])
+    ]
+
+
+def test_nearby_never_dead_ends_and_offers_refresh(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_location(1, 10.0, 20.0)  # the only member with a location
+
+    query, _ = press(1, "nearby")
+
+    labels = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "No one here yet" in query.edits[-1]["text"]
+    assert "nearby" in labels             # 🔄 Refresh rescans
+    assert "share_location" in labels     # 📍 share again
+
+
+def test_nearby_list_can_message_its_people(fresh_db):
+    register(fresh_db, 1)
+    fresh_db.set_location(1, 0.0, 0.0)
+    near = register(fresh_db, 2)
+    fresh_db.set_location(2, 0.0, 0.1)
+
+    query, context = press(1, "nearby")
+
+    labels = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "browse_msg" in labels
+    assert context.user_data["browse_ids"] == [near.user_id]
+
+    query2, _ = press(1, "browse_msg", context)
+    assert "per person" in query2.edits[-1]["text"]
+
+
+def test_nearby_list_rows_show_place_distance_and_activity(fresh_db):
+    register(fresh_db, 1)
+    other = register(fresh_db, 2, gender=Gender.FEMALE)
+    other.country, other.city = "India", "Bara Bazar"
+    other.last_seen = time.time() - 40 * 60
+    fresh_db.set_location(1, 0.0, 0.0)
+    fresh_db.set_location(2, 0.0, 0.1)
+
+    query, _ = press(1, "nearby")
+    text = query.edits[-1]["text"]
+
+    # reference-bot row: name/ID, country (city) • distance, last-seen line
+    assert "India (Bara Bazar)" in text
+    assert "km away" in text
+    assert "⌛ Was online 40 minutes ago" in text
+    assert "/user_" in text
 
 
 # ── Like / unlike ───────────────────────────────────────────────
@@ -2508,9 +2656,31 @@ def test_direct_message_is_hidden_until_viewed(fresh_db):
     assert not any("secret hello" in m["text"] for m in context.bot.sent)
     # Content is stored, waiting to be revealed
     assert fresh_db.pending_dms[receiver.user_id]["text"] == "secret hello"
-    # The list broadcast costs a flat 2 coins, charged on delivery
+    # The list broadcast costs 2 coins PER person, charged on delivery
     assert fresh_db.get_user(sender.user_id).coins == before - bot.LIST_MESSAGE_COST
     assert f"-{bot.LIST_MESSAGE_COST}" in update.message.replies[-1]["text"]
+
+
+def test_broadcast_charges_per_person(fresh_db):
+    """3 recipients must cost 3 × 2 = 6 coins, not a flat 2."""
+    sender = register(fresh_db, 1)
+    for uid in (2, 3, 4):
+        register(fresh_db, uid)
+    sender.coins = 10
+    context = FakeContext()
+    context.user_data["browse_ids"] = [2, 3, 4]
+    context.user_data["awaiting_broadcast"] = True
+    before = fresh_db.get_user(sender.user_id).coins
+
+    update = FakeUpdate(1, message=FakeMessage(text="hello list"))
+    asyncio.run(bot.relay_message(update, context))
+
+    expected = bot.LIST_MESSAGE_COST * 3
+    assert expected == 6
+    assert fresh_db.get_user(sender.user_id).coins == before - expected
+    assert f"-{expected}" in update.message.replies[-1]["text"]
+    for uid in (2, 3, 4):
+        assert fresh_db.pending_dms[uid]["text"] == "hello list"
 
 
 def test_broadcast_prompt_mentions_the_cost(fresh_db):

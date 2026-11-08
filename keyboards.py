@@ -457,6 +457,27 @@ def share_location_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def nearby_list_keyboard(users, empty_callback="nearby") -> InlineKeyboardMarkup:
+    """
+    Nearby results with a 🔄 Refresh (rescans — someone may have just
+    shared their location) and a 📍 re-share shortcut when empty.
+    """
+    if not users:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data=empty_callback)],
+            [InlineKeyboardButton("📍 Share My Location", callback_data="share_location")],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")],
+        ])
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"view_{user.user_id}")]
+        for label, user in users
+    ]
+    rows.append([InlineKeyboardButton("📋 Send Message to List", callback_data="browse_msg")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=empty_callback)])
+    rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ── Someone else's profile (viewed by ID / Nearby / Contacts) ──
 
 def profile_view_keyboard(

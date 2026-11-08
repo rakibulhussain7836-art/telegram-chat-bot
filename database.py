@@ -125,12 +125,13 @@ GUY_SEARCH_COST = 2        # coins per "Chat With Guy" search (Random stays free
 BAN_REPORT_THRESHOLD = 5   # unique reports before an account is restricted
 CHAT_REQUEST_COST = 2      # coins to send a chat request from Nearby / by ID
 DIRECT_MESSAGE_COST = 1    # coins to start a Direct Message from a profile card
-LIST_MESSAGE_COST = 2      # flat fee for "📋 Send Message to List" broadcasts
+LIST_MESSAGE_COST = 2      # coins PER PERSON for "📋 Send Message to List"
 NOTIFY_COST = 1            # coins to enable 🔔 "notify me" alerts (VIP: free)
 REMINDER_HOUR_START = 9    # daily reminder window (BOT timezone)
 REMINDER_HOUR_END = 22
 CHAT_REQUEST_TTL = 120     # seconds the receiver has to answer a request
 NEARBY_RADIUS_KM = 50      # default radius for the Nearby search
+NEARBY_WIDE_RADIUS_KM = 500  # fallback scan when the tight radius is empty
 EARTH_RADIUS_KM = 6371.0
 VIEW_ALERT_COOLDOWN = 600  # seconds between "someone viewed you" toasts
 BROWSE_PAGE_SIZE = 5       # profiles per page in the Browse People list
@@ -146,7 +147,7 @@ DAILY_CHECKIN_COINS = 1    # exactly 1 coin per calendar-day check-in
 AVAILABILITY_TTL = 12 * 3600  # stale statuses auto-expire back to Ready
 
 # ── 🔍 Matchmaking queue ─────────────────────────────────────────
-SEARCH_TIMEOUT = 120  # seconds before an abandoned search expires
+SEARCH_TIMEOUT = 3600  # seconds (1 hour) before a search window is refreshed
 
 # ── 🏆 Weekly leaderboard ────────────────────────────────────────
 # ONLY the top three users are paid each week. Everyone else gets 0.
@@ -1086,13 +1087,24 @@ class Database:
         radius_km: float = NEARBY_RADIUS_KM,
         limit: int = 20,
     ) -> list[tuple["UserProfile", float]]:
-        """Users with a shared location inside the radius, nearest first."""
+        """Users with a shared location inside the radius, nearest first.
+
+        ⚫ Invisible members and anyone in a blocked pair are never listed.
+        """
         me = self.users.get(user_id)
-        if not me or me.lat is None:
+        if not me or me.lat is None or me.lon is None:
             return []
         found = []
         for user in self.users.values():
-            if user.user_id == user_id or user.banned or user.lat is None:
+            if (
+                user.user_id == user_id
+                or user.banned
+                or user.lat is None
+                or user.lon is None
+                or user.availability == Availability.INVISIBLE
+                or user.user_id in me.blocked
+                or me.user_id in user.blocked
+            ):
                 continue
             dist = self._haversine(me.lat, me.lon, user.lat, user.lon)
             if dist <= radius_km:
@@ -1521,17 +1533,18 @@ class Database:
             self._write_user(user)
 
     def sweep_stale_searches(self, timeout: float = SEARCH_TIMEOUT) -> list[int]:
-        """Drop abandoned and broken queue entries.
+        """Drop broken queue rows and refresh the window of live searchers.
 
         Removes rows whose user is gone, banned, already paired or no
-        longer searching, plus searches older than `timeout` seconds — so
-        a ghost can never be handed out as a match. Returns the ids that
-        expired by timeout; their `search_started_at` is left stamped so
-        the UI can tell "timed out" apart from "cancelled".
+        longer searching — so a ghost can never be handed out as a match.
+        A search older than `timeout` seconds is NEVER kicked out: its
+        clock is re-armed so the user keeps waiting (the queue only ever
+        empties on a match or a cancel). Returns the ids whose window had
+        elapsed and was refreshed.
         """
         cutoff = time.time() - timeout
         dropped: list[int] = []
-        expired: list[int] = []
+        refreshed: list[int] = []
         for uid in list(self.queue):
             user = self.users.get(uid)
             if (
@@ -1547,18 +1560,13 @@ class Database:
                 user.search_started_at = time.time()
                 self._write_user(user)
             elif user.search_started_at <= cutoff:
-                expired.append(uid)
-                dropped.append(uid)
-        for uid in dropped:
-            stamp = 0.0
-            user = self.users.get(uid)
-            if uid in expired and user:
-                stamp = user.search_started_at
-            self.remove_from_queue(uid)
-            if stamp and user:
-                user.search_started_at = stamp  # breadcrumb: timed out
+                # Elapsed window: re-arm instead of kicking the searcher out.
+                user.search_started_at = time.time()
                 self._write_user(user)
-        return expired
+                refreshed.append(uid)
+        for uid in dropped:
+            self.remove_from_queue(uid)
+        return refreshed
 
     def recover_searches(self) -> int:
         """Re-arm every queued searcher after a restart.

@@ -22,6 +22,7 @@ Supports: text, photos, stickers, voice, video, documents, GIFs
 
 import os
 import sys
+import re
 import asyncio
 import base64
 import logging
@@ -67,6 +68,8 @@ from database import (
     NOTIFY_COST,
     CHAT_REQUEST_TTL,
     NEARBY_RADIUS_KM,
+    NEARBY_WIDE_RADIUS_KM,
+    EARTH_RADIUS_KM,
     BROWSE_PAGE_SIZE,
     DAILY_REWARD_COINS,
     DAILY_CHECKIN_COINS,
@@ -97,6 +100,7 @@ from keyboards import (
     credit_keyboard,
     back_to_credit_keyboard,
     user_list_keyboard,
+    nearby_list_keyboard,
     share_location_keyboard,
     profile_view_keyboard,
     request_keyboard,
@@ -666,6 +670,46 @@ def format_state(s):
 ONLINE_WINDOW = 300  # seconds a user counts as Online after their last activity
 
 
+def _ago(seconds: float) -> str:
+    """'just now' / '40 minutes ago' / '1 hour ago' / '3 days ago'."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'' if hours == 1 else 's'} ago"
+    days = hours // 24
+    if days < 30:
+        return f"{days} day{'' if days == 1 else 's'} ago"
+    months = days // 30
+    if months < 12:
+        return f"{months} month{'' if months == 1 else 's'} ago"
+    years = days // 365
+    return f"{max(1, years)} year{'' if years == 1 else 's'} ago"
+
+
+def last_seen_stamp(user) -> float:
+    """Heartbeat time — falls back to registration for pre-heartbeat rows."""
+    return getattr(user, "last_seen", 0.0) or user.registered_at or 0.0
+
+
+def activity_line(user) -> str:
+    """⌛ Was online 40 minutes ago (In chat💬) — reference-bot activity row."""
+    delta = time.time() - last_seen_stamp(user)
+    if delta <= ONLINE_WINDOW:
+        line = "👁 Online now"
+    else:
+        line = f"⌛ Was online {_ago(delta)}"
+    if user.state == ChatState.CHATTING:
+        line += " (In chat💬)"
+    elif user.state == ChatState.SEARCHING:
+        line += " (Searching🔍)"
+    return line
+
+
 def format_online(user) -> str:
     """👁 Online status line shown on profile cards.
 
@@ -676,9 +720,9 @@ def format_online(user) -> str:
     avail = getattr(user, "availability", Availability.READY)
     if avail == Availability.INVISIBLE:
         return "⚫ Invisible"
-    last_seen = getattr(user, "last_seen", 0.0) or 0.0
+    last_seen = last_seen_stamp(user)
     if time.time() - last_seen > ONLINE_WINDOW:
-        return "⚫ Offline"
+        return activity_line(user)
     if user.state == ChatState.CHATTING:
         base = "👁 Online (Chatting🗣)"
     elif user.state == ChatState.SEARCHING:
@@ -1711,6 +1755,13 @@ def _remember_list_message(context, query) -> None:
         context.user_data["list_message_id"] = message_id
 
 
+def _remember_reply_list(context, message) -> None:
+    """Same, for a list the bot sent as a plain reply (no callback query)."""
+    message_id = getattr(message, "message_id", None)
+    if message_id:
+        context.user_data["list_message_id"] = message_id
+
+
 async def show_user_card(query, context, viewer_id: int, target) -> None:
     """
     Open someone's profile as ONE photo card — picture, info and buttons
@@ -1809,10 +1860,10 @@ def _plain_label(user, viewer=None) -> str:
     )
 
 
-def _nearby_pairs(viewer_id: int) -> list:
+def _nearby_pairs(viewer_id: int, radius_km: float = NEARBY_RADIUS_KM) -> list:
     pairs = []
     viewer = db.get_user(viewer_id)
-    for target, dist in db.nearby_users(viewer_id):
+    for target, dist in db.nearby_users(viewer_id, radius_km):
         pairs.append((
             f"{_plain_label(target, viewer)} • 📍 {dist:.0f} km",
             target,
@@ -1852,6 +1903,99 @@ async def send_nearby_cards(context, chat_id: int, pairs, limit: int = 5) -> Non
             logger.debug(f"nearby card for {target.user_id} skipped: {e}")
 
 
+def _message_location(message):
+    """Coordinates from a 📍 location or a 🏷 place (venue) message."""
+    loc = getattr(message, "location", None)
+    if loc is not None and getattr(loc, "latitude", None) is not None:
+        return loc
+    venue = getattr(message, "venue", None)
+    loc = getattr(venue, "location", None) if venue is not None else None
+    if loc is not None and getattr(loc, "latitude", None) is not None:
+        return loc
+    return None
+
+
+# "12.9777, 77.5931" / a pasted maps link — coordinates typed as text.
+_COORDS_RE = re.compile(r"(?<![\d.\-])(-?\d{1,2}\.\d{2,})\s*,\s*(-?\d{1,3}\.\d{2,})(?![\d.])")
+
+
+def _coords_from_text(text: str):
+    """(lat, lon) parsed out of a message, or None."""
+    for match in _COORDS_RE.finditer(text or ""):
+        lat, lon = float(match.group(1)), float(match.group(2))
+        if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+            return lat, lon
+    return None
+
+
+def _list_markup(kind: str, pairs):
+    """Back-navigation keyboard for a results list (Nearby gets 🔄 Refresh)."""
+    if kind == "nearby":
+        return nearby_list_keyboard(pairs)
+    return user_list_keyboard(pairs)
+
+
+async def prepare_nearby(context, user_id: int):
+    """
+    Scan for members near the viewer — 50 km first, then 500 km, then the
+    whole planet — so Nearby never dead-ends on an empty tight circle.
+    Sends the photo cards, remembers the list for Back and returns
+    (text, reply_markup).
+    """
+    context.user_data["list_kind"] = "nearby"
+    context.user_data["list_title"] = "📍 People near you"
+
+    if not db.has_location(user_id):
+        context.user_data["list_ids"] = []
+        return (
+            f"📍 **Nearby People**\n\n"
+            f"Share your location to see people within {NEARBY_RADIUS_KM} km "
+            f"of you.",
+            share_location_keyboard(),
+        )
+
+    pairs: list = []
+    title = "📍 People near you"
+    previous_ids = set(context.user_data.get("list_ids") or [])
+    for radius in (NEARBY_RADIUS_KM, NEARBY_WIDE_RADIUS_KM, EARTH_RADIUS_KM * 2):
+        pairs = await asyncio.to_thread(_nearby_pairs, user_id, radius)
+        if pairs:
+            if radius == NEARBY_WIDE_RADIUS_KM:
+                title = (
+                    f"📍 No one within {NEARBY_RADIUS_KM} km — nearest people "
+                    f"within {NEARBY_WIDE_RADIUS_KM} km"
+                )
+            elif radius > NEARBY_WIDE_RADIUS_KM:
+                title = (
+                    f"📍 No one within {NEARBY_WIDE_RADIUS_KM} km — "
+                    f"nearest members anywhere"
+                )
+            break
+
+    context.user_data["list_ids"] = [u.user_id for _, u in pairs]
+    # 📋 Send Message to List works from Nearby too — same recipient pool.
+    context.user_data["browse_ids"] = context.user_data["list_ids"]
+    if not pairs:
+        return (
+            "📍 **No one here yet**\n\n"
+            "No other member with a shared location was found.\n\n"
+            "👉 Tap **📍 Share My Location** below if you haven't, then "
+            "**🔄 Refresh** — anyone who shares later appears here.",
+            nearby_list_keyboard([]),
+        )
+
+    # Photo cards only for people we haven't just shown (a Refresh with the
+    # same neighbours shouldn't flood the chat with the same pictures).
+    if set(context.user_data["list_ids"]) != previous_ids:
+        await send_nearby_cards(context, user_id, pairs)
+    context.user_data["list_title"] = title
+    viewer = db.get_user(user_id)
+    return (
+        _list_text(title, pairs, viewer, kind="nearby"),
+        nearby_list_keyboard(pairs),
+    )
+
+
 def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
     pairs = []
     viewer = db.get_user(viewer_id)
@@ -1868,10 +2012,32 @@ def _pairs_from_ids(viewer_id: int, ids, kind: str) -> list:
     return pairs
 
 
-def _list_text(title: str, pairs) -> str:
+def _nearby_entry(target, viewer=None) -> str:
+    """One 📍 Nearby row — name/ID, place + distance, last-seen activity."""
+    dist = db.distance_km(viewer.user_id, target.user_id) if viewer else None
+    if target.country and target.city:
+        place = f"{target.country} ({target.city})"
+    else:
+        place = target.city or target.country or "Not set"
+    return (
+        f"{gender_emoji(target.gender)} {_list_badges(target)}"
+        f"**{md_escape(display_name(target, viewer))}**"
+        f"{f', {target.age}' if target.age else ''} • {public_id_link(target)}\n"
+        f"📍 {md_escape(place)}"
+        + (f" • {dist:.0f} km away" if dist is not None else "")
+        + f"\n{activity_line(target)}\n"
+        f"{'〰️' * 8}"
+    )
+
+
+def _list_text(title: str, pairs, viewer=None, kind: str = "plain") -> str:
     if not pairs:
         return f"{title}\n\nNo one here right now."
-    return f"{title}\n\n👥 {len(pairs)} found — tap one to open their profile:"
+    header = f"{title}\n\n👥 {len(pairs)} found — tap one to open their profile:"
+    if kind == "nearby" and viewer is not None:
+        body = "\n\n".join(_nearby_entry(user, viewer) for _, user in pairs)
+        return f"{header}\n\n{body}"
+    return header
 
 
 def _browse_entry(target, viewer=None) -> str:
@@ -4200,17 +4366,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=share_location_keyboard(),
             )
         else:
-            pairs = await asyncio.to_thread(_nearby_pairs, user_id)
-            await send_nearby_cards(context, user_id, pairs)
-            context.user_data["list_ids"] = [u.user_id for _, u in pairs]
-            context.user_data["list_title"] = "📍 People near you"
-            context.user_data["list_kind"] = "nearby"
+            text, markup = await prepare_nearby(context, user_id)
             _remember_list_message(context, query)
             await safe_edit(
-                query,
-                _list_text("📍 People near you", pairs),
-                parse_mode="Markdown",
-                reply_markup=user_list_keyboard(pairs),
+                query, text, parse_mode="Markdown", reply_markup=markup
             )
 
     elif data == "share_location":
@@ -4218,8 +4377,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(
             query,
             "📍 **Send your location**\n\n"
-            "Open the attachment menu ➡️ 📍 Location and send it "
-            "(live location works too).",
+            "Any of these works:\n"
+            "• 📎 ➡️ 📍 Location (live location works too)\n"
+            "• 📎 ➡️ 🏷 place / a pin dropped on the map\n"
+            "• paste coordinates like `12.97, 77.59`",
             parse_mode="Markdown",
             reply_markup=share_location_keyboard(),
         )
@@ -4279,8 +4440,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, markup = _browse_state(context, user_id)
             else:
                 pairs = _pairs_from_ids(user_id, ids, kind)
-                text = _list_text(title, pairs)
-                markup = user_list_keyboard(pairs)
+                text = _list_text(title, pairs, db.get_user(user_id), kind)
+                markup = _list_markup(kind, pairs)
             if list_message_id:
                 try:
                     await context.bot.edit_message_text(
@@ -4308,8 +4469,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pairs = _pairs_from_ids(user_id, ids, kind)
         await safe_edit(
-            query, _list_text(title, pairs), parse_mode="Markdown",
-            reply_markup=user_list_keyboard(pairs),
+            query, _list_text(title, pairs, db.get_user(user_id), kind),
+            parse_mode="Markdown",
+            reply_markup=_list_markup(kind, pairs),
         )
 
     elif data.startswith("view_") and data[5:].isdigit():
@@ -4697,8 +4859,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📋 **Send Message to List**\n\n"
             f"Type the message you want to send to the people in your current "
             f"list.\n\n"
-            f"🪙 Costs **{LIST_MESSAGE_COST} coins** — charged when the "
-            f"message is sent.",
+            f"🪙 Costs **{LIST_MESSAGE_COST} coins per person** in your "
+            f"current list — charged when the message is sent.",
             parse_mode="Markdown",
         )
 
@@ -5133,16 +5295,11 @@ async def handle_chat_bar(update: Update, context, user) -> bool:
                 reply_markup=share_location_keyboard(),
             )
         else:
-            pairs = await asyncio.to_thread(_nearby_pairs, uid)
-            await send_nearby_cards(context, uid, pairs)
-            context.user_data["list_ids"] = [u.user_id for _, u in pairs]
-            context.user_data["list_title"] = "📍 People near you"
-            context.user_data["list_kind"] = "nearby"
-            await update.message.reply_text(
-                _list_text("📍 People near you", pairs),
-                parse_mode="Markdown",
-                reply_markup=user_list_keyboard(pairs),
+            text, markup = await prepare_nearby(context, uid)
+            reply = await update.message.reply_text(
+                text, parse_mode="Markdown", reply_markup=markup
             )
+            _remember_reply_list(context, reply)
         return True
 
     return False
@@ -5298,27 +5455,45 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Handle location sharing (Nearby search)
-    if context.user_data.get("awaiting_location"):
+    # ── 📍 Location sharing (Nearby search) ─────────────────────
+    # A 📍 location, a 🏷 place or pasted coordinates all count — whether we
+    # asked for one or the user just dropped a pin while idle.
+    _want_loc = bool(context.user_data.get("awaiting_location"))
+    _edited_msg = getattr(update, "edited_message", None)
+    _msg = update.message if update.message is not None else _edited_msg
+    _loc = _message_location(_msg) if _msg is not None else None
+    _latlon = (
+        (_loc.latitude, _loc.longitude)
+        if _loc is not None
+        else (
+            _coords_from_text(_msg.text or "")
+            if _want_loc and _msg is not None
+            else None
+        )
+    )
+    if _latlon is not None and _edited_msg is not None and not _want_loc:
+        # A live-location tick arrives as an edit — refresh the saved pin
+        # quietly instead of re-opening Nearby (or re-relaying) every second.
+        db.set_location(user_id, _latlon[0], _latlon[1])
+        return
+    if _want_loc or (_latlon is not None and user.state != ChatState.CHATTING):
         context.user_data["awaiting_location"] = False
-        location = update.message.location
-        if location:
-            db.set_location(user_id, location.latitude, location.longitude)
-            pairs = await asyncio.to_thread(_nearby_pairs, user_id)
-            await send_nearby_cards(context, user_id, pairs)
-            context.user_data["list_ids"] = [u.user_id for _, u in pairs]
-            context.user_data["list_title"] = "📍 People near you"
-            context.user_data["list_kind"] = "nearby"
-            await update.message.reply_text(
-                "✅ Location saved!\n\n" + _list_text("📍 People near you", pairs),
+        if _latlon is not None:
+            db.set_location(user_id, _latlon[0], _latlon[1])
+            body, markup = await prepare_nearby(context, user_id)
+            reply = await _msg.reply_text(
+                ("✅ Location saved!\n\n" + body) if _want_loc else body,
                 parse_mode="Markdown",
-                reply_markup=user_list_keyboard(pairs),
+                reply_markup=markup,
             )
-        else:
-            await update.message.reply_text(
-                "❌ That wasn't a location — tap 📎 → 📍 Location and send it.",
-                reply_markup=share_location_keyboard(),
-            )
+            _remember_reply_list(context, reply)
+            return
+        await _msg.reply_text(
+            "❌ That wasn't a location — tap 📎 → 📍 Location and send it "
+            "(a 🏷 place or pasted coordinates like `12.97, 77.59` work too).",
+            parse_mode="Markdown",
+            reply_markup=share_location_keyboard(),
+        )
         return
 
     # Handle "Find by ID" text input
@@ -5472,15 +5647,18 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "No one to send to right now.", reply_markup=_bar(user)
             )
             return
-        if user.coins < LIST_MESSAGE_COST:
+        total = LIST_MESSAGE_COST * len(recipients)
+        if user.coins < total:
             await update.message.reply_text(
                 f"🪙 **Not enough Coins!** Sending a message to the list costs "
-                f"**{LIST_MESSAGE_COST} 🪙**.",
+                f"**{LIST_MESSAGE_COST} 🪙 per person** — "
+                f"{len(recipients)} {'person' if len(recipients) == 1 else 'people'} "
+                f"= **{total} 🪙**.",
                 parse_mode="Markdown",
                 reply_markup=credit_keyboard(),
             )
             return
-        db.spend_coins(user_id, LIST_MESSAGE_COST)
+        db.spend_coins(user_id, total)
         sent = 0
         for uid in recipients:
             db.queue_dm(uid, user_id, text)
@@ -5503,7 +5681,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Failed to deliver list message to {uid}: {e}")
         await update.message.reply_text(
             f"✅ Message sent to {sent} {'person' if sent == 1 else 'people'} "
-            f"(-{LIST_MESSAGE_COST} 🪙).",
+            f"(-{total} 🪙 · {LIST_MESSAGE_COST} 🪙 per person).",
             reply_markup=_bar(user),
         )
         return
@@ -5581,6 +5759,12 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "location",
                 latitude=msg.location.latitude,
                 longitude=msg.location.longitude,
+            )
+        elif getattr(msg, "venue", None):
+            await _to_partner(
+                "location",
+                latitude=msg.venue.location.latitude,
+                longitude=msg.venue.location.longitude,
             )
         else:
             await update.message.reply_text("⚠️ This message type is not supported.")
@@ -5834,7 +6018,8 @@ def main():
         | filters.VIDEO_NOTE
         | filters.ANIMATION
         | filters.Document.ALL
-        | filters.LOCATION,
+        | filters.LOCATION
+        | filters.VENUE,
         relay_message,
     ))
 
