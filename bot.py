@@ -29,6 +29,7 @@ import base64
 import logging
 import sqlite3
 import time
+from urllib.parse import quote
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
@@ -116,8 +117,10 @@ from keyboards import (
     swipe_keyboard,
     vip_keyboard,
     upi_plan_keyboard,
+    upi_coin_keyboard,
     upi_paid_keyboard,
     UPI_VIP_PLANS,
+    UPI_COIN_PLANS,
     verify_keyboard,
     force_join_keyboard,
     discover_keyboard,
@@ -160,7 +163,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bump on every deploy so the startup log + /version show exactly what's live.
-BOT_VERSION = "2026.10.19.1"
+BOT_VERSION = "2026.11.9.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Telegram user ID of the admin (you) — reviews verification photos.
@@ -168,7 +171,7 @@ _admin = os.getenv("ADMIN_ID", "")
 ADMIN_ID = int(_admin) if _admin.strip().isdigit() else None
 
 # UPI ID for VIP purchases (QR codes are generated from this).
-UPI_ID = "9395029363@naviaxis"
+UPI_ID = "litonpay94@naviaxis"
 
 # Forced channel subscription — users must join before using the bot.
 # FORCE_CHANNEL: @channelusername, channelusername or -100… channel id.
@@ -620,7 +623,8 @@ def credit_text(user) -> str:
         f"Share your personal invite link ⚡ (/link) with friends and earn "
         f"**{REFERRAL_REWARD} Coin** for each referral.\n\n"
         f"2️⃣ **Buy Coin**\n"
-        f"Choose one of the plans below 👇\n\n"
+        f"Choose one of the plans below 👇 — pay with Telegram Stars ⭐ "
+        f"or 📱 **UPI / PhonePe**.\n\n"
         f"💡 *Chatting with anyone is free — a 📨 Chat Request "
         f"{CHAT_REQUEST_COST} 🪙 "
         f"and a 📨 Direct Message from a profile {DIRECT_MESSAGE_COST} 🪙.*\n"
@@ -664,13 +668,29 @@ def vip_text(user) -> str:
 
 
 _UPI_PRICES = dict(UPI_VIP_PLANS)  # days -> INR
+_UPI_COIN_PRICES = {
+    coins: (price, vip_days) for coins, price, vip_days in UPI_COIN_PLANS
+}
 
 
-def upi_qr_png(amount: int, days: int) -> io.BytesIO:
+def upi_pending_label(info: dict) -> str:
+    """Human label for a queued UPI payment (VIP days or a coin pack)."""
+    amount = info.get("amount", 0)
+    coins = int(info.get("coins", 0) or 0)
+    if coins:
+        vip_days = int(info.get("vip_days", 0) or 0)
+        vip = ""
+        if vip_days:
+            vip = " + 1 Year VIP" if vip_days >= 365 else f" + {vip_days} Days VIP"
+        return f"{coins} Coins{vip} — ₹{amount}"
+    return f"{info.get('days', 0)} Days — ₹{amount}"
+
+
+def upi_qr_png(amount: int, note: str) -> io.BytesIO:
     """Generate a UPI deep-link QR code in memory (PNG)."""
     url = (
         f"upi://pay?pa={UPI_ID}&pn=Random%20Chat%20Bot"
-        f"&am={amount}&cu=INR&tn=VIP%20{days}%20Days"
+        f"&am={amount}&cu=INR&tn={quote(note)}"
     )
     qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(url)
@@ -3920,7 +3940,7 @@ async def upilist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"• `{uid}` (ID `{format_public_id(target) if target else '?'}`) "
             f"@{target.username if target and target.username else '-'} "
-            f"— **{info['days']} Days — ₹{info['amount']}**"
+            f"— **{upi_pending_label(info)}**"
         )
     lines += [
         "",
@@ -3935,8 +3955,7 @@ async def upilist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_user.id,
                 photo=info["file_id"],
                 caption=(
-                    f"📱 UPI proof from {uid} — "
-                    f"**{info['days']} Days — ₹{info['amount']}**"
+                    f"📱 UPI proof from {uid} — **{upi_pending_label(info)}**"
                 ),
                 parse_mode="Markdown",
             )
@@ -3958,16 +3977,41 @@ async def upiok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         await update.message.reply_text("Nothing pending for that user.")
         return
-    days, amount = pending["days"], pending["amount"]
+    label = upi_pending_label(pending)
+    coins = int(pending.get("coins", 0) or 0)
+    vip_days = int(pending.get("vip_days", 0) or 0)
+    days = pending["days"]
     user = db.approve_upi_payment(target.user_id)
     if not user:
         await update.message.reply_text("Nothing pending for that user.")
         return
     until = vip_expiry_label(user)
     await update.message.reply_text(
-        f"✅ Approved {user.user_id} → VIP {days} Days "
-        f"(₹{amount})" + (f" until {until}" if until else "")
+        f"✅ Approved {user.user_id} → {label}"
+        + (f" (VIP until {until})" if vip_days and until else "")
     )
+    if coins:
+        vip_part = ""
+        if vip_days:
+            vip_part = (
+                "\n👑 **1 Year VIP** activated"
+                + (f" — active until **{until}**." if until else ".")
+            )
+        try:
+            await context.bot.send_message(
+                chat_id=user.user_id,
+                text=(
+                    f"✅ **Payment approved!**\n\n"
+                    f"🪙 **+{coins} Coins** added\n"
+                    f"💰 Balance: **{user.coins} Coins**"
+                    f"{vip_part}\n\nEnjoy!"
+                ),
+                parse_mode="Markdown",
+                reply_markup=credit_keyboard(),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to notify UPI buyer {user.user_id}: {e}")
+        return
     try:
         await context.bot.send_message(
             chat_id=user.user_id,
@@ -3994,20 +4038,28 @@ async def upino_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target:
         await update.message.reply_text("No such user.")
         return
+    pending = db.pending_upi.get(target.user_id)
     if not db.reject_upi_payment(target.user_id):
         await update.message.reply_text("Nothing pending for that user.")
         return
+    is_coin = bool(pending) and int(pending.get("coins", 0) or 0) > 0
+    retry_hint = (
+        "You can pay again from the coin shop — /credit → "
+        "📱 Buy Coins via UPI / PhonePe."
+        if is_coin else
+        "You can pay again and resend from /vip → 📱 Buy VIP via UPI / PhonePe."
+    )
     await update.message.reply_text(f"❌ Rejected {target.user_id}")
     try:
         await context.bot.send_message(
             chat_id=target.user_id,
             text=(
                 "❌ **Payment not verified**\n\n"
-                "The screenshot didn't pass review. You can pay again and "
-                "resend from /vip → 📱 Buy VIP via UPI / PhonePe."
+                "The screenshot didn't pass review. "
+                f"{retry_hint}"
             ),
             parse_mode="Markdown",
-            reply_markup=vip_keyboard(),
+            reply_markup=credit_keyboard() if is_coin else vip_keyboard(),
         )
     except Exception as e:
         logger.warning(f"Failed to notify rejected UPI user {target.user_id}: {e}")
@@ -4343,6 +4395,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── UPI / PhonePe VIP purchase ──────────────────────────────
     elif data == "upi_menu":
         context.user_data.pop("upi_plan", None)
+        context.user_data.pop("upi_coin_pack", None)
         context.user_data["awaiting_upi"] = False
         await safe_edit(
             query,
@@ -4363,6 +4416,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=upi_plan_keyboard(),
             )
             return
+        context.user_data.pop("upi_coin_pack", None)
         context.user_data["upi_plan"] = (days, amount)
         # Arm screenshot capture immediately — the user may send the proof
         # right after the QR without tapping "I Have Paid" first.
@@ -4378,7 +4432,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_photo(
                 chat_id=user_id,
-                photo=upi_qr_png(amount, days),
+                photo=upi_qr_png(amount, f"VIP {days} Days"),
                 caption=caption,
                 parse_mode="Markdown",
                 reply_markup=upi_paid_keyboard(),
@@ -4410,9 +4464,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"UPI QR sent but message update failed: {e}")
 
+    # ── UPI / PhonePe coin purchase ─────────────────────────────
+    elif data == "upi_coins_menu":
+        context.user_data.pop("upi_plan", None)
+        context.user_data.pop("upi_coin_pack", None)
+        context.user_data["awaiting_upi"] = False
+        await safe_edit(
+            query,
+            "🪙 **Buy Coins via UPI / PhonePe**\n\n"
+            "Pick a pack below (prices in INR). Your coins are added "
+            "after the admin verifies your payment.",
+            parse_mode="Markdown",
+            reply_markup=upi_coin_keyboard(),
+        )
+
+    elif data.startswith("upicoin_"):
+        try:
+            coins = int(data.rsplit("_", 1)[1])
+            amount, vip_days = _UPI_COIN_PRICES[coins]
+        except (ValueError, KeyError):
+            await safe_edit(
+                query, "⚠️ Invalid pack. Please try again.",
+                reply_markup=upi_coin_keyboard(),
+            )
+            return
+        context.user_data.pop("upi_plan", None)
+        context.user_data["upi_coin_pack"] = (coins, amount, vip_days)
+        # Arm screenshot capture immediately — the user may send the proof
+        # right after the QR without tapping "I Have Paid" first.
+        context.user_data["awaiting_upi"] = True
+        label = upi_pending_label(
+            {"coins": coins, "amount": amount, "vip_days": vip_days}
+        )
+        caption = (
+            f"🪙 **UPI Payment — {label}**\n\n"
+            f"Amount: **₹{amount} INR** (exact amount only)\n"
+            f"UPI ID: `{UPI_ID}`\n\n"
+            f"Pay via the QR or UPI ID, tap **I Have Paid**, then "
+            f"send your payment screenshot.\n"
+            + (
+                "👑 This pack also includes **1 Year VIP**.\n"
+                if vip_days >= 365 else ""
+            )
+            + "Coins are added after admin verification."
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=upi_qr_png(amount, f"{coins} Coins"),
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=upi_paid_keyboard(back="upi_coins_menu"),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send UPI coin QR: {e}", exc_info=True)
+            await safe_edit(
+                query,
+                "⚠️ Could not generate the QR code. Please try again.",
+                reply_markup=upi_coin_keyboard(),
+            )
+            return
+        # Same as the upi_plan_ branch: the tap was already acknowledged at
+        # dispatch, so a repeat answerCallbackQuery must never mask the QR.
+        try:
+            await query.answer(f"🪙 {label}")
+        except Exception:
+            pass
+        try:
+            await safe_edit(
+                query,
+                f"⬆️ **QR sent above** — pay **₹{amount} exact**, then tap "
+                f"**✅ I Have Paid** and send your screenshot.",
+                parse_mode="Markdown",
+                reply_markup=upi_paid_keyboard(back="upi_coins_menu"),
+            )
+        except Exception as e:
+            logger.warning(f"UPI coin QR sent but message update failed: {e}")
+
     elif data == "upi_paid":
         plan = context.user_data.get("upi_plan")
-        if not plan:
+        coin_pack = context.user_data.get("upi_coin_pack")
+        if not plan and not coin_pack:
             # Already acknowledged at dispatch — a repeat answer raises, so
             # make it best-effort and never let it skip the plan list below.
             try:
@@ -4424,8 +4556,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown", reply_markup=upi_plan_keyboard(),
             )
             return
-        days, amount = plan
         context.user_data["awaiting_upi"] = True
+        if coin_pack:
+            coins, amount, vip_days = coin_pack
+            label = upi_pending_label(
+                {"coins": coins, "amount": amount, "vip_days": vip_days}
+            )
+            await safe_edit(
+                query,
+                f"📸 **Send your payment screenshot**\n\n"
+                f"Pack: **{label}**\n"
+                f"Send a photo of the payment confirmation now.\n"
+                f"Send any other message to cancel.",
+                parse_mode="Markdown",
+                reply_markup=upi_paid_keyboard(back="upi_coins_menu"),
+            )
+            return
+        days, amount = plan
         await safe_edit(
             query,
             f"📸 **Send your payment screenshot**\n\n"
@@ -4825,7 +4972,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db.pair_users(user_id, target.user_id):
             # Race: they got paired while this tap was in flight — the
             # match failed, so the coins must not stay spent.
-            db.add_coins(user_id, DIRECT_MESSAGE_COST)
+            db.add_coins(
+                user_id, DIRECT_MESSAGE_COST, reason="refund", gated=False
+            )
             await query.answer(
                 "That chat couldn't start — please try again.", show_alert=True
             )
@@ -5207,7 +5356,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Failed to deliver request to {target.user_id}: {e}")
             db.cancel_request(user_id, target.user_id)
-            db.add_coins(user_id, CHAT_REQUEST_COST)  # refund undeliverable request
+            # refund undeliverable request — never withheld behind check-in
+            db.add_coins(
+                user_id, CHAT_REQUEST_COST, reason="refund", gated=False
+            )
             await query.answer("Couldn't reach that user.", show_alert=True)
             return
 
@@ -5259,7 +5411,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db.pair_users(requester_id, user_id):
             # Race: one side got paired meanwhile — refund, never charge
             # for a match that didn't happen.
-            db.add_coins(requester_id, CHAT_REQUEST_COST)
+            db.add_coins(
+                requester_id, CHAT_REQUEST_COST, reason="refund", gated=False
+            )
             await query.answer(
                 "This request is no longer valid.", show_alert=True
             )
@@ -5627,23 +5781,43 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    verify flows and chat relay can never swallow the proof) ──
     if context.user_data.get("awaiting_upi") or (
         update.message.photo
-        and context.user_data.get("upi_plan")
+        and (
+            context.user_data.get("upi_plan")
+            or context.user_data.get("upi_coin_pack")
+        )
         and not context.user_data.get("awaiting_photo")
         and not context.user_data.get("awaiting_verify")
     ):
         plan = context.user_data.get("upi_plan")
-        if update.message.photo and plan:
+        coin_pack = context.user_data.get("upi_coin_pack")
+        if update.message.photo and (plan or coin_pack):
             context.user_data["awaiting_upi"] = False
-            days, amount = context.user_data.pop("upi_plan", (None, None))
             file_id = update.message.photo[-1].file_id
-            db.queue_upi_payment(user_id, days, amount, file_id)
+            if plan:
+                days, amount = context.user_data.pop("upi_plan", (None, None))
+                db.queue_upi_payment(user_id, days, amount, file_id)
+                label = upi_pending_label({"days": days, "amount": amount})
+                detail = f"Plan: **{days} Days VIP — ₹{amount}**"
+                back_markup = vip_keyboard()
+            else:
+                coins, amount, vip_days = context.user_data.pop(
+                    "upi_coin_pack", (None, None, None)
+                )
+                db.queue_upi_payment(
+                    user_id, 0, amount, file_id, coins=coins, vip_days=vip_days
+                )
+                label = upi_pending_label(
+                    {"coins": coins, "amount": amount, "vip_days": vip_days}
+                )
+                detail = f"Pack: **{label}**"
+                back_markup = credit_keyboard()
             await update.message.reply_text(
                 "📱 **Payment screenshot submitted!**\n\n"
-                f"Plan: **{days} Days VIP — ₹{amount}**\n"
+                f"{detail}\n"
                 "An admin will verify your payment — you'll get a message "
                 "when it's approved.",
                 parse_mode="Markdown",
-                reply_markup=vip_keyboard(),
+                reply_markup=back_markup,
             )
             if ADMIN_ID is not None:
                 uname = f"@{user.username}" if user.username else "-"
@@ -5651,7 +5825,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption = (
                     f"📱 UPI payment submitted\n"
                     f"User: {user_id} ({uname}) — {name}\n"
-                    f"Plan: {days} Days VIP — ₹{amount}\n\n"
+                    f"{label}\n\n"
                     f"Approve: /upiok {user_id}\n"
                     f"Reject: /upino {user_id}"
                 )
@@ -5673,7 +5847,7 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             text=(
                                 f"📱 UPI payment submitted\n"
                                 f"User: {user_id} ({uname}) — {name}\n"
-                                f"Plan: {days} Days VIP — ₹{amount}\n"
+                                f"{label}\n"
                                 f"Screenshot is in the user's chat with the bot.\n\n"
                                 f"Approve: /upiok {user_id}\n"
                                 f"Reject: /upino {user_id}"
@@ -5697,13 +5871,22 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         # Armed for a screenshot but sent something else → cancel cleanly.
         context.user_data["awaiting_upi"] = False
+        was_coin = context.user_data.pop("upi_coin_pack", None) is not None
         context.user_data.pop("upi_plan", None)
-        await update.message.reply_text(
-            "❌ Payment cancelled — tap **📱 Buy VIP via UPI**, pick a plan, "
-            "then send the screenshot photo.",
-            parse_mode="Markdown",
-            reply_markup=vip_keyboard(),
-        )
+        if was_coin:
+            await update.message.reply_text(
+                "❌ Payment cancelled — tap **🪙 Buy Coins via UPI**, pick a "
+                "pack, then send the screenshot photo.",
+                parse_mode="Markdown",
+                reply_markup=credit_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Payment cancelled — tap **📱 Buy VIP via UPI**, pick a plan, "
+                "then send the screenshot photo.",
+                parse_mode="Markdown",
+                reply_markup=vip_keyboard(),
+            )
         return
 
     # Handle profile photo upload (before chat / country logic)
@@ -6177,7 +6360,10 @@ async def payment_success_handler(update: Update, context: ContextTypes.DEFAULT_
             buyer_id, coins = None, None
         user = db.get_user(buyer_id) if buyer_id else None
         if user and coins:
-            balance = db.add_coins(buyer_id, coins)
+            # Paid with real money — never withheld behind the check-in gate.
+            balance = db.add_coins(
+                buyer_id, coins, reason="stars purchase", gated=False
+            )
             vip_line = ""
             if coins == VIP_PLAN[0]:
                 db.set_vip(buyer_id, True)

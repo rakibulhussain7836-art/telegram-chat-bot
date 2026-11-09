@@ -349,12 +349,27 @@ COIN_PLANS = [
     (6200, 740, True),
 ]
 
+# (coins, price_in_INR, vip_days) — UPI / PhonePe coin packs
+UPI_COIN_PLANS = [
+    (280, 100, 0),
+    (500, 250, 0),
+    (1300, 500, 0),
+    (2500, 900, 0),
+    (6200, 1500, 365),  # 👑 Coins + 1 Year VIP
+]
+UPI_COIN_BADGES = {6200: "👑 1 Year VIP"}
+
 
 def credit_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("🎁 Refer Friends (Free Coin)", callback_data="show_refer")]]
     for coins, stars, vip in COIN_PLANS:
         label = f"👑 {coins} Coins VIP → ⭐{stars}" if vip else f"🪙 {coins} Coins → ⭐{stars}"
         rows.append([InlineKeyboardButton(label, callback_data=f"buy_{stars}_{coins}")])
+    rows.append([
+        InlineKeyboardButton(
+            "📱 Buy Coins via UPI / PhonePe", callback_data="upi_coins_menu"
+        )
+    ])
     rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -605,10 +620,22 @@ def upi_plan_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def upi_paid_keyboard() -> InlineKeyboardMarkup:
+def upi_coin_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for coins, price, vip_days in UPI_COIN_PLANS:
+        badge = UPI_COIN_BADGES.get(coins)
+        label = f"{coins} Coins — ₹{price}" + (f" · {badge}" if badge else "")
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"upicoin_{coins}")
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Go Back", callback_data="credit_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def upi_paid_keyboard(back: str = "upi_menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ I Have Paid", callback_data="upi_paid")],
-        [InlineKeyboardButton("⬅️ Go Back", callback_data="upi_menu")],
+        [InlineKeyboardButton("⬅️ Go Back", callback_data=back)],
     ])
 
 

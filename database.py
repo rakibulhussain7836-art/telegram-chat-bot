@@ -1332,7 +1332,14 @@ class Database:
     # ── UPI payments (screenshot evidence reviewed by the admin) ──
 
     def queue_upi_payment(
-        self, user_id: int, days: int, amount: int, file_id: str
+        self,
+        user_id: int,
+        days: int,
+        amount: int,
+        file_id: str,
+        *,
+        coins: int = 0,
+        vip_days: int = 0,
     ) -> bool:
         user = self.users.get(user_id)
         if not user:
@@ -1340,6 +1347,8 @@ class Database:
         self.pending_upi[user_id] = {
             "days": int(days),
             "amount": int(amount),
+            "coins": int(coins),
+            "vip_days": int(vip_days),
             "file_id": file_id,
             "created_at": time.time(),
         }
@@ -1350,12 +1359,21 @@ class Database:
         return sorted(self.pending_upi.items())
 
     def approve_upi_payment(self, user_id: int) -> Optional["UserProfile"]:
-        """Approve the pending UPI payment: grant VIP days, return the user."""
+        """Approve the pending UPI payment: grant what it bought, return the user."""
         pending = self.pending_upi.pop(user_id, None)
         user = self.users.get(user_id)
         if not pending or not user:
             return None
-        self.add_vip_days(user_id, pending["days"])
+        coins = int(pending.get("coins", 0) or 0)
+        days = int(pending.get("days", 0) or 0)
+        vip_days = int(pending.get("vip_days", 0) or 0)
+        if coins:
+            # Paid with real money — never withheld behind the check-in gate.
+            self.add_coins(user_id, coins, reason="upi purchase", gated=False)
+        if days:
+            self.add_vip_days(user_id, days)
+        if vip_days:
+            self.add_vip_days(user_id, vip_days)
         self._write_upi()
         return user
 
@@ -1404,19 +1422,28 @@ class Database:
             )
         return None
 
-    def add_coins(self, user_id: int, amount: int, reason: str = "adjust") -> int:
+    def add_coins(
+        self,
+        user_id: int,
+        amount: int,
+        reason: str = "adjust",
+        *,
+        gated: bool = True,
+    ) -> int:
         """
         Add coins to a user and return the new balance. Never negative.
 
         🎁 MANDATORY: positive earnings are withheld until the daily
         check-in is claimed today. Refunds/adjustments (amount <= 0) are
         never gated, so a failed purchase can always be given back.
+        Paid purchases and refunds pass gated=False — real money and
+        returned coins are never withheld behind the check-in.
         """
         user = self.users.get(user_id)
         if not user or amount == 0:
             return user.coins if user else 0
         amount = int(amount)
-        if amount > 0 and user.last_checkin != bot_today():
+        if gated and amount > 0 and user.last_checkin != bot_today():
             return user.coins  # 🎁 daily check-in required to earn coins
         user.coins = max(0, user.coins + amount)
         if amount > 0:

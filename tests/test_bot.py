@@ -678,6 +678,18 @@ def test_unverifiable_payment_is_not_credited(fresh_db):
     assert "could not be verified" in update.message.replies[0]["text"]
 
 
+def test_stars_purchase_credits_without_checkin(fresh_db):
+    fresh_db.register_user(1)
+    user = fresh_db.get_user(1)
+    user.last_checkin = ""  # no check-in claimed — real money must still credit
+    update = FakeUpdate(1)
+    update.message.successful_payment = FakePayment("coin_pack:1:280")
+
+    asyncio.run(bot.payment_success_handler(update, FakeContext()))
+
+    assert fresh_db.get_user(1).coins == STARTING_COINS + 280
+
+
 # ── Referral deep link ──────────────────────────────────────────
 
 def test_start_with_referral_code_credits_both(fresh_db):
@@ -1795,6 +1807,28 @@ def test_report_from_profile_card_bans_at_threshold(fresh_db):
     assert fresh_db.get_user(target).banned is True
 
 
+def test_two_users_can_match_again_after_ending_chat(fresh_db):
+    """Ending a chat must leave NO rematch restriction: the same two
+    accounts go back into the queue and find each other again."""
+    register(fresh_db, 1, gender=Gender.MALE, country="US")
+    register(fresh_db, 2, gender=Gender.FEMALE, country="FR")
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    assert fresh_db.find_match(1) == 2
+
+    fresh_db.pair_users(1, 2)
+    fresh_db.end_chat(1)
+
+    assert fresh_db.get_user(1).state == ChatState.IDLE
+    assert fresh_db.get_user(1).partner_id is None
+    assert fresh_db.get_user(2).partner_id is None
+
+    fresh_db.add_to_queue(1)
+    fresh_db.add_to_queue(2)
+    assert fresh_db.find_match(1) == 2
+    assert fresh_db.find_match(2) == 1
+
+
 def test_add_contact_from_profile_card(fresh_db):
     register(fresh_db, 1)
     register(fresh_db, 2)
@@ -2615,7 +2649,7 @@ def test_upi_plan_sends_qr_and_stores_plan(fresh_db):
 
 
 def test_upi_qr_png_generates_png_bytes(fresh_db):
-    buf = bot.upi_qr_png(250, 30)
+    buf = bot.upi_qr_png(250, "VIP 30 Days")
     assert buf.read(8) == b"\x89PNG\r\n\x1a\n"
 
 
@@ -2806,6 +2840,203 @@ def test_vip_go_back_callback_shows_vip_screen(fresh_db):
 def test_vip_text_mentions_upi_option(fresh_db):
     user = register(fresh_db, 1)
     assert "UPI" in bot.vip_text(user)
+
+
+# ── UPI / PhonePe coin packs ──────────────────────────────────────
+
+def test_credit_keyboard_has_upi_button(fresh_db):
+    from keyboards import credit_keyboard
+
+    labels = [b.text for b in _buttons(credit_keyboard())]
+    assert any("UPI" in l for l in labels)
+
+
+def test_upi_coin_menu_lists_all_packs(fresh_db):
+    from keyboards import UPI_COIN_PLANS
+
+    register(fresh_db, 1)
+    query, _ = press(1, "upi_coins_menu")
+    text = query.edits[-1]["text"]
+    assert "UPI" in text
+    markup = query.edits[-1]["reply_markup"]
+    cbds = [b.callback_data for b in _buttons(markup)]
+    labels = [b.text for b in _buttons(markup)]
+    for coins, price, vip_days in UPI_COIN_PLANS:
+        assert f"upicoin_{coins}" in cbds, coins
+        assert any(f"{coins} Coins" in l and f"₹{price}" in l for l in labels), coins
+    assert any("1 Year VIP" in l for l in labels)
+
+
+def test_upi_coin_pack_sends_qr_and_arms_capture(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "upicoin_280")
+
+    assert context.user_data["upi_coin_pack"] == (280, 100, 0)
+    assert context.user_data["awaiting_upi"] is True
+    assert "upi_plan" not in context.user_data
+    assert len(context.bot.photos) == 1
+    photo = context.bot.photos[0]
+    assert photo["chat_id"] == 1
+    assert "₹100" in photo["caption"]
+    assert "280 Coins" in photo["caption"]
+    assert bot.UPI_ID in photo["caption"].replace("`", "")
+    cbds = [b.callback_data for b in _buttons(photo["reply_markup"])]
+    assert "upi_paid" in cbds
+    assert "upi_coins_menu" in cbds  # Go Back returns to the coin menu
+
+
+def test_upi_year_pack_caption_mentions_year_vip(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upicoin_6200")
+    assert context.user_data["upi_coin_pack"] == (6200, 1500, 365)
+    caption = context.bot.photos[0]["caption"]
+    assert "6200 Coins" in caption
+    assert "1 Year VIP" in caption
+    assert "₹1500" in caption
+
+
+def test_upi_paid_for_coin_pack_asks_for_screenshot(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upicoin_500")
+    query, context = press(1, "upi_paid", context)
+    assert context.user_data["awaiting_upi"] is True
+    assert "screenshot" in query.edits[-1]["text"].lower()
+    assert "500 Coins" in query.edits[-1]["text"]
+
+
+def test_coin_and_vip_flows_clear_each_others_state(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upicoin_280")
+    assert "upi_coin_pack" in context.user_data
+
+    press(1, "upi_menu", context)
+    assert "upi_coin_pack" not in context.user_data
+    assert context.user_data.get("awaiting_upi") is False
+
+    _, context = press(1, "upi_plan_30", context)
+    assert "upi_plan" in context.user_data
+    press(1, "upi_coins_menu", context)
+    assert "upi_plan" not in context.user_data
+
+
+def test_upi_coin_screenshot_queues_and_notifies_admin(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+    # pack selection alone arms capture — no "I Have Paid" tap required
+    _, context = press(1, "upicoin_1300")
+
+    update = FakeUpdate(
+        1, message=FakeMessage(photo=[SimpleNamespace(file_id="pay_proof_c1")])
+    )
+    asyncio.run(bot.relay_message(update, context))
+
+    assert 1 in fresh_db.pending_upi
+    pending = fresh_db.pending_upi[1]
+    assert pending["coins"] == 1300
+    assert pending["amount"] == 500
+    assert pending["days"] == 0
+    assert pending["vip_days"] == 0
+    assert pending["file_id"] == "pay_proof_c1"
+    assert "submitted" in update.message.replies[0]["text"]
+    assert "1300 Coins" in update.message.replies[0]["text"]
+    # screenshot DM'd to the admin with an approve command
+    admin_photos = [p for p in context.bot.photos if p["chat_id"] == 999]
+    assert len(admin_photos) == 1
+    assert "upiok" in admin_photos[0]["caption"]
+    assert "1300 Coins" in admin_photos[0]["caption"]
+
+
+def test_upi_coin_screenshot_cancel_on_non_photo(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upicoin_280")
+
+    update = FakeUpdate(1, message=FakeMessage(text="not a photo"))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.pending_upi == {}
+    assert "upi_coin_pack" not in context.user_data
+    assert "cancelled" in update.message.replies[0]["text"].lower()
+
+
+def test_admin_approve_coin_pack_grants_coins_without_checkin(
+    fresh_db, monkeypatch
+):
+    register(fresh_db, 1)
+    user = fresh_db.get_user(1)
+    user.last_checkin = ""  # no check-in claimed — real money must still credit
+    fresh_db.queue_upi_payment(1, 0, 100, "proof_c1", coins=280)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.upiok_command(update, context))
+
+    user = fresh_db.get_user(1)
+    assert user.coins == STARTING_COINS + 280
+    assert user.vip is False
+    assert "✅ Approved" in update.message.replies[0]["text"]
+    assert "280 Coins" in update.message.replies[0]["text"]
+    assert fresh_db.pending_upi == {}
+    buyer_msgs = [m for m in context.bot.sent if m["chat_id"] == 1]
+    assert buyer_msgs
+    assert "280 Coins" in buyer_msgs[0]["text"]
+
+
+def test_admin_approve_year_pack_grants_coins_and_year_vip(
+    fresh_db, monkeypatch
+):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 0, 1500, "proof_c2", coins=6200, vip_days=365)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.upiok_command(update, context))
+
+    user = fresh_db.get_user(1)
+    assert user.coins == STARTING_COINS + 6200
+    assert user.vip is True
+    assert user.vip_expires_at > time.time() + 360 * 86400
+    assert "1 Year VIP" in update.message.replies[0]["text"]
+    assert fresh_db.pending_upi == {}
+    buyer_msgs = [m for m in context.bot.sent if m["chat_id"] == 1]
+    assert buyer_msgs
+    assert "6200 Coins" in buyer_msgs[0]["text"]
+    assert "1 Year VIP" in buyer_msgs[0]["text"]
+
+
+def test_admin_can_reject_coin_pack_payment(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 0, 250, "proof_c3", coins=500)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.upino_command(update, context))
+
+    assert fresh_db.pending_upi == {}
+    assert "❌ Rejected" in update.message.replies[0]["text"]
+    buyer_msgs = [m for m in context.bot.sent if m["chat_id"] == 1]
+    assert buyer_msgs
+    assert "Buy Coins via UPI" in buyer_msgs[0]["text"]
+
+
+def test_upilist_labels_coin_packs(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 0, 1500, "proof_c4", coins=6200, vip_days=365)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    asyncio.run(bot.upilist_command(update, context))
+
+    text = update.message.replies[0]["text"]
+    assert "Pending UPI" in text
+    assert "6200 Coins" in text
+    assert "1 Year VIP" in text
 
 
 # ── Chat request TTL ───────────────────────────────────────────
