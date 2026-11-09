@@ -5614,21 +5614,52 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ADMIN_ID is not None:
                 uname = f"@{user.username}" if user.username else "-"
                 name = user.name or "-"
+                caption = (
+                    f"📱 UPI payment submitted\n"
+                    f"User: {user_id} ({uname}) — {name}\n"
+                    f"Plan: {days} Days VIP — ₹{amount}\n\n"
+                    f"Approve: /upiok {user_id}\n"
+                    f"Reject: /upino {user_id}"
+                )
+                notified = False
                 try:
                     await context.bot.send_photo(
                         chat_id=ADMIN_ID,
                         photo=file_id,
-                        caption=(
-                            f"📱 **UPI payment submitted**\n"
-                            f"User: `{user_id}` ({uname}) — {name}\n"
-                            f"Plan: **{days} Days VIP — ₹{amount}**\n\n"
-                            f"Approve: `/upiok {user_id}`\n"
-                            f"Reject: `/upino {user_id}`"
-                        ),
-                        parse_mode="Markdown",
+                        caption=caption,
                     )
+                    notified = True
                 except Exception as e:
-                    logger.warning(f"Failed to notify admin of UPI payment: {e}")
+                    logger.warning(f"UPI admin photo notify failed: {e}")
+                if not notified:
+                    # Fallback: plain text so the admin never misses a payment
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                f"📱 UPI payment submitted\n"
+                                f"User: {user_id} ({uname}) — {name}\n"
+                                f"Plan: {days} Days VIP — ₹{amount}\n"
+                                f"Screenshot is in the user's chat with the bot.\n\n"
+                                f"Approve: /upiok {user_id}\n"
+                                f"Reject: /upino {user_id}"
+                            ),
+                        )
+                        notified = True
+                    except Exception as e:
+                        logger.error(
+                            f"UPI admin text notify also failed "
+                            f"(ADMIN_ID={ADMIN_ID}): {e}"
+                        )
+                if notified:
+                    logger.info(
+                        f"UPI payment from {user_id} queued and admin notified"
+                    )
+            else:
+                logger.warning(
+                    "UPI payment queued but ADMIN_ID is not set — "
+                    "admin was NOT notified."
+                )
             return
         # Armed for a screenshot but sent something else → cancel cleanly.
         context.user_data["awaiting_upi"] = False
