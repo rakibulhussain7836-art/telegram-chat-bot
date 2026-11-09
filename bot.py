@@ -4364,7 +4364,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         context.user_data["upi_plan"] = (days, amount)
-        context.user_data["awaiting_upi"] = False
+        # Arm screenshot capture immediately — the user may send the proof
+        # right after the QR without tapping "I Have Paid" first.
+        context.user_data["awaiting_upi"] = True
         caption = (
             f"📱 **UPI Payment — {days} Days VIP**\n\n"
             f"Amount: **₹{amount} INR** (exact amount only)\n"
@@ -5587,6 +5589,58 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_channel(update, context):
         return
 
+    # ── UPI payment screenshot (checked FIRST so profile-photo /
+    #    verify flows and chat relay can never swallow the proof) ──
+    if context.user_data.get("awaiting_upi") or (
+        update.message.photo
+        and context.user_data.get("upi_plan")
+        and not context.user_data.get("awaiting_photo")
+        and not context.user_data.get("awaiting_verify")
+    ):
+        plan = context.user_data.get("upi_plan")
+        if update.message.photo and plan:
+            context.user_data["awaiting_upi"] = False
+            days, amount = context.user_data.pop("upi_plan", (None, None))
+            file_id = update.message.photo[-1].file_id
+            db.queue_upi_payment(user_id, days, amount, file_id)
+            await update.message.reply_text(
+                "📱 **Payment screenshot submitted!**\n\n"
+                f"Plan: **{days} Days VIP — ₹{amount}**\n"
+                "An admin will verify your payment — you'll get a message "
+                "when it's approved.",
+                parse_mode="Markdown",
+                reply_markup=vip_keyboard(),
+            )
+            if ADMIN_ID is not None:
+                uname = f"@{user.username}" if user.username else "-"
+                name = user.name or "-"
+                try:
+                    await context.bot.send_photo(
+                        chat_id=ADMIN_ID,
+                        photo=file_id,
+                        caption=(
+                            f"📱 **UPI payment submitted**\n"
+                            f"User: `{user_id}` ({uname}) — {name}\n"
+                            f"Plan: **{days} Days VIP — ₹{amount}**\n\n"
+                            f"Approve: `/upiok {user_id}`\n"
+                            f"Reject: `/upino {user_id}`"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify admin of UPI payment: {e}")
+            return
+        # Armed for a screenshot but sent something else → cancel cleanly.
+        context.user_data["awaiting_upi"] = False
+        context.user_data.pop("upi_plan", None)
+        await update.message.reply_text(
+            "❌ Payment cancelled — tap **📱 Buy VIP via UPI**, pick a plan, "
+            "then send the screenshot photo.",
+            parse_mode="Markdown",
+            reply_markup=vip_keyboard(),
+        )
+        return
+
     # Handle profile photo upload (before chat / country logic)
     if context.user_data.get("awaiting_photo"):
         context.user_data["awaiting_photo"] = False
@@ -5769,49 +5823,6 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Verification cancelled — pick your gender first, then send "
                 "a photo.",
                 reply_markup=settings_keyboard(user.daily_reminder, vip=user.vip),
-            )
-        return
-
-    # Handle UPI payment screenshot evidence
-    if context.user_data.get("awaiting_upi"):
-        context.user_data["awaiting_upi"] = False
-        plan = context.user_data.pop("upi_plan", None)
-        if update.message.photo and plan:
-            days, amount = plan
-            file_id = update.message.photo[-1].file_id
-            db.queue_upi_payment(user_id, days, amount, file_id)
-            await update.message.reply_text(
-                "📱 **Payment screenshot submitted!**\n\n"
-                f"Plan: **{days} Days VIP — ₹{amount}**\n"
-                "An admin will verify your payment — you'll get a message "
-                "when it's approved.",
-                parse_mode="Markdown",
-                reply_markup=vip_keyboard(),
-            )
-            if ADMIN_ID is not None:
-                uname = f"@{user.username}" if user.username else "-"
-                name = user.name or "-"
-                try:
-                    await context.bot.send_photo(
-                        chat_id=ADMIN_ID,
-                        photo=file_id,
-                        caption=(
-                            f"📱 **UPI payment submitted**\n"
-                            f"User: `{user_id}` ({uname}) — {name}\n"
-                            f"Plan: **{days} Days VIP — ₹{amount}**\n\n"
-                            f"Approve: `/upiok {user_id}`\n"
-                            f"Reject: `/upino {user_id}`"
-                        ),
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to notify admin of UPI payment: {e}")
-        else:
-            await update.message.reply_text(
-                "❌ Payment cancelled — tap **📱 Buy VIP via UPI**, pick a plan, "
-                "then send the screenshot.",
-                parse_mode="Markdown",
-                reply_markup=vip_keyboard(),
             )
         return
 

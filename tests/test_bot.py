@@ -2603,6 +2603,8 @@ def test_upi_plan_sends_qr_and_stores_plan(fresh_db):
     query, context = press(1, "upi_plan_30")
 
     assert context.user_data["upi_plan"] == (30, 250)
+    # screenshot capture armed as soon as a plan is chosen
+    assert context.user_data["awaiting_upi"] is True
     assert len(context.bot.photos) == 1
     photo = context.bot.photos[0]
     assert photo["chat_id"] == 1
@@ -2636,8 +2638,8 @@ def test_upi_paid_without_plan_shows_plan_list(fresh_db):
 def test_upi_screenshot_flow_queues_and_notifies_admin(fresh_db, monkeypatch):
     register(fresh_db, 1)
     monkeypatch.setattr(bot, "ADMIN_ID", 999)
+    # plan selection alone arms capture — no "I Have Paid" tap required
     _, context = press(1, "upi_plan_14")
-    press(1, "upi_paid", context)
 
     update = FakeUpdate(
         1, message=FakeMessage(photo=[SimpleNamespace(file_id="pay_proof_1")])
@@ -2653,6 +2655,37 @@ def test_upi_screenshot_flow_queues_and_notifies_admin(fresh_db, monkeypatch):
     admin_photos = [p for p in context.bot.photos if p["chat_id"] == 999]
     assert len(admin_photos) == 1
     assert "upiok" in admin_photos[0]["caption"]
+
+
+def test_upi_screenshot_works_after_i_have_paid(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+    _, context = press(1, "upi_plan_7")
+    press(1, "upi_paid", context)
+
+    update = FakeUpdate(
+        1, message=FakeMessage(photo=[SimpleNamespace(file_id="pay_proof_2")])
+    )
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.pending_upi[1]["days"] == 7
+    assert fresh_db.pending_upi[1]["amount"] == 60
+
+
+def test_upi_screenshot_not_stolen_by_profile_photo_flag(fresh_db, monkeypatch):
+    """A stale Set-Profile-Photo flag must not swallow the payment proof."""
+    register(fresh_db, 1)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+    _, context = press(1, "upi_plan_30")
+    context.user_data["awaiting_photo"] = True  # stale from Settings
+
+    update = FakeUpdate(
+        1, message=FakeMessage(photo=[SimpleNamespace(file_id="pay_proof_3")])
+    )
+    asyncio.run(bot.relay_message(update, context))
+
+    assert 1 in fresh_db.pending_upi
+    assert fresh_db.pending_upi[1]["file_id"] == "pay_proof_3"
 
 
 def test_upi_screenshot_cancel_on_non_photo(fresh_db):
