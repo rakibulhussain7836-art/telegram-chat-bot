@@ -2619,6 +2619,37 @@ def test_upi_qr_png_generates_png_bytes(fresh_db):
     assert buf.read(8) == b"\x89PNG\r\n\x1a\n"
 
 
+def test_upi_plan_qr_survives_duplicate_callback_answer(fresh_db):
+    """button_handler acknowledges every callback once at dispatch; the
+    branch's own answerCallbackQuery is then rejected by Telegram with a
+    400. That must never mask an already-sent QR with a false
+    'Could not generate the QR code' error."""
+    register(fresh_db, 1)
+
+    class StrictQuery(FakeQuery):
+        async def answer(self, text=None, show_alert=False):
+            if self.answers:
+                raise RuntimeError(
+                    "Bad Request: query is too old and response timeout "
+                    "expired or query id is invalid"
+                )
+            await super().answer(text, show_alert)
+
+    query = StrictQuery(1, "upi_plan_30")
+    update = FakeUpdate(1, callback_query=query)
+    context = FakeContext()
+    asyncio.run(bot.button_handler(update, context))
+
+    # QR photo was delivered
+    assert len(context.bot.photos) == 1
+    assert context.bot.photos[0]["chat_id"] == 1
+    # no false failure shown, success instructions landed instead
+    assert not any("Could not generate" in e["text"] for e in query.edits)
+    assert any("QR sent above" in e["text"] for e in query.edits)
+    assert context.user_data["upi_plan"] == (30, 250)
+    assert context.user_data["awaiting_upi"] is True
+
+
 def test_upi_paid_asks_for_screenshot(fresh_db):
     register(fresh_db, 1)
     _, context = press(1, "upi_plan_7")

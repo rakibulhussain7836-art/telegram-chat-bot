@@ -4383,7 +4383,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=upi_paid_keyboard(),
             )
+        except Exception as e:
+            logger.error(f"Failed to send UPI QR: {e}", exc_info=True)
+            await safe_edit(
+                query,
+                "⚠️ Could not generate the QR code. Please try again.",
+                reply_markup=upi_plan_keyboard(),
+            )
+            return
+        # The tap was already acknowledged at dispatch (button_handler answers
+        # every callback once). A second answerCallbackQuery is rejected by
+        # Telegram with 400 — keep it best-effort so it can never mask the
+        # successful QR send with a false "could not generate" error.
+        try:
             await query.answer(f"📱 {days} Days VIP — ₹{amount}")
+        except Exception:
+            pass
+        try:
             await safe_edit(
                 query,
                 f"⬆️ **QR sent above** — pay **₹{amount} exact**, then tap "
@@ -4392,17 +4408,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=upi_paid_keyboard(),
             )
         except Exception as e:
-            logger.error(f"Failed to send UPI QR: {e}")
-            await safe_edit(
-                query,
-                "⚠️ Could not generate the QR code. Please try again.",
-                reply_markup=upi_plan_keyboard(),
-            )
+            logger.warning(f"UPI QR sent but message update failed: {e}")
 
     elif data == "upi_paid":
         plan = context.user_data.get("upi_plan")
         if not plan:
-            await query.answer("Pick a plan first.", show_alert=True)
+            # Already acknowledged at dispatch — a repeat answer raises, so
+            # make it best-effort and never let it skip the plan list below.
+            try:
+                await query.answer("Pick a plan first.", show_alert=True)
+            except Exception:
+                pass
             await safe_edit(
                 query, "📱 **Buy VIP via UPI / PhonePe**\n\nChoose a plan below.",
                 parse_mode="Markdown", reply_markup=upi_plan_keyboard(),
