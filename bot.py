@@ -5157,6 +5157,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_ok, req_reason = db.can_direct_message(user_id, target.user_id)
         if not req_ok:
             await query.answer(req_reason, show_alert=True)
+            # Toasts vanish in seconds — also leave a persistent message so
+            # the sender always sees WHY no request went out.
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⛔ {req_reason}",
+                reply_markup=profile_view_keyboard(
+                    target.user_id, False, notify=user.notify_on_end,
+                    back=context.user_data.get("profile_back", "back_list"),
+                ),
+            )
             return
 
         ok, reason = db.create_request(user_id, target.user_id)
@@ -5170,6 +5180,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await query.answer(reason, show_alert=True)
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⛔ {reason}",
+                    reply_markup=profile_view_keyboard(
+                        target.user_id, False, notify=user.notify_on_end,
+                        back=context.user_data.get("profile_back", "back_list"),
+                    ),
+                )
             return
 
         sender = user
@@ -6222,6 +6240,11 @@ async def set_bot_commands(application):
 async def on_startup(application):
     """Start the hourly reminder sweep, then restore/backup the DB."""
     logger.info(f"talkNhappybot v{BOT_VERSION} starting up")
+    logger.info(
+        f"ADMIN_ID={ADMIN_ID} — UPI/verification admin alerts enabled"
+        if ADMIN_ID is not None
+        else "ADMIN_ID is NOT SET — UPI/verification admin alerts are DISABLED"
+    )
     try:
         me = await application.bot.get_me()
         set_bot_username(me.username)
