@@ -567,14 +567,49 @@ def swipe_keyboard(index: int, total: int, target_id: int, liked: bool) -> Inlin
 
 # ── VIP ─────────────────────────────────────────────────────────
 
+# (days, price_in_INR) — UPI / PhonePe VIP plans
+UPI_VIP_PLANS = [
+    (3, 30),
+    (7, 60),
+    (14, 150),
+    (30, 250),   # ⭐ Popular
+    (90, 400),   # 👑 Best Value
+]
+UPI_PLAN_BADGES = {30: "⭐ Popular", 90: "👑 Best Value"}
+
+
 def vip_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(f"👑 Upgrade VIP → ⭐{stars}", callback_data=f"buy_{stars}_{coins}")]
         for coins, stars, is_vip in COIN_PLANS
         if is_vip
     ]
+    rows.append([
+        InlineKeyboardButton(
+            "📱 Buy VIP via UPI / PhonePe", callback_data="upi_menu"
+        )
+    ])
     rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def upi_plan_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for days, price in UPI_VIP_PLANS:
+        badge = UPI_PLAN_BADGES.get(days)
+        label = f"{days} Days — ₹{price}" + (f" · {badge}" if badge else "")
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"upi_plan_{days}")
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Go Back", callback_data="vip")])
+    return InlineKeyboardMarkup(rows)
+
+
+def upi_paid_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I Have Paid", callback_data="upi_paid")],
+        [InlineKeyboardButton("⬅️ Go Back", callback_data="upi_menu")],
+    ])
 
 
 # ── Verification ────────────────────────────────────────────────

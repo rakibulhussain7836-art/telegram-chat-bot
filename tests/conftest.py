@@ -41,6 +41,7 @@ def fresh_db():
         bot.db.processed_charges.clear()
         bot.db.requests.clear()
         bot.db.pending_verifications.clear()
+        bot.db.pending_upi.clear()
         bot.db.pending_dms.clear()
         bot.db.game_battles.clear()
         bot.db.meta.clear()

@@ -2567,6 +2567,183 @@ def test_vip_text_mentions_partner_preference(fresh_db):
     assert "Partner preference" in bot.vip_text(user)
 
 
+# ── UPI / PhonePe VIP purchase ──────────────────────────────────
+
+def test_vip_keyboard_has_upi_button(fresh_db):
+    from keyboards import vip_keyboard
+
+    labels = [b.text for b in _buttons(vip_keyboard())]
+    assert any("UPI" in l for l in labels)
+
+
+def test_upi_plan_keyboard_lists_all_plans(fresh_db):
+    from keyboards import upi_plan_keyboard, UPI_VIP_PLANS
+
+    buttons = _buttons(upi_plan_keyboard())
+    labels = [b.text for b in buttons]
+    for days, price in UPI_VIP_PLANS:
+        assert any(f"{days} Days" in l and f"₹{price}" in l for l in labels), days
+    assert any("Go Back" in l for l in labels)
+    # Popular / Best Value badges
+    assert any("Popular" in l for l in labels)
+    assert any("Best Value" in l for l in labels)
+
+
+def test_upi_menu_opens_plan_list(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "upi_menu")
+    text = query.edits[-1]["text"]
+    assert "UPI" in text
+    cbds = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "upi_plan_30" in cbds
+
+
+def test_upi_plan_sends_qr_and_stores_plan(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "upi_plan_30")
+
+    assert context.user_data["upi_plan"] == (30, 250)
+    assert len(context.bot.photos) == 1
+    photo = context.bot.photos[0]
+    assert photo["chat_id"] == 1
+    assert "₹250" in photo["caption"]
+    assert bot.UPI_ID in photo["caption"].replace("`", "")
+    cbds = [b.callback_data for b in _buttons(photo["reply_markup"])]
+    assert "upi_paid" in cbds
+
+
+def test_upi_qr_png_generates_png_bytes(fresh_db):
+    buf = bot.upi_qr_png(250, 30)
+    assert buf.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+def test_upi_paid_asks_for_screenshot(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upi_plan_7")
+    query, context = press(1, "upi_paid", context)
+    assert context.user_data["awaiting_upi"] is True
+    assert "screenshot" in query.edits[-1]["text"].lower()
+
+
+def test_upi_paid_without_plan_shows_plan_list(fresh_db):
+    register(fresh_db, 1)
+    query, context = press(1, "upi_paid")
+    assert context.user_data.get("awaiting_upi") is not True
+    cbds = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "upi_plan_3" in cbds
+
+
+def test_upi_screenshot_flow_queues_and_notifies_admin(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+    _, context = press(1, "upi_plan_14")
+    press(1, "upi_paid", context)
+
+    update = FakeUpdate(
+        1, message=FakeMessage(photo=[SimpleNamespace(file_id="pay_proof_1")])
+    )
+    asyncio.run(bot.relay_message(update, context))
+
+    assert 1 in fresh_db.pending_upi
+    assert fresh_db.pending_upi[1]["days"] == 14
+    assert fresh_db.pending_upi[1]["amount"] == 150
+    assert fresh_db.pending_upi[1]["file_id"] == "pay_proof_1"
+    assert "submitted" in update.message.replies[0]["text"]
+    # screenshot DM'd to the admin
+    admin_photos = [p for p in context.bot.photos if p["chat_id"] == 999]
+    assert len(admin_photos) == 1
+    assert "upiok" in admin_photos[0]["caption"]
+
+
+def test_upi_screenshot_cancel_on_non_photo(fresh_db):
+    register(fresh_db, 1)
+    _, context = press(1, "upi_plan_3")
+    press(1, "upi_paid", context)
+
+    update = FakeUpdate(1, message=FakeMessage(text="not a photo"))
+    asyncio.run(bot.relay_message(update, context))
+
+    assert fresh_db.pending_upi == {}
+    assert "cancelled" in update.message.replies[0]["text"].lower()
+
+
+def test_admin_can_approve_upi_payment(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 30, 250, "proof_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = [str(fresh_db.get_user(1).public_id)]
+    asyncio.run(bot.upiok_command(update, context))
+
+    user = fresh_db.get_user(1)
+    assert user.vip is True
+    assert user.vip_expires_at > time.time()
+    assert "✅ Approved" in update.message.replies[0]["text"]
+    assert any(m["chat_id"] == 1 for m in context.bot.sent)
+    assert fresh_db.pending_upi == {}
+
+
+def test_admin_can_reject_upi_payment(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 7, 60, "proof_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.upino_command(update, context))
+
+    assert fresh_db.get_user(1).vip is False
+    assert fresh_db.pending_upi == {}
+    assert "❌ Rejected" in update.message.replies[0]["text"]
+    assert any(m["chat_id"] == 1 for m in context.bot.sent)
+
+
+def test_non_admin_cannot_approve_upi(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 30, 250, "proof_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(1)
+    context = FakeContext()
+    context.args = ["1"]
+    asyncio.run(bot.upiok_command(update, context))
+
+    assert fresh_db.get_user(1).vip is False
+    assert 1 in fresh_db.pending_upi
+    assert update.message.replies == []
+
+
+def test_upilist_shows_pending_payments(fresh_db, monkeypatch):
+    register(fresh_db, 1)
+    fresh_db.queue_upi_payment(1, 30, 250, "proof_1")
+    monkeypatch.setattr(bot, "ADMIN_ID", 999)
+
+    update = FakeUpdate(999)
+    context = FakeContext()
+    asyncio.run(bot.upilist_command(update, context))
+
+    text = update.message.replies[0]["text"]
+    assert "Pending UPI" in text
+    assert "30 Days" in text
+    assert context.bot.photos  # screenshot re-sent
+
+
+def test_vip_go_back_callback_shows_vip_screen(fresh_db):
+    register(fresh_db, 1)
+    query, _ = press(1, "vip")
+    assert "VIP" in query.edits[-1]["text"]
+    cbds = [b.callback_data for b in _buttons(query.edits[-1]["reply_markup"])]
+    assert "upi_menu" in cbds
+
+
+def test_vip_text_mentions_upi_option(fresh_db):
+    user = register(fresh_db, 1)
+    assert "UPI" in bot.vip_text(user)
+
+
 # ── Chat request TTL ───────────────────────────────────────────
 
 def test_request_expires_and_refunds_the_sender(fresh_db):

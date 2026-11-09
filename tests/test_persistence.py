@@ -318,6 +318,38 @@ def test_card_fields_survive_restart(tmp_path):
     db2.close()
 
 
+def test_timed_vip_expiry_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.add_vip_days(1, 30)
+    expiry = db.get_user(1).vip_expires_at
+    db.close()
+
+    db2 = Database(path=path)
+    user = db2.get_user(1)
+    assert user.vip is True
+    assert user.vip_expires_at == expiry
+    db2.close()
+
+
+def test_pending_upi_payment_survives_restart(tmp_path):
+    path = str(tmp_path / "bot.db")
+
+    db = Database(path=path)
+    register(db, 1)
+    db.queue_upi_payment(1, 30, 250, "proof_1")
+    db.close()
+
+    db2 = Database(path=path)
+    assert 1 in db2.pending_upi
+    assert db2.pending_upi[1]["days"] == 30
+    assert db2.pending_upi[1]["amount"] == 250
+    assert db2.pending_upi[1]["file_id"] == "proof_1"
+    db2.close()
+
+
 def test_daily_reminder_fields_survive_restart(tmp_path):
     path = str(tmp_path / "bot.db")
 

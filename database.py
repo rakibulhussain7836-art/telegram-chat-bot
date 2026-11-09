@@ -242,6 +242,7 @@ class UserProfile:
     verified_gender: Optional[Gender] = None
     # ── VIP & notifications ──
     vip: bool = False
+    vip_expires_at: float = 0.0   # 0 = permanent (Stars); >0 = expiry timestamp
     notify_on_end: bool = False      # 🔔 ping me when my chat ends
     view_alert_at: float = 0.0       # last "someone viewed you" toast
     # ── Chat history (most recent partners, newest first) ──
@@ -313,6 +314,7 @@ def _user_to_json(user: UserProfile) -> str:
                 user.verified_gender.value if user.verified_gender else None
             ),
             "vip": user.vip,
+            "vip_expires_at": user.vip_expires_at,
             "notify_on_end": user.notify_on_end,
             "view_alert_at": user.view_alert_at,
             "recent_partners": list(user.recent_partners),
@@ -392,6 +394,7 @@ def _user_from_json(data: str) -> UserProfile:
         verified=bool(d.get("verified", False)),
         verified_gender=_enum_or_none(Gender, d.get("verified_gender")),
         vip=bool(d.get("vip", False)),
+        vip_expires_at=float(d.get("vip_expires_at") or 0.0),
         notify_on_end=bool(d.get("notify_on_end", False)),
         view_alert_at=d.get("view_alert_at", 0.0),
         recent_partners=list(d.get("recent_partners") or []),
@@ -427,6 +430,8 @@ class Database:
         self.requests: dict[str, dict] = {}
         # Photo evidence waiting for admin review: user_id -> {gender, file_id}
         self.pending_verifications: dict[int, dict] = {}
+        # UPI payments waiting for admin review: user_id -> {days, amount, file_id}
+        self.pending_upi: dict[int, dict] = {}
         # Unread direct messages: to_id -> {from_id, text, at}
         self.pending_dms: dict[int, dict] = {}
         # 🧠 Quiz Battles in progress: "a:b" -> battle session dict
@@ -510,6 +515,13 @@ class Database:
         except ValueError:
             self.pending_verifications = {}
         try:
+            self.pending_upi = {
+                int(k): v
+                for k, v in json.loads(state.get("upi", "{}")).items()
+            }
+        except ValueError:
+            self.pending_upi = {}
+        try:
             self.pending_dms = {
                 int(k): v
                 for k, v in json.loads(state.get("dms", "{}")).items()
@@ -560,6 +572,7 @@ class Database:
             for key, value in (
                 ("requests", json.dumps(self.requests)),
                 ("verifications", json.dumps(self.pending_verifications)),
+                ("upi", json.dumps(self.pending_upi)),
                 ("dms", json.dumps(self.pending_dms)),
                 ("game_battles", json.dumps(self.game_battles)),
                 ("meta", json.dumps(self.meta)),
@@ -633,6 +646,9 @@ class Database:
     def _write_verifications(self):
         self._write_state("verifications", json.dumps(self.pending_verifications))
 
+    def _write_upi(self):
+        self._write_state("upi", json.dumps(self.pending_upi))
+
     def _write_dms(self):
         self._write_state("dms", json.dumps(self.pending_dms))
 
@@ -673,6 +689,7 @@ class Database:
                     "charges": sorted(self.processed_charges),
                     "requests": self.requests,
                     "verifications": self.pending_verifications,
+                    "upi": self.pending_upi,
                     "dms": self.pending_dms,
                     "game_battles": self.game_battles,
                     "meta": self.meta,
@@ -698,6 +715,7 @@ class Database:
         self.processed_charges.clear()
         self.requests.clear()
         self.pending_verifications.clear()
+        self.pending_upi.clear()
         self.pending_dms.clear()
         self.game_battles.clear()
         self.meta.clear()
@@ -748,8 +766,17 @@ class Database:
 
     # ── User management ──────────────────────────────────────────
 
-    def get_user(self, user_id: int) -> Optional[UserProfile]:
-        return self.users.get(user_id)
+    def get_user(self, user_id: int) -> Optional["UserProfile"]:
+        user = self.users.get(user_id)
+        # Lazy VIP expiry: timed UPI VIPs flip off the first time they're read.
+        # Permanent VIPs (vip_expires_at == 0) never expire.
+        if user and user.vip and user.vip_expires_at and (
+            time.time() >= user.vip_expires_at
+        ):
+            user.vip = False
+            user.vip_expires_at = 0.0
+            self._write_user(user)
+        return user
 
     def register_user(
         self,
@@ -875,6 +902,29 @@ class Database:
         if not user:
             return False
         user.vip = value
+        if not value:
+            user.vip_expires_at = 0.0
+        self._write_user(user)
+        return True
+
+    def add_vip_days(self, user_id: int, days: int) -> bool:
+        """Grant `days` days of VIP, stacking on any active timed VIP.
+
+        Permanent VIP (vip_expires_at == 0 with vip=True) stays permanent —
+        a timed purchase never downgrades it. Otherwise the new expiry is
+        now (or the current expiry, if still in the future) + days.
+        """
+        user = self.users.get(user_id)
+        if not user or days <= 0:
+            return False
+        if user.vip and user.vip_expires_at == 0.0:
+            return True  # already permanent
+        now = time.time()
+        base = now
+        if user.vip and user.vip_expires_at > now:
+            base = user.vip_expires_at
+        user.vip = True
+        user.vip_expires_at = base + days * 86400
         self._write_user(user)
         return True
 
@@ -1277,6 +1327,43 @@ class Database:
             return False
         del self.pending_verifications[user_id]
         self._write_verifications()
+        return True
+
+    # ── UPI payments (screenshot evidence reviewed by the admin) ──
+
+    def queue_upi_payment(
+        self, user_id: int, days: int, amount: int, file_id: str
+    ) -> bool:
+        user = self.users.get(user_id)
+        if not user:
+            return False
+        self.pending_upi[user_id] = {
+            "days": int(days),
+            "amount": int(amount),
+            "file_id": file_id,
+            "created_at": time.time(),
+        }
+        self._write_upi()
+        return True
+
+    def pending_upi_list(self) -> list[tuple[int, dict]]:
+        return sorted(self.pending_upi.items())
+
+    def approve_upi_payment(self, user_id: int) -> Optional["UserProfile"]:
+        """Approve the pending UPI payment: grant VIP days, return the user."""
+        pending = self.pending_upi.pop(user_id, None)
+        user = self.users.get(user_id)
+        if not pending or not user:
+            return None
+        self.add_vip_days(user_id, pending["days"])
+        self._write_upi()
+        return user
+
+    def reject_upi_payment(self, user_id: int) -> bool:
+        if user_id not in self.pending_upi:
+            return False
+        del self.pending_upi[user_id]
+        self._write_upi()
         return True
 
     # ── Coins ─────────────────────────────────────────────────────

@@ -736,6 +736,92 @@ def test_vip_and_notify_flags():
     assert db.set_vip(999, True) is False
 
 
+# ── VIP days (UPI purchases) ────────────────────────────────────
+
+def test_add_vip_days_sets_timed_expiry():
+    db = Database()
+    make_user(db, 1)
+    assert db.add_vip_days(1, 30) is True
+    user = db.get_user(1)
+    assert user.vip is True
+    assert user.vip_expires_at > time.time() + 29 * 86400
+    assert user.vip_expires_at <= time.time() + 30 * 86400
+
+
+def test_add_vip_days_stacks_on_active_timed_vip():
+    db = Database()
+    make_user(db, 1)
+    db.add_vip_days(1, 7)
+    first_expiry = db.get_user(1).vip_expires_at
+    db.add_vip_days(1, 7)
+    assert db.get_user(1).vip_expires_at > first_expiry
+
+
+def test_add_vip_days_keeps_permanent_vip_permanent():
+    db = Database()
+    make_user(db, 1)
+    db.set_vip(1, True)  # permanent (Stars purchase)
+    assert db.add_vip_days(1, 30) is True
+    assert db.get_user(1).vip_expires_at == 0.0
+
+
+def test_expired_timed_vip_flips_off_on_get_user():
+    db = Database()
+    make_user(db, 1)
+    db.add_vip_days(1, 3)
+    user = db.get_user(1)
+    user.vip_expires_at = time.time() - 10  # force past expiry
+    assert db.get_user(1).vip is False
+    assert db.get_user(1).vip_expires_at == 0.0
+
+
+def test_permanent_vip_never_expires():
+    db = Database()
+    make_user(db, 1)
+    db.set_vip(1, True)
+    assert db.get_user(1).vip is True
+    assert db.get_user(1).vip_expires_at == 0.0
+
+
+def test_add_vip_days_rejects_unknown_user_and_bad_days():
+    db = Database()
+    make_user(db, 1)
+    assert db.add_vip_days(999, 30) is False
+    assert db.add_vip_days(1, 0) is False
+    assert db.get_user(1).vip is False
+
+
+# ── UPI payment queue ───────────────────────────────────────────
+
+def test_upi_queue_and_approval_grants_vip_days():
+    db = Database()
+    user = make_user(db, 1)
+    assert db.queue_upi_payment(1, 30, 250, "screenshot_1") is True
+    assert db.pending_upi_list() == [(1, db.pending_upi[1])]
+
+    approved = db.approve_upi_payment(1)
+    assert approved is user
+    assert user.vip is True
+    assert user.vip_expires_at > time.time()
+    assert db.pending_upi_list() == []
+    assert db.approve_upi_payment(1) is None
+
+
+def test_upi_reject_allows_retry():
+    db = Database()
+    user = make_user(db, 1)
+    db.queue_upi_payment(1, 7, 60, "shot_1")
+    assert db.reject_upi_payment(1) is True
+    assert db.reject_upi_payment(1) is False
+    assert user.vip is False
+    assert db.queue_upi_payment(1, 7, 60, "shot_2") is True
+
+
+def test_upi_queue_rejects_unknown_user():
+    db = Database()
+    assert db.queue_upi_payment(999, 3, 30, "shot") is False
+
+
 def test_view_alert_respects_cooldown_and_self():
     db = Database()
     make_user(db, 1)
